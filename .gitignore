@@ -1,0 +1,10 @@
+# DevDeck — ignore patterns (placeholder)
+
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+runtime/cpp/build/
+*.gguf
