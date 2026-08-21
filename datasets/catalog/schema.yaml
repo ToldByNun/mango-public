@@ -1,0 +1,29 @@
+# Catalog schema — scenario sidecar metadata lives in index.jsonl (not in training JSONL).
+
+schema_version: 1
+
+required_meta_fields:
+  - scenario_id
+  - lang
+  - workflow
+  - difficulty
+  - bug_class
+
+workflows:
+  - test_fail_fix
+  - security_review
+  - multi_file_refactor
+  - ambiguous_ask_epistemic
+  - cot_cycle
+  - epistemic_api
+  - agent_finish
+
+difficulties:
+  - easy
+  - medium
+  - hard
+
+verification_tiers:
+  - sandbox
+  - static_only
+  - human_reviewed

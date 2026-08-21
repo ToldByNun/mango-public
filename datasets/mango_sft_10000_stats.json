@@ -1,0 +1,28 @@
+{
+  "total": 10000,
+  "v1_rows": 1000,
+  "v3_rows": 9000,
+  "unique_lines": 10000,
+  "unique_user": 10000,
+  "unique_assistant": 10000,
+  "index_entries": 9000,
+  "by_lang": {
+    "c": 1500,
+    "cpp": 2000,
+    "go": 300,
+    "javascript": 287,
+    "typescript": 1353,
+    "js_ts": 360,
+    "python": 2300,
+    "rust": 900
+  },
+  "by_workflow": {
+    "test_fail_fix": 3745,
+    "security_review": 1213,
+    "multi_file_refactor": 810,
+    "ambiguous_ask_epistemic": 403,
+    "cot_cycle": 1374,
+    "epistemic_api": 1213,
+    "agent_finish": 242
+  }
+}

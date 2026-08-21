@@ -1,0 +1,14 @@
+# JavaScript / TypeScript bug classes
+
+- id: prototype_pollution
+  cwe: CWE-1321
+- id: innerHTML
+  cwe: CWE-79
+- id: missing_validation
+  cwe: CWE-20
+- id: promise_race
+  cwe: CWE-362
+- id: unsafe_assertion
+  cwe: CWE-704
+- id: any_leak
+  cwe: CWE-704

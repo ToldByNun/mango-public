@@ -1,0 +1,8 @@
+# Rust bug classes
+
+- id: unwrap
+  cwe: CWE-754
+- id: unsafe_block
+  cwe: CWE-119
+- id: panic_instead_result
+  cwe: CWE-754

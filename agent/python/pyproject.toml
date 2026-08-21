@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mango-agent"
+version = "0.1.0"
+description = "Mango minimal agent loop (runtime + tools)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+swebench = ["swebench>=2.2", "datasets>=2.14", "docker>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mango_agent*"]
+
+[tool.setuptools.package-data]
+"mango_agent.benchmark.swebench" = ["baseline.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "smoke: requires a real GGUF model",
+    "swebench: SWE-bench integration tests",
+    "swebench_live: requires Docker, network, and optional swebench package",
+]

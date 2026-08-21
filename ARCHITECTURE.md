@@ -1,10 +1,12 @@
-# DevDeck — Architektur
+# Mango — Architektur
+
+> **Aktueller Stand:** [README.md](README.md) beschreibt das laufende System (Loop, Runner-Gates, Entscheidungen). Diese Datei ist der ursprüngliche Modul-Entwurf.
 
 ## Leitprinzip
 
 > **Ein lokales Modell, viele spezialisierte Agenten-Kontexte.**
 
-DevDeck teilt eine einzige lokale LLM-Instanz (GGUF) zwischen mehreren spezialisierten Agenten-Kontexten. Jeder Kontext definiert eigene System-Prompts, erlaubte Tools, epistemische Regeln und Verifikations-Schleifen — ohne separate Modell-Instanzen pro Agent.
+Mango teilt eine einzige lokale LLM-Instanz (GGUF) zwischen mehreren spezialisierten Agenten-Kontexten. Jeder Kontext definiert eigene System-Prompts, erlaubte Tools, epistemische Regeln und Verifikations-Schleifen — ohne separate Modell-Instanzen pro Agent.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

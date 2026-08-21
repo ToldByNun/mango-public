@@ -1,0 +1,8 @@
+{
+  "total": 2000,
+  "unique_lines": 2000,
+  "unique_user": 2000,
+  "unique_assistant": 2000,
+  "v1_rows": 1000,
+  "v2_rows": 1000
+}

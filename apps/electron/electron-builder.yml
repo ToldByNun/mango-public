@@ -1,0 +1,33 @@
+appId: com.mango.app
+productName: Mango
+copyright: Copyright © Mango
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: build/mango-runtime
+    to: mango
+    filter:
+      - "**/*"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: Mango-Setup-${version}.${ext}
+  icon: resources/icon.png
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Mango
+  uninstallDisplayName: Mango
+publish:
+  provider: github
+  owner: ToldByNun
+  repo: mango-public
+  releaseType: release

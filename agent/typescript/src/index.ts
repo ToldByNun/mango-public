@@ -1,4 +1,4 @@
-/** DevDeck Agent — TypeScript IPC adapter for Electron. */
+/** Mango Agent — TypeScript IPC adapter for Electron. */
 
 // TODO: expose AgentIPC
 

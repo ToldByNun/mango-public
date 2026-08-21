@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mango"
+version = "0.1.0"
+description = "Mango local coding agent (terminal UI)"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.80.0",
+    "mango-agent",
+    "mango-runtime",
+]
+
+[project.scripts]
+mango = "mango_cli.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mango_cli*"]
+
+[tool.setuptools.package-data]
+mango_cli = ["theme.tcss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

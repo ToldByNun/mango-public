@@ -1,0 +1,10 @@
+# C bug classes
+
+- id: strcpy
+  cwe: CWE-787
+- id: double_free
+  cwe: CWE-415
+- id: uninit
+  cwe: CWE-457
+- id: off_by_one
+  cwe: CWE-193

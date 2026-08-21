@@ -1,0 +1,40 @@
+import { type ReactNode } from "react";
+import type { Session } from "@shared/events";
+
+type Store = {
+  sessions: Session[];
+  activeId: string | null;
+  workspace: string;
+  branch: string;
+  modelName: string;
+  modelPath: string;
+  models: Array<{ path: string; label: string }>;
+  modelLoaded: boolean;
+  modelSwitching: boolean;
+  sidecarError: string | null;
+  tokens: number;
+  contextMax: number;
+  search: string;
+  settingsOpen: boolean;
+  diff: { path: string; diff: string } | null;
+  setSearch: (value: string) => void;
+  setSettingsOpen: (open: boolean) => void;
+  setDiff: (value: { path: string; diff: string } | null) => void;
+  active: Session | null;
+  filtered: Session[];
+  newSession: () => void;
+  selectSession: (id: string) => void;
+  closeSession: (id: string) => void;
+  renameSession: (id: string, title: string) => void;
+  deleteSession: (id: string) => void;
+  deleteWorkspaceSessions: (workspace: string) => void;
+  pickWorkspace: () => Promise<void>;
+  selectWorkspace: (path: string) => Promise<void>;
+  selectModel: (path: string) => Promise<void>;
+  send: (goal: string, attachments: string[], thinkingLevel?: string) => Promise<boolean>;
+  cancel: () => Promise<void>;
+};
+
+export declare function AgentProvider({ children }: { children: ReactNode }): JSX.Element;
+export declare function useAgent(): Store;
+export {};

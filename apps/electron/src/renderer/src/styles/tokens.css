@@ -1,0 +1,179 @@
+:root {
+  /* Surfaces — warm graphite */
+  --surface-0: #0e0d0c;
+  --surface-1: #161412;
+  --surface-2: #1c1a18;
+  --surface-3: #25221f;
+  --surface-inset: #0a0908;
+
+  /* Borders */
+  --border-default: #2e2a26;
+  --border-subtle: #23201d;
+  --border-strong: #4a433c;
+
+  /* Text — warm gray */
+  --text-primary: #f5f2ed;
+  --text-secondary: #a89f94;
+  --text-tertiary: #7a7268;
+  --text-disabled: #564f48;
+
+  /* Accent — mango */
+  --accent: #e8943a;
+  --accent-hover: #d4822e;
+  --accent-muted: rgba(232, 148, 58, 0.14);
+  --accent-subtle: rgba(232, 148, 58, 0.1);
+  --accent-on: #1a1208;
+
+  /* Status */
+  --status-success: #3dba6e;
+  --status-success-bg: rgba(61, 186, 110, 0.12);
+  --status-success-border: rgba(61, 186, 110, 0.28);
+
+  --status-warning: #e5a23a;
+  --status-warning-bg: rgba(229, 162, 58, 0.12);
+  --status-warning-border: rgba(229, 162, 58, 0.28);
+
+  --status-danger: #e85d4c;
+  --status-danger-bg: rgba(232, 93, 76, 0.12);
+  --status-danger-border: rgba(232, 93, 76, 0.28);
+
+  --status-info: #7a7268;
+  --status-info-bg: rgba(122, 114, 104, 0.12);
+  --status-info-border: rgba(122, 114, 104, 0.25);
+
+  /* Legacy semantic (diff badges) */
+  --add: var(--status-success);
+  --add-bg: var(--status-success-bg);
+  --del: #e8786e;
+  --del-bg: var(--status-danger-bg);
+  --ok: var(--status-success);
+  --warn: var(--status-warning);
+  --danger: var(--status-danger);
+  --overlay: rgba(0, 0, 0, 0.55);
+
+  /* Legacy aliases → migrate modules gradually */
+  --bg-app: var(--surface-0);
+  --bg-sidebar: var(--surface-1);
+  --bg-activity: var(--surface-0);
+  --bg-elevated: var(--surface-2);
+  --bg-bubble: var(--surface-3);
+  --bg-composer: var(--surface-2);
+  --bg-hover: var(--surface-3);
+  --bg-active: var(--accent-subtle);
+  --border: var(--border-default);
+  --text: var(--text-primary);
+  --text-muted: var(--text-secondary);
+  --text-faint: var(--text-tertiary);
+  --accent-dim: var(--border-strong);
+
+  /* Spacing (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Layout */
+  --rail-width: 48px;
+  --sidebar-width: 236px;
+  --header-height: 40px;
+  --status-height: 32px;
+  --content-max: 720px;
+
+  /* Typography */
+  --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, monospace;
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-base: 15px;
+  --text-lg: 22px;
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --leading-tight: 1.35;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.6;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+  --radius-composer: var(--radius-xl);
+  --radius-card: var(--radius-lg);
+  --radius-btn: var(--radius-md);
+  --radius-badge: var(--radius-sm);
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 14px 44px rgba(0, 0, 0, 0.5);
+  --shadow-composer: var(--shadow-md);
+
+  /* Motion */
+  --duration-fast: 120ms;
+  --duration-normal: 180ms;
+  --duration-slow: 280ms;
+  --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.2, 0.64, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-normal);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+textarea,
+input {
+  font-family: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: var(--space-2);
+  height: var(--space-2);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-lg);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

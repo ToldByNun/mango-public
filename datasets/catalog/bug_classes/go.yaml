@@ -1,0 +1,8 @@
+# Go bug classes
+
+- id: goroutine_leak
+  cwe: CWE-401
+- id: channel_deadlock
+  cwe: CWE-833
+- id: mutex_scope
+  cwe: CWE-362

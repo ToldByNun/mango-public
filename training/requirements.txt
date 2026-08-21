@@ -1,0 +1,12 @@
+unsloth[colab-new]
+torch>=2.4.0
+trl>=0.12.0
+# Unsloth pins datasets<4.4; Python 3.14 needs a local pickle patch (see finetune_qwen_coder.py)
+datasets>=4.3.0,<4.4.0
+transformers
+bitsandbytes
+accelerate
+peft
+wandb
+# kernels>=0.15 breaks transformers hub_kernels import (LayerRepository needs version=)
+kernels>=0.12,<0.15

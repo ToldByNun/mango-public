@@ -1,4 +1,4 @@
-/** DevDeck Tools — TypeScript bridge for Electron / IPC. */
+/** Mango Tools — TypeScript bridge for Electron / IPC. */
 
 // TODO: expose ToolBridge
 

@@ -2,15 +2,26 @@
 
 Minimal GGUF model runner — backed by [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) (llama.cpp).
 
-## Warum llama-cpp-python?
+## GPU (CUDA)
 
-| Option | Pro | Contra |
-|--------|-----|--------|
-| **llama-cpp-python** | Native API, Streaming, KV-Cache, GPU-Wheels | Python-Abhängigkeit |
-| llama-cli Subprocess | Kein Binding nötig | IPC-Overhead, schlechtes Streaming |
-| Direktes C++ llama.cpp | Max. Performance | Bindings-Aufwand (später) |
+The PyPI default wheel is **CPU-only**. For an NVIDIA GPU you must rebuild with CUDA:
 
-Für Phase 1 ist **llama-cpp-python** die beste Balance: isoliert lauffähig und später per C++-Kern ersetzbar, ohne die Python-API zu brechen.
+```powershell
+# Developer Command Prompt / vcvars64. Visual Studio often has no CUDA toolset —
+# use Ninja so nvcc is invoked directly:
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+$env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;$env:PATH"
+$env:CMAKE_GENERATOR = "Ninja"
+$env:CMAKE_ARGS = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_CCACHE=OFF"  # 120 = RTX 50
+$env:FORCE_CMAKE = "1"
+pip install llama-cpp-python --force-reinstall --no-cache-dir
+```
+
+Helper script: `runtime/scripts/install_llama_cpp_cuda.bat` (set `PIP` to the target venv pip).
+
+Set `hardware.n_gpu_layers: -1` in `config.yaml` to offload all layers. `0` keeps inference on CPU.
+
+On load, the runner prepends the CUDA `bin` / `bin\x64` folders to `PATH` (needed for `cublas64_13.dll` on CUDA 13) and refuses GPU offload if the installed `llama-cpp-python` has no CUDA backend.
 
 ## Setup
 
@@ -21,75 +32,34 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-GPU (CUDA-Beispiel):
+## Configuration
 
-```powershell
-$env:CMAKE_ARGS = "-DGGML_CUDA=on"
-pip install --force-reinstall llama-cpp-python
-```
+| Key | Meaning |
+|-----|---------|
+| `model.path` | Path to `.gguf` file |
+| `model.n_ctx` | Context window (tokens) |
+| `hardware.n_gpu_layers` | `0` = CPU, `-1` = all layers on GPU |
+| `hardware.n_threads` | CPU threads (`0` = auto) |
+| `inference.*` | Default sampling parameters |
 
-## Konfiguration
+Environment overrides:
 
-```powershell
-copy ..\config.example.yaml ..\config.yaml
-# model.path und hardware.n_gpu_layers anpassen
-```
+- `MANGO_GGUF_MODEL_PATH` — overrides `model.path`
+- `MANGO_RUNTIME_CONFIG` — path to alternate config
 
-| Key | Bedeutung |
-|-----|-----------|
-| `model.path` | Pfad zur `.gguf`-Datei |
-| `model.n_ctx` | Kontext-Fenster (Tokens) |
-| `hardware.n_gpu_layers` | `0` = CPU, `-1` = alle Layer auf GPU |
-| `hardware.n_threads` | CPU-Threads (`0` = auto) |
-| `inference.*` | Default-Sampling-Parameter |
-
-Umgebungsvariablen:
-
-- `DEVDECK_GGUF_MODEL_PATH` — überschreibt `model.path`
-- `DEVDECK_RUNTIME_CONFIG` — Pfad zu alternativer Config
-
-## Nutzung
+## Usage
 
 ```python
-from devdeck_runtime import ModelRunner
+from mango_runtime import ModelRunner
 
 with ModelRunner() as runner:
     result = runner.complete("Hello!")
     print(result.text)
-
-    for token in runner.complete_stream("Hello!", reset_cache=True):
-        print(token, end="", flush=True)
+    # Lazy GBNF: free text until trigger, then constrain the tool-call tail.
+    # result = runner.complete(prompt, grammar=gbnf, grammar_trigger="<tool_call=")
+    # reset_cache=False keeps the KV prefix (do not wipe between thought and tool).
 ```
-
-CLI:
 
 ```powershell
-python -m devdeck_runtime "Your prompt here"
-python -m devdeck_runtime --stream "Your prompt here"
+python -m mango_runtime "Your prompt here"
 ```
-
-## KV-Cache
-
-llama.cpp hält den KV-Cache pro `Llama`-Instanz. Standard: `reset_cache=True` bei jedem `complete()` / `complete_stream()` (frischer Prompt). Für Multi-Turn später: `reset_cache=False` und explizit `runner.reset_cache()`.
-
-## Tests
-
-Unit-Tests (ohne Modell):
-
-```powershell
-pytest tests/test_config.py -v
-```
-
-Smoke-Test (benötigt GGUF-Modell):
-
-```powershell
-$env:DEVDECK_GGUF_MODEL_PATH = "C:\path\to\model.gguf"
-pytest tests/test_smoke.py -v -m smoke
-```
-
-## API
-
-- `ModelRunner.load()` / `unload()` / `is_loaded`
-- `ModelRunner.complete(prompt, ...)` → `CompletionResult`
-- `ModelRunner.complete_stream(prompt, ...)` → `Iterator[str]`
-- `ModelRunner.reset_cache()`

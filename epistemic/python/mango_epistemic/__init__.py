@@ -1,0 +1,12 @@
+"""Mango Epistemic — isolated sub-agents that share one ModelRunner."""
+
+from mango_epistemic.epistemic_engine import EpistemicEngine, ask_epistemic, register_ask_epistemic
+from mango_epistemic.types import EpistemicResult, Evidence
+
+__all__ = [
+    "EpistemicEngine",
+    "EpistemicResult",
+    "Evidence",
+    "ask_epistemic",
+    "register_ask_epistemic",
+]

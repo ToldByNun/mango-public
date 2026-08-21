@@ -1,0 +1,10 @@
+# C++ bug classes
+
+- id: buffer_overflow
+  cwe: CWE-787
+- id: uaf
+  cwe: CWE-416
+- id: format_string
+  cwe: CWE-134
+- id: int_overflow
+  cwe: CWE-190

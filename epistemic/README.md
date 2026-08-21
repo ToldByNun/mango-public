@@ -1,19 +1,21 @@
 # Epistemic
 
-Epistemic Engine und Sub-Agenten — Bewertung epistemischer Sicherheit und Eskalation bei Wissenslücken.
+Isolated summarize turn that shares the **same ModelRunner** but never the main agent's chat.
 
-**Sprache:** Python
+## ask_epistemic
 
-## Geplante Komponenten
+The runner:
 
-- `EpistemicEngine` — assess, escalate
-- `SubAgent` — spawn, merge_result
-- `ConfidenceScore` — value, rationale
+1. Resolves concrete symbols from the question (`collections` → `deque`, `threading` → `Lock`, `time` → `monotonic`).
+2. Loads each via `importlib` / `inspect` (source or C-extension docstring).
+3. Asks the model **once** to write a targeted usage brief (import, snippet, pitfalls). Nested thoughts/lookups are **not** forwarded to the Mango transcript — they stay inside the “Asked epistemic sub-agent” bubble.
 
-## Struktur
+The main agent receives `EpistemicResult.to_compact_dict()` only.
 
-```
-epistemic/
-└── python/
-    └── sub_agents/   # Spezialisierte Sub-Agenten (Research, Verify, Clarify)
+## Tests
+
+```powershell
+cd epistemic/python
+pip install -e ".[dev]"
+pytest -v
 ```

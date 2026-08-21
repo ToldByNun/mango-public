@@ -1,0 +1,36 @@
+# Python bug classes — see datasets/builders/templates.py for authoritative templates
+
+- id: sqli
+  bug_class: sqli
+  cwe: CWE-89
+  description: SQL injection via string concat
+
+- id: pickle
+  bug_class: pickle
+  cwe: CWE-502
+  description: Unsafe pickle deserialization
+
+- id: path_traversal
+  bug_class: path_traversal
+  cwe: CWE-22
+  description: Path traversal in file open
+
+- id: eval_exec
+  bug_class: eval_exec
+  cwe: CWE-94
+  description: eval on config expression
+
+- id: race_thread
+  bug_class: race_thread
+  cwe: CWE-362
+  description: Race on shared counter
+
+- id: asyncio_lock
+  bug_class: asyncio_lock
+  cwe: CWE-362
+  description: Async race without lock
+
+- id: except_pass
+  bug_class: except_pass
+  cwe: CWE-390
+  description: Silent exception swallow

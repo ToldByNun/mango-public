@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packages
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install pytest
+          pip install -e runtime/python
+          pip install -e tools/python
+          pip install -e context/python
+          pip install -e cot/python
+          pip install -e epistemic/python
+          pip install -e codeintel/python
+          pip install -e verification/python
+          pip install -e "agent/python[dev]"
+          pip install -e "cli/python[dev]"
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          mark='not smoke and not swebench_live'
+          pytest -q -m "$mark" agent/python/tests
+          pytest -q -m "$mark" tools/python/tests
+          pytest -q -m "$mark" runtime/python/tests
+          pytest -q -m "$mark" context/python/tests
+          pytest -q -m "$mark" cot/python/tests
+          pytest -q -m "$mark" epistemic/python/tests
+          pytest -q -m "$mark" codeintel/python/tests
+          pytest -q -m "$mark" verification/python/tests
+          pytest -q -m "$mark" cli/python/tests
+          pytest -q agent/python/mango_dataset/tests
+
+  electron-build:
+    name: Electron build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/electron
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/electron/package-lock.json
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build

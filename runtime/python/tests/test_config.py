@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from devdeck_runtime.config import load_config
-from devdeck_runtime.gguf_loader import GGUFLoader, GGUFLoadError
+from mango_runtime.config import load_config
+from mango_runtime.gguf_loader import GGUFLoader, GGUFLoadError
 
 
 def test_load_config_from_file(tmp_path: Path) -> None:
@@ -38,7 +38,7 @@ def test_env_model_path_overrides_config(tmp_path: Path, monkeypatch: pytest.Mon
         yaml.dump({"model": {"path": "old.gguf"}}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DEVDECK_GGUF_MODEL_PATH", str(tmp_path / "override.gguf"))
+    monkeypatch.setenv("MANGO_GGUF_MODEL_PATH", str(tmp_path / "override.gguf"))
 
     config = load_config(config_file)
     assert config.model.path == str(tmp_path / "override.gguf")
@@ -58,7 +58,7 @@ def test_empty_model_path_raises(tmp_path: Path) -> None:
 
 
 def test_gguf_loader_rejects_missing_file(tmp_path: Path) -> None:
-    from devdeck_runtime.types import ModelConfig, RuntimeConfig
+    from mango_runtime.types import ModelConfig, RuntimeConfig
 
     loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(tmp_path / "nope.gguf"))))
     with pytest.raises(GGUFLoadError, match="not found"):
@@ -66,10 +66,23 @@ def test_gguf_loader_rejects_missing_file(tmp_path: Path) -> None:
 
 
 def test_gguf_loader_rejects_wrong_extension(tmp_path: Path) -> None:
-    from devdeck_runtime.types import ModelConfig, RuntimeConfig
+    from mango_runtime.types import ModelConfig, RuntimeConfig
 
     bad_file = tmp_path / "model.bin"
     bad_file.write_text("fake", encoding="utf-8")
     loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(bad_file))))
     with pytest.raises(GGUFLoadError, match="Expected a .gguf"):
         loader.validate()
+
+
+def test_llama_kwargs_use_windowed_swa_cache(tmp_path: Path) -> None:
+    from mango_runtime.types import ModelConfig, RuntimeConfig
+
+    gguf = tmp_path / "gemma4.gguf"
+    gguf.write_bytes(b"GGUF")
+    loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(gguf), n_ctx=16384, n_batch=512)))
+    kwargs = loader.llama_kwargs()
+    assert kwargs["swa_full"] is False
+    assert kwargs["type_k"] == 8
+    assert kwargs["type_v"] == 8
+    assert kwargs["n_ctx"] == 16384

@@ -1,0 +1,111 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: grid;
+  place-items: center;
+  z-index: 20;
+}
+
+.panel {
+  width: min(720px, calc(100vw - 48px));
+  max-height: min(70vh, 640px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.close {
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.body {
+  overflow: auto;
+  padding: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.line {
+  padding: 0 12px;
+  white-space: pre;
+}
+
+.add {
+  background: var(--add-bg);
+  color: var(--add);
+}
+
+.del {
+  background: var(--del-bg);
+  color: var(--del);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+}
+
+.form label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form input {
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius-btn);
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.form input:read-only {
+  color: var(--text-muted);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.primary {
+  border: 0;
+  background: var(--accent);
+  color: #111;
+  border-radius: var(--radius-btn);
+  padding: 6px 12px;
+}
+
+.ghost {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius-btn);
+  padding: 6px 12px;
+}

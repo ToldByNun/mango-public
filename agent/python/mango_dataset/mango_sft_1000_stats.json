@@ -1,0 +1,20 @@
+{
+  "total": 1000,
+  "by_variant": {
+    "agent_action": 550,
+    "agent_finish": 30,
+    "cot_cycle": 170,
+    "epistemic_answer": 250
+  },
+  "by_tool": {
+    "declare_apis": 54,
+    "ask_epistemic": 36,
+    "write_file": 141,
+    "read_file": 123,
+    "edit_file": 107,
+    "edit_symbol": 35,
+    "search_code": 18,
+    "rename_symbol": 18,
+    "run_tests": 18
+  }
+}

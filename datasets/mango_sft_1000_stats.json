@@ -1,0 +1,10 @@
+{
+  "total": 1000,
+  "unique_lines": 1000,
+  "unique_user": 1000,
+  "unique_assistant": 1000,
+  "agent_action": 550,
+  "agent_finish": 30,
+  "cot_cycle": 170,
+  "epistemic_answer": 250
+}

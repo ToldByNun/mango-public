@@ -1,10 +1,71 @@
-# DevDeck — ignore patterns (placeholder)
+# Mango
 
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.tsbuildinfo
+
+# Node / Electron
 node_modules/
 dist/
 build/
-runtime/cpp/build/
+apps/electron/out/
+apps/electron/release/
+apps/electron/build/
+apps/electron/*.exe
+apps/electron/*.blockmap
+
+# Local agent / benchmark caches (current + legacy name)
+.mango/
+.devdeck/
+**/.mango/
+**/.devdeck/
+
+# Dataset build / verify scratch (not source)
+datasets/.verify_cache/
+datasets/verify_reports/
+**/chunks2/**/*.jsonl
+training/output/
+training/**/wandb/
+training/**/runs/
+training/**/checkpoint-*/
+
+# Models, local reports
 *.gguf
+agent/benchmark_reports/
+agent/python/swebench_reports/
+runtime/cpp/build/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# Misc / one-off scripts output
+*.swp
+*~
+.cache/
+rename_output.txt

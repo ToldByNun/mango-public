@@ -1,0 +1,103 @@
+/* Mango CLI — console-first, GUI palette */
+
+Screen {
+    background: #0e0d0c;
+    color: #f5f2ed;
+}
+
+/* one thin identity line — no chrome bar */
+MangoHeader {
+    dock: top;
+    height: 1;
+    background: #0e0d0c;
+    color: #7a7268;
+    padding: 0 1;
+}
+
+MangoHeader .brand {
+    color: #e8943a;
+    text-style: bold;
+}
+
+MangoHeader .sep {
+    color: #4a433c;
+}
+
+MangoHeader .path {
+    color: #a89f94;
+}
+
+#main {
+    height: 1fr;
+    padding: 0 1;
+}
+
+/* plain scroll — no panel, no rounded border */
+#transcript {
+    height: 1fr;
+    background: #0e0d0c;
+    border: none;
+    padding: 0;
+    scrollbar-background: #0e0d0c;
+    scrollbar-color: #2e2a26;
+    scrollbar-color-hover: #e8943a;
+    scrollbar-color-active: #d4822e;
+}
+
+/* classic prompt row */
+#composer-row {
+    height: auto;
+    max-height: 5;
+    min-height: 1;
+    margin: 0;
+    padding: 0;
+    background: #0e0d0c;
+}
+
+#prompt-glyph {
+    width: 2;
+    color: #e8943a;
+    text-style: bold;
+    padding: 0;
+}
+
+#composer {
+    width: 1fr;
+    height: auto;
+    max-height: 5;
+    min-height: 1;
+    border: none;
+    background: #0e0d0c;
+    padding: 0;
+    color: #f5f2ed;
+}
+
+#composer:focus {
+    border: none;
+}
+
+#composer .text-area--cursor-line {
+    background: #0e0d0c;
+}
+
+/* quiet footer line */
+MangoStatusBar {
+    dock: bottom;
+    height: 1;
+    background: #0e0d0c;
+    border-top: solid #23201d;
+    color: #7a7268;
+    padding: 0 1;
+}
+
+MangoStatusBar .accent {
+    color: #e8943a;
+}
+
+MangoStatusBar .ok {
+    color: #3dba6e;
+}
+
+MangoStatusBar .err {
+    color: #e85d4c;
+}
