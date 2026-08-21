@@ -73,7 +73,7 @@ def _run_subprocess(
                         except Exception:
                             pass
                         stdout = out_path.read_text(encoding="utf-8", errors="replace")[-4_000:] if out_path.is_file() else ""
-                        stderr = out_path.read_text(encoding="utf-8", errors="replace")[-2_000:] if err_path.is_file() else ""
+                        stderr = err_path.read_text(encoding="utf-8", errors="replace")[-2_000:] if err_path.is_file() else ""
                         return -1, stdout, stderr, False
 
                     rc = proc.poll()
@@ -93,7 +93,7 @@ def _run_subprocess(
                         except Exception:
                             pass
                         stdout = out_path.read_text(encoding="utf-8", errors="replace")[-4_000:] if out_path.is_file() else ""
-                        stderr = out_path.read_text(encoding="utf-8", errors="replace")[-2_000:] if err_path.is_file() else ""
+                        stderr = err_path.read_text(encoding="utf-8", errors="replace")[-2_000:] if err_path.is_file() else ""
                         return -1, stdout, stderr, True
 
                     time.sleep(0.1)

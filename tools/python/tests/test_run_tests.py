@@ -29,8 +29,8 @@ def test_run_tests_runs_pytest(tmp_path: Path) -> None:
 
 def test_run_tests_uses_devnull_stdin(tmp_path: Path) -> None:
     (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    with patch("mango_tools.implementations.run_tests.subprocess.run") as mocked:
-        mocked.return_value = type("R", (), {"returncode": 0})()
+    with patch("mango_tools.implementations.run_tests.subprocess.Popen") as mocked:
+        mocked.return_value.poll.return_value = 0
         run_tests(_context={"workspace": str(tmp_path)})
         assert mocked.call_args.kwargs.get("stdin") == subprocess.DEVNULL
 

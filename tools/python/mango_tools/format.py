@@ -20,5 +20,6 @@ def tool_call_instruction() -> str:
     return (
         "You may write a short plan (a few sentences), then emit exactly one tool call:\n"
         f"  {TOOL_CALL_PREFIX}<tool_name> : {{\"arg\": \"value\"}}{TOOL_CALL_SUFFIX}\n"
-        "Stop after the tool call. Multiple tool calls may appear in the same response."
+        "For write_file put a SHORT skeleton in JSON \"content\" (under ~60 lines). "
+        "Then edit_file to grow the file. Stop after the tool call."
     )

@@ -158,6 +158,8 @@ _THIRD_PARTY_LIBS = frozenset(
         "tensorflow",
         "torch",
         "typer",
+        "discord",
+        "discord.py",
     }
 )
 _FOLLOW_UP_MARKERS = (
@@ -165,12 +167,24 @@ _FOLLOW_UP_MARKERS = (
     "follow-up request:",
 )
 _TEST_DIR_NAMES = frozenset({"tests", "testing", "test"})
-_IDLE_TOOL_RETRIES = 2
+_IDLE_TOOL_RETRIES = 6
 _MAX_TEST_FIX_ATTEMPTS = 5  # messaging threshold only — loop stops at max_iterations/time, not here
 _MAX_STRESS_NUDGES = 2
-_WRITE_TOOL_MAX_TOKENS = 2048
-_TRUNCATED_WRITE_TOOL_MAX_TOKENS = 3072
+# Identical model answers with no tool call in between. Escalate the feedback once,
+# then stop: without this the loop burns every remaining iteration on one answer.
+_STALL_ESCALATE = 2
+_STALL_LIMIT = 4
+_WRITE_TOOL_MAX_TOKENS = 3072
+_TRUNCATED_WRITE_TOOL_MAX_TOKENS = 4096
 _MAX_REASONING_CYCLES_PER_ITER = 3
+_UNFINISHED_ANSWER = re.compile(
+    r"(?i)\b("
+    r"i need to|i'll |i will |let me |next step|still need|todo\b|"
+    r"write the test|create the test|write a test|not done yet|do not finish|"
+    r"emit a tool|call write_file|call edit_file|read bot\.py|read the file|"
+    r"register is never|never called"
+    r")\b"
+)
 _CONCURRENCY_IMPL = re.compile(
     r"\b(threading|asyncio|concurrent\.futures|multiprocessing)\b|"
     r"\b(Lock|RLock|Semaphore|Event|Condition|Barrier|ThreadPoolExecutor|ProcessPoolExecutor)\s*\("
@@ -183,6 +197,10 @@ _FENCE_RE = re.compile(r"```[\w+-]*\n.*?```", re.DOTALL)
 _GOAL_WANTS_TESTS = re.compile(r"(?i)test_|pytest|\btests?\b|\bteste")
 _GOAL_WANTS_FILE_IO = re.compile(
     r"(?i)\b(read|edit|replace|write|create|modify)\b.*\bfile\b|\bread the file\b|\bedit the file\b"
+)
+_GOAL_LARGE_MARKUP = re.compile(
+    r"(?i)\b(index\.html|landing\s*page|animation|canvas|rocket|html\s*file|full\s*page|"
+    r"css\s*animation|single[- ]page)\b"
 )
 _GOAL_IMPLIES_EDIT = re.compile(
     r"(?i)\b(fix|bug|refactor|rename|implement|add|update|change|modify|patch|correct|repair)\b"
@@ -323,6 +341,9 @@ class Agent:
             self._register_declare_apis()
         self._idle_tool_retries = 0
         self._readonly_iters = 0
+        self._stall_key = ""
+        self._stall_repeats = 0
+        self._auto_test_runs = 0
         self._last_streamed = ""
         self._last_stream_channel = "thought"
         self._thought_log: list[str] = []
@@ -330,10 +351,14 @@ class Agent:
         self._task_wants_tests = False
         self._ran_tests_ok = False
         self._goal_wants_file_io = False
+        self._large_markup_goal = False
         self._run_tests_failures = 0
         self._runtime_smoke_failures = 0
         self._stress_nudges = 0
         self._prefer_write_file = False
+        self._prefer_read_file = False
+        self._last_tool_truncated = False
+        self._fix_hint_path = ""
         self._edit_fail_counts: dict[str, int] = {}
         self._review_needed = False
         self._review_done = False
@@ -510,15 +535,38 @@ class Agent:
                 useful = bool(
                     usable_api_brief(output.get("details"))
                     or usable_api_signature(output.get("signature"))
-                    or output.get("exists") is False
                 )
-                if self._epistemic_covers_plan(question, output) and useful:
+                blob = f"{output.get('details') or ''} {output.get('error') or ''}".lower()
+                import_miss = output.get("exists") is False and (
+                    "import failed" in blob
+                    or "no module named" in blob
+                    or "install failed" in blob
+                    or output.get("install_ok") is False
+                )
+                if import_miss:
+                    useful = False
+                elif not useful and output.get("exists") is False and "attribute failed" in blob:
+                    useful = True
+                if useful and self._epistemic_covers_plan(question, output) and not import_miss:
                     self._epistemic_once = True
                     self._apis_declared_once = True
                     engine.set_verification_feedback(feedback("epistemic_ok"))
                 else:
                     needed = ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries()) or "the declared libraries"
-                    engine.set_verification_feedback(feedback("epistemic_retry", needed=needed))
+                    if import_miss or (
+                        output.get("install_command") and not output.get("install_ok", True)
+                    ):
+                        pkgs = output.get("failed") or output.get("installed") or []
+                        pkg_label = ", ".join(str(x) for x in pkgs) if isinstance(pkgs, list) else needed
+                        engine.set_verification_feedback(
+                            feedback(
+                                "install_failed",
+                                pkgs=pkg_label or needed,
+                                command=str(output.get("install_command") or f"pip install {needed}"),
+                            )
+                        )
+                    else:
+                        engine.set_verification_feedback(feedback("epistemic_retry", needed=needed))
 
     def _research_still_required(self) -> bool:
         if not self._research_targets:
@@ -580,10 +628,17 @@ class Agent:
         visible = strip_thought_markup(text or "")
         if not visible:
             return
-        self._thought_log = [visible]
+        # Append instead of replace so chained reasoning steps stay readable, but
+        # never twice: idle iterations re-generate the identical thought and the
+        # renderer would otherwise stack it inside the same bubble.
+        key = _thought_key(visible)
+        if key and key not in {_thought_key(entry) for entry in self._thought_log}:
+            self._thought_log.append(visible)
         payload: dict[str, Any] = {
             "id": self._thought_id(),
             "delta": "",
+            # Full text (not a delta) — this overwrites whatever the token stream
+            # accumulated in this bubble, which is what drops duplicate lines.
             "text": "\n\n".join(self._thought_log) if self._thought_log else "",
             "channel": "thought",
             "duration_ms": duration_ms,
@@ -689,6 +744,7 @@ class Agent:
         self._pending_symbol_lookups = list(targets.symbols)
         self._pending_goal_files = list(targets.files)
         self._goal_wants_file_io = bool(_GOAL_WANTS_FILE_IO.search(task or ""))
+        self._large_markup_goal = bool(_GOAL_LARGE_MARKUP.search(task or ""))
         if self._require_tools:
             # UI create-from-scratch tasks should not scan/index the whole repo first.
             self._pending_symbol_lookups = []
@@ -706,6 +762,9 @@ class Agent:
         self._declared_libraries = []
         self._idle_tool_retries = 0
         self._readonly_iters = 0
+        self._stall_key = ""
+        self._stall_repeats = 0
+        self._auto_test_runs = 0
         self._last_streamed = ""
         self._last_stream_channel = "thought"
         self._thought_log = []
@@ -720,6 +779,9 @@ class Agent:
         self._runtime_smoke_failures = 0
         self._stress_nudges = 0
         self._prefer_write_file = False
+        self._prefer_read_file = False
+        self._last_tool_truncated = False
+        self._fix_hint_path = ""
         self._write_tool_max_tokens = _WRITE_TOOL_MAX_TOKENS
         self._edit_fail_counts = {}
         self._review_needed = False
@@ -744,6 +806,12 @@ class Agent:
                 engine.set_verification_feedback(feedback("follow_up"))
             elif self._libraries_needing_research():
                 engine.set_verification_feedback(feedback("declare_first"))
+        if self._large_markup_goal:
+            engine.set_verification_feedback(feedback("large_markup_goal"))
+            # Keep thought short so the model cannot dump the whole page into chat.
+            self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
+            # Cap constrained write so GBNF short-content rule can finish (skeleton only).
+            self._write_tool_max_tokens = 768
         steps: list[AgentStep] = []
         final_answer = ""
         idle_retry = False
@@ -782,7 +850,9 @@ class Agent:
                 and iteration >= min(test_deadline, self._limits.max_iterations)
             ):
                 return self._result(
-                    final_answer=final_answer or feedback("run.tests_deadline"),
+                    # Never surface the model's last give-up prose as the answer —
+                    # the run stopped because tests stayed red.
+                    final_answer=self._fallback_summary(steps, draft=final_answer),
                     steps=steps,
                     iterations=iteration,
                     stop_reason=StopReason.ERROR,
@@ -840,7 +910,7 @@ class Agent:
                         ) + "Prior verification failed. Focus on Fix → Verify again."
 
                     def _on_chain_step(step_i: int, text: str) -> None:
-                        visible, _ = self._visible_thought(text)
+                        visible, _ = self._visible_thought(_human_part(text))
                         if not visible:
                             return
                         self._emit_thought_text(
@@ -887,10 +957,10 @@ class Agent:
                         f" summary={summary.replace(chr(10), ' ')[:220]!r}"
                     )
                     if final_summary:
-                        visible, _ = self._visible_thought(final_summary)
+                        visible, _ = self._visible_thought(_human_part(final_summary))
                         if visible:
                             self._emit_thought_text(
-                                f"[summary] {visible.strip()}",
+                                visible.strip(),
                                 duration_ms=int((time.monotonic() - cycle_started) * 1000),
                             )
                     allow_reason = False  # classic per-cycle loop skipped this iter
@@ -1054,23 +1124,31 @@ class Agent:
                 display_thought, had_code = self._visible_thought(raw_thought)
                 self._last_streamed = display_thought
                 self._last_stream_channel = channel
-                if display_thought.strip() and display_thought != last_visible.strip():
-                    tail = (
-                        display_thought[len(last_visible) :]
-                        if last_visible and display_thought.startswith(last_visible)
-                        else display_thought
-                    )
-                    if tail.strip():
-                        self._emit(
-                            agent_events.TOKEN,
-                            {
-                                "id": thought_id,
-                                "delta": tail,
-                                "channel": channel,
-                                "duration_ms": int((time.monotonic() - stream_started) * 1000),
-                                "done": False,
-                            },
+                if display_thought.strip():
+                    if channel == "thought":
+                        # Re-send the whole bubble so repeated idle thoughts collapse
+                        # instead of stacking on top of the streamed tokens.
+                        self._emit_thought_text(
+                            display_thought,
+                            duration_ms=int((time.monotonic() - stream_started) * 1000),
                         )
+                    elif display_thought != last_visible.strip():
+                        tail = (
+                            display_thought[len(last_visible) :]
+                            if last_visible and display_thought.startswith(last_visible)
+                            else display_thought
+                        )
+                        if tail.strip():
+                            self._emit(
+                                agent_events.TOKEN,
+                                {
+                                    "id": thought_id,
+                                    "delta": tail,
+                                    "channel": channel,
+                                    "duration_ms": int((time.monotonic() - stream_started) * 1000),
+                                    "done": False,
+                                },
+                            )
                 if self._cancelled():
                     self._close_thought_stream()
                     return self._result(
@@ -1082,6 +1160,10 @@ class Agent:
                     )
                 if "```" in raw_thought or _looks_like_script(raw_thought):
                     engine.set_verification_feedback(feedback("thought_has_code"))
+                    # Code was dumped into thought — shrink budget so the next turn uses tools.
+                    self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 64)
+                    if self._large_markup_goal:
+                        engine.set_verification_feedback(feedback("large_markup_goal"))
                 elif _thought_sentence_count(display_thought) > self._thinking.thought_max_sentences:
                     engine.set_verification_feedback(feedback("thought_too_long"))
             except Exception as exc:  # noqa: BLE001
@@ -1120,16 +1202,38 @@ class Agent:
                 if len(preview) > 240:
                     preview = preview[:239] + "…"
                 truncated = TOOL_CALL_PREFIX in model_output
+                unfinished = bool(_UNFINISHED_ANSWER.search(model_output or ""))
                 if truncated:
                     self._write_tool_max_tokens = max(
                         self._write_tool_max_tokens, _TRUNCATED_WRITE_TOOL_MAX_TOKENS
                     )
                     self._prefer_write_file = True
+                    self._last_tool_truncated = True
                 self._trace(
                     f"iter {iteration} no tool call"
                     + (" (truncated/invalid JSON)" if truncated else "")
                     + (f" raw={preview!r}" if preview else "")
                 )
+                if self._note_stall(model_output, engine):
+                    self._trace(
+                        f"iter {iteration} stalled: same answer x{self._stall_repeats + 1}"
+                        " without a tool call; stopping"
+                    )
+                    steps.append(
+                        self._record_step(
+                            engine,
+                            iteration,
+                            prompt=prompt,
+                            model_output=model_output,
+                            reasoning_need=cot.last_need.value,
+                            reasoning_summary=summary,
+                        )
+                    )
+                    return self._complete(
+                        steps=steps,
+                        iterations=iteration,
+                        draft=model_output,
+                    )
                 if self._verification_enabled() and self._last_verification_ok is not True:
                     if self._last_verification_ok is None and not self._syntax_errors():
                         self._execute_verification(engine, iteration)
@@ -1185,7 +1289,11 @@ class Agent:
                         )
                     )
                     continue
-                if self._tests_still_required():
+                # Re-running pytest without an intervening tool call cannot produce a
+                # new outcome — it only burns the iteration budget. Run once, then let
+                # the idle-retry feedback below push the model back to a tool.
+                if self._tests_still_required() and self._auto_test_runs == 0:
+                    self._auto_test_runs += 1
                     auto_results = self._run_workspace_tests(iteration)
                     if auto_results:
                         self._handle_run_tests_results(auto_results, engine)
@@ -1220,7 +1328,11 @@ class Agent:
                     )
                     engine.set_verification_feedback(review_message(coarsened=self._lock_coarsened))
                     continue
-                if self._needs_tool() and self._idle_tool_retries < _IDLE_TOOL_RETRIES:
+                if (
+                    self._require_tools
+                    and (self._needs_tool() or truncated or unfinished or self._last_tool_truncated)
+                    and self._idle_tool_retries < _IDLE_TOOL_RETRIES
+                ):
                     self._idle_tool_retries += 1
                     steps.append(
                         self._record_step(
@@ -1235,9 +1347,31 @@ class Agent:
                     final_answer = model_output
                     if truncated:
                         self._prefer_write_file = True
-                    engine.set_verification_feedback(
-                        feedback("truncated_json") if truncated else feedback("emit_tool")
-                    )
+                        # Next thought must stay tiny; the model was dumping the page into chat.
+                        self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 64)
+                        if self._large_markup_goal or ".html" in model_output.lower():
+                            engine.set_verification_feedback(feedback("truncated_write_markup"))
+                        else:
+                            engine.set_verification_feedback(feedback("truncated_json"))
+                    elif unfinished:
+                        engine.set_verification_feedback(feedback("continue_work"))
+                    else:
+                        if self._prefer_read_file:
+                            path = self._fix_hint_path or self._guess_impl_path()
+                            engine.set_verification_feedback(
+                                feedback(
+                                    "failed_read_first",
+                                    hint="failed",
+                                    attempt=self._run_tests_failures or 1,
+                                    attempts=_MAX_TEST_FIX_ATTEMPTS,
+                                    remaining=max(0, _MAX_TEST_FIX_ATTEMPTS - self._run_tests_failures),
+                                    path=path,
+                                    extra="",
+                                    detail="",
+                                )
+                            )
+                        else:
+                            engine.set_verification_feedback(feedback("emit_tool"))
                     continue
                 if self._require_tools and not self._acted_once:
                     steps.append(
@@ -1275,6 +1409,24 @@ class Agent:
                         )
                     )
                     continue
+                # Don't finish on prose that admits more work is left.
+                if self._require_tools and unfinished and self._idle_tool_retries < _IDLE_TOOL_RETRIES:
+                    self._idle_tool_retries += 1
+                    engine.set_verification_feedback(feedback("continue_work"))
+                    continue
+                # Never draft-give-up while tests failed / truncated write still pending.
+                if self._require_tools and not self._ran_tests_ok and (
+                    self._run_tests_failures > 0
+                    or self._last_tool_truncated
+                    or unfinished
+                    or self._tests_still_required()
+                ):
+                    engine.set_verification_feedback(
+                        feedback("tests_still_red")
+                        if self._run_tests_failures > 0 or self._tests_still_required()
+                        else feedback("continue_work")
+                    )
+                    continue
                 return self._complete(
                     steps=steps,
                     iterations=iteration,
@@ -1283,6 +1435,9 @@ class Agent:
 
             idle_retry = False
             self._idle_tool_retries = 0
+            self._auto_test_runs = 0
+            self._clear_stall()
+            self._last_tool_truncated = False
             for call in tool_calls:
                 self._trace(f"iter {iteration} tool={call.name} {_compact_args(call.arguments)}")
             snapshots = self._snapshot_paths(tool_calls)
@@ -1361,6 +1516,8 @@ class Agent:
             tool_results = self._fallback_failed_edits(tool_results)
             self._note_review_reads(engine, tool_results)
             self._note_read_files(tool_results)
+            if any(result.success and result.tool_name == "read_file" for result in tool_results):
+                self._prefer_read_file = False
             for result in tool_results:
                 if result.success:
                     self._trace(f"iter {iteration} {result.tool_name} ok {_compact_result(result)}")
@@ -1505,7 +1662,11 @@ class Agent:
                     engine.set_verification_feedback(feedback("readonly_edit_now"))
 
         return self._result(
-            final_answer=final_answer or self._fallback_summary(steps),
+            final_answer=(
+                self._fallback_summary(steps, draft=final_answer)
+                if self._tests_still_required() or self._syntax_broken
+                else (final_answer or self._fallback_summary(steps))
+            ),
             steps=steps,
             iterations=self._limits.max_iterations,
             stop_reason=(
@@ -1596,7 +1757,17 @@ class Agent:
         cleaned = _clean_finish_summary(draft)
         if not self._plan_apis_enabled():
             stub = cleaned.lower().strip()
-            if cleaned and "<tool_call" not in stub and stub not in {"done", "all done.", "all tests passed.", "all tests passed"}:
+            if cleaned and "<tool_call" not in stub and stub not in {
+                "done",
+                "all done.",
+                "all done",
+                "i am done.",
+                "i am done",
+                "i'm done.",
+                "i'm done",
+                "all tests passed.",
+                "all tests passed",
+            }:
                 return cleaned
             return fallback
         facts = self._finish_facts(steps)
@@ -1659,7 +1830,7 @@ class Agent:
             raw = facts.split("changed_files: ", 1)[1].split("\n", 1)[0].strip()
             if raw and raw != "no files recorded":
                 files = raw
-        if self._ran_tests_ok:
+        if self._ran_tests_ok or self._last_verification_ok is True:
             tests = "Tests passed."
         elif self._run_tests_failures >= _MAX_TEST_FIX_ATTEMPTS:
             tests = f"Tests still failing after {_MAX_TEST_FIX_ATTEMPTS}+ fix attempts — run stopped at iteration limit."
@@ -1769,8 +1940,30 @@ class Agent:
         loaded = load_verification_config(self._verification_root, self._verification_config)
         return loaded.has_any_command()
 
+    def _note_stall(self, model_output: str, engine: ContextEngine) -> bool:
+        """Count identical tool-less answers. True when the loop cannot progress."""
+        key = _thought_key(model_output)[:400]
+        if key and key == self._stall_key:
+            self._stall_repeats += 1
+        else:
+            self._stall_key = key
+            self._stall_repeats = 0
+            return False
+        if self._stall_repeats == _STALL_ESCALATE:
+            # Nudging with the same feedback clearly did not work — say so plainly
+            # and let the model pick any tool instead of the one we were pushing.
+            self._prefer_read_file = False
+            engine.set_verification_feedback(feedback("stalled"))
+        return self._stall_repeats >= _STALL_LIMIT
+
+    def _clear_stall(self) -> None:
+        self._stall_key = ""
+        self._stall_repeats = 0
+
     def _needs_tool(self) -> bool:
         if self._syntax_broken:
+            return True
+        if self._last_tool_truncated:
             return True
         if self._plan_gate_phase() is not None:
             return True
@@ -1787,6 +1980,8 @@ class Agent:
         if not self._acted_once:
             return True
         if self._task_wants_tests and not self._ran_tests_ok:
+            return True
+        if self._run_tests_failures > 0 and not self._ran_tests_ok:
             return True
         if self._design_review_still_required():
             return True
@@ -1827,10 +2022,28 @@ class Agent:
         if self._require_tools and self._task_wants_tests and not self._ran_tests_ok:
             names = [name for name in names if name != "run_terminal_command"]
         if self._tests_still_required() and self._plan_gate_phase() is None:
-            names = [name for name in names if name in _CODE_MUTATING_TOOLS or name == "run_tests"]
+            # Keep read_file available — without it the model cannot fix assertion failures
+            # (edit_file needs a verbatim old_string from the file).
+            names = [
+                name
+                for name in names
+                if name in _CODE_MUTATING_TOOLS or name in {"run_tests", "read_file"}
+            ]
             missing_tests = not self._discover_test_files()
-            if (self._prefer_write_file or missing_tests) and "write_file" in names:
+            if self._prefer_read_file and "read_file" in names:
+                names = [
+                    "read_file",
+                    "edit_file",
+                    *[name for name in names if name not in {"read_file", "edit_file"}],
+                ]
+            elif (self._prefer_write_file or missing_tests) and "write_file" in names:
                 names = ["write_file", *[name for name in names if name != "write_file"]]
+            elif "edit_file" in names:
+                names = [
+                    "edit_file",
+                    "read_file",
+                    *[name for name in names if name not in {"edit_file", "read_file"}],
+                ]
             else:
                 names = ["run_tests", *[name for name in names if name != "run_tests"]]
         elif self._design_review_still_required() and "read_file" in names:
@@ -1902,14 +2115,20 @@ class Agent:
             return
         lines = [f"{result.tool_name} failed: {result.error or 'failed'}" for result in failed]
         extra_snippets: list[str] = []
+        markup_truncated = False
         for result in failed:
             err = str(result.error or "failed")
+            err_l = err.lower()
+            if result.tool_name == "write_file" and (
+                "truncated" in err_l or "incomplete" in err_l or "junk" in err_l
+            ):
+                markup_truncated = True
             call = getattr(result, "call", None)
             arguments = getattr(call, "arguments", None) if call is not None else None
             path = arguments.get("path") if isinstance(arguments, dict) else None
             if (
                 path
-                and "old_string not found" not in err.lower()
+                and "old_string not found" not in err_l
                 and not _looks_like_test_path(str(path))
             ):
                 self._pending_impl_files.append(self._abs_impl_path(str(path)))
@@ -1924,8 +2143,11 @@ class Agent:
                         self._prefer_write_file = True
                 locate = self._locate_failed_edit(arguments, err, path)
                 extra_snippets.extend(locate)
-        lines.append(feedback("retry"))
-        if self._prefer_write_file:
+        if markup_truncated:
+            lines.append(feedback("truncated_write_markup"))
+        else:
+            lines.append(feedback("retry"))
+        if self._prefer_write_file and not markup_truncated:
             lines.append(feedback("write_file"))
         if extra_snippets:
             lines.append("\n".join(extra_snippets))
@@ -2271,6 +2493,8 @@ class Agent:
                 self._ran_tests_ok = True
                 self._run_tests_failures = 0
                 self._runtime_smoke_failures = 0
+                self._prefer_read_file = False
+                self._fix_hint_path = ""
                 if self._design_review_still_required():
                     engine.set_verification_feedback(
                         review_message(coarsened=self._lock_coarsened)
@@ -2283,12 +2507,23 @@ class Agent:
             self._run_tests_failures += 1
             timed_out = bool(result.output.get("timed_out"))
             detail = str(result.output.get("stderr") or result.output.get("stdout") or "").strip()
+            missing = _parse_missing_modules(detail)
+            if missing:
+                install_info = self._ensure_missing_deps(missing)
+                self._feedback_missing_dependency(engine, missing, install_info)
+                continue
+            hint_path = _impl_path_from_pytest(detail) or self._guess_impl_path()
+            if hint_path:
+                self._fix_hint_path = hint_path
+            self._prefer_read_file = True
+            self._prefer_write_file = False
             hint = "timed out" if timed_out else "failed"
             extra = ""
             if self._impl_looks_concurrent() and not self._tests_cover_concurrency():
                 extra = feedback("concurrent_hint")
             remaining = _MAX_TEST_FIX_ATTEMPTS - self._run_tests_failures
             detail_block = f"\n{detail[:800]}" if detail else ""
+            path_hint = self._fix_hint_path or "the implementation file"
             if self._run_tests_failures >= _MAX_TEST_FIX_ATTEMPTS:
                 engine.set_verification_feedback(
                     feedback(
@@ -2303,11 +2538,12 @@ class Agent:
             snap_block = f"\nCurrent implementation:\n{snap}" if snap else ""
             engine.set_verification_feedback(
                 feedback(
-                    "failed",
+                    "failed_read_first",
                     hint=hint,
                     attempt=self._run_tests_failures,
                     attempts=_MAX_TEST_FIX_ATTEMPTS,
                     remaining=remaining,
+                    path=path_hint,
                     extra=extra,
                     detail=detail_block + snap_block,
                 )
@@ -2341,10 +2577,10 @@ class Agent:
     def _tests_still_required(self) -> bool:
         return bool(
             self._require_tools
-            and self._task_wants_tests
             and not self._ran_tests_ok
             and not self._syntax_broken
             and self._acted_once
+            and (self._task_wants_tests or self._run_tests_failures > 0)
         )
 
     def _design_review_still_required(self) -> bool:
@@ -2465,6 +2701,84 @@ class Agent:
     def _experiments_enabled(self) -> bool:
         return bool(self._require_tools and "write_file" not in self._disabled_tools)
 
+    def _missing_deps_from_results(self, results: list[ToolResult]) -> list[str]:
+        found: list[str] = []
+        seen: set[str] = set()
+        for result in results:
+            if result.tool_name != "run_tests" or not isinstance(result.output, dict):
+                continue
+            detail = str(result.output.get("stderr") or result.output.get("stdout") or "")
+            for name in _parse_missing_modules(detail):
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(name)
+        return found
+
+    def _ensure_missing_deps(self, modules: list[str]) -> dict[str, Any]:
+        try:
+            from mango_epistemic.install_deps import ensure_packages
+        except ImportError:
+            return {"ok": False, "installed": [], "failed": list(modules), "command": None}
+        info = ensure_packages(modules)
+        if info.get("command"):
+            pkgs = info.get("installed") or info.get("failed") or modules
+            label = ", ".join(str(x) for x in pkgs)
+            self._emit(
+                agent_events.TOOL,
+                {
+                    "id": f"tool-pip-dep-{self._run_id}-{self._current_iteration}",
+                    "name": "run_terminal_command",
+                    "title": (
+                        f"Installed {label}"
+                        if info.get("ok") and info.get("installed")
+                        else f"pip install {label}"
+                    ),
+                    "body": "\n".join(
+                        part
+                        for part in (
+                            str(info.get("command") or ""),
+                            str(info.get("stdout") or "")[-800:],
+                            str(info.get("stderr") or "")[-800:],
+                        )
+                        if part
+                    )[:1_500]
+                    or None,
+                    "console": True,
+                    "ok": bool(info.get("ok")),
+                    "streaming": False,
+                },
+            )
+        return info
+
+    def _feedback_missing_dependency(
+        self,
+        engine: ContextEngine,
+        modules: list[str],
+        install_info: dict[str, Any] | None = None,
+    ) -> None:
+        pkgs = ", ".join(modules) or "unknown"
+        command = ""
+        if install_info:
+            command = str(install_info.get("command") or "")
+            if install_info.get("ok") and install_info.get("installed"):
+                engine.set_verification_feedback(
+                    feedback(
+                        "missing_dependency_installed",
+                        pkgs=", ".join(str(x) for x in install_info["installed"]) or pkgs,
+                        command=command or f"pip install {pkgs}",
+                    )
+                )
+                return
+        engine.set_verification_feedback(
+            feedback(
+                "missing_dependency",
+                pkgs=pkgs,
+                command=command or f"python -m pip install {pkgs}",
+            )
+        )
+
     def _tests_ok_from_results(self, results: list[ToolResult]) -> bool | None:
         found: bool | None = None
         for result in results:
@@ -2580,6 +2894,26 @@ class Agent:
                     }
             return False
         tests_ok = self._tests_ok_from_results(tool_results)
+        missing_deps = self._missing_deps_from_results(tool_results)
+        if missing_deps and not syntax_bad:
+            # Dependency errors are not code-hypothesis failures — don't revert edits.
+            install_info = self._ensure_missing_deps(missing_deps)
+            self._feedback_missing_dependency(engine, missing_deps, install_info)
+            self._emit(
+                agent_events.EXPERIMENT,
+                {
+                    "hypothesis": self._last_hypothesis,
+                    "before": None,
+                    "after": None,
+                    "unit": "ms",
+                    "decision": "keep",
+                    "delta_pct": None,
+                    "reason": "missing_dependency",
+                },
+            )
+            self._ran_tests_ok = False
+            self._trace(f"iter {iteration} skip experiment revert; missing deps={missing_deps}")
+            return False
         before, after, command_changed = (None, None, False)
         if not syntax_bad:
             before, after, command_changed = self._collect_perf_pair(
@@ -3125,6 +3459,20 @@ class Agent:
                 ordered.append(path)
         return ordered[:12]
 
+    def _guess_impl_path(self) -> str:
+        if self._fix_hint_path:
+            return self._fix_hint_path
+        for path in self._impl_python_files():
+            name = Path(path).name.lower()
+            if name.startswith("test_"):
+                continue
+            if any(hint in name for hint in _IMPL_NAME_HINTS):
+                return self._display_path(path)
+        files = [p for p in self._impl_python_files() if not Path(p).name.lower().startswith("test_")]
+        if files:
+            return self._display_path(files[0])
+        return "bot.py"
+
     def _impl_python_files(self) -> list[str]:
         root = self._verification_root
         if root is None:
@@ -3345,8 +3693,16 @@ class Agent:
             header = ""
             if isinstance(looked, list) and looked:
                 header = "Looked up " + ", ".join(str(item) for item in looked if item)
+            install_cmd = str(output.get("install_command") or "").strip()
+            installed = output.get("installed") or []
+            install_line = ""
+            if install_cmd:
+                names = ", ".join(str(x) for x in installed) if isinstance(installed, list) else ""
+                install_line = f"pip install {names}".strip() if names else install_cmd
+                if output.get("install_ok") is False:
+                    install_line = f"FAILED: {install_line}"
             text = details or signature
-            body = "\n\n".join(part for part in (header, text) if part)
+            body = "\n\n".join(part for part in (install_line, header, text) if part)
             return body[:1_500]
         if isinstance(output, dict):
             parts = [
@@ -3505,6 +3861,44 @@ class Agent:
                     tool_id = f"tool-run-tests-{self._run_id}-{self._current_iteration}"
                 elif name == "ask_epistemic":
                     tool_id = f"tool-ask-epistemic-{self._run_id}-{self._current_iteration}"
+                    # Show auto-pip as its own console chip before the epistemic brief.
+                    if isinstance(output, dict) and output.get("install_command"):
+                        pkgs = output.get("installed") or []
+                        failed = output.get("failed") or []
+                        install_ok = bool(output.get("install_ok", True))
+                        if install_ok and pkgs:
+                            pkg_label = ", ".join(str(x) for x in pkgs)
+                            title_pip = f"Installed {pkg_label}"
+                        elif failed:
+                            pkg_label = ", ".join(str(x) for x in failed)
+                            title_pip = f"pip install failed: {pkg_label}"
+                        else:
+                            # Fall back to parsing package names from the command.
+                            cmd = str(output.get("install_command") or "")
+                            bits = cmd.split("pip install", 1)
+                            pkg_label = bits[1].strip() if len(bits) > 1 else "packages"
+                            title_pip = f"pip install {pkg_label}"
+                        install_body = "\n".join(
+                            part
+                            for part in (
+                                str(output.get("install_command") or ""),
+                                str(output.get("install_stdout") or "")[-800:],
+                                str(output.get("install_stderr") or "")[-800:],
+                            )
+                            if part
+                        )
+                        self._emit(
+                            agent_events.TOOL,
+                            {
+                                "id": f"tool-pip-install-{self._run_id}-{self._current_iteration}",
+                                "name": "run_terminal_command",
+                                "title": title_pip,
+                                "body": install_body[:1_500] or None,
+                                "console": True,
+                                "ok": install_ok,
+                                "streaming": False,
+                            },
+                        )
                 elif name == "declare_apis":
                     tool_id = f"tool-declare-apis-{self._run_id}-{self._current_iteration}"
                 elif name in {
@@ -3632,6 +4026,62 @@ def _looks_like_script(text: str) -> bool:
     return hits >= 3
 
 
+_MISSING_MODULE = re.compile(
+    r"No module named ['\"]([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z0-9_.]*)?['\"]",
+    re.IGNORECASE,
+)
+_MISSING_MODULE_BARE = re.compile(
+    r"ModuleNotFoundError:\s*([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_missing_modules(text: str) -> list[str]:
+    """Extract top-level import roots from pytest ModuleNotFoundError output."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _MISSING_MODULE.finditer(text or ""):
+        root = match.group(1)
+        key = root.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(root)
+    if not found:
+        for match in _MISSING_MODULE_BARE.finditer(text or ""):
+            root = match.group(1)
+            key = root.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(root)
+    return found
+
+
+_PYTEST_FILE = re.compile(
+    r"(?m)^(?:[A-Za-z]:)?[^\s:][/\\]?[\w./\\-]*?([^/\\:\s]+)\.py(?::\d+)?(?:\s|$|:)",
+)
+_IMPL_NAME_HINTS = ("bot", "discord_bot", "formulas", "main", "app")
+
+
+def _impl_path_from_pytest(text: str) -> str | None:
+    """Best-effort implementation path from pytest failure text (not test_*.py)."""
+    candidates: list[str] = []
+    for match in re.finditer(r"([\w./\\-]+\.py)", text or ""):
+        path = match.group(1).replace("\\", "/")
+        name = Path(path).name.lower()
+        if name.startswith("test_") or name == "conftest.py":
+            continue
+        if "/tests/" in path.lower() or "\\tests\\" in match.group(1).lower():
+            continue
+        candidates.append(Path(path).name)
+    for name in candidates:
+        stem = Path(name).stem.lower()
+        if any(hint in stem for hint in _IMPL_NAME_HINTS):
+            return name
+    return candidates[0] if candidates else None
+
+
 def _should_write_file_fallback(new_string: str, existing: str) -> bool:
     if not _looks_like_script(new_string):
         return False
@@ -3695,6 +4145,17 @@ def _thought_sentence_count(text: str) -> int:
     return len([p for p in parts if p.strip()])
 
 
+def _human_part(text: str) -> str:
+    """Drop the internal `next=` / `facts=` / `verify=` segments of a CoT line."""
+    head = re.split(r"\s\|\s(?:next|facts|verify)=", text or "", maxsplit=1)[0]
+    return head.strip()
+
+
+def _thought_key(text: str) -> str:
+    """Normalized form used to recognize a thought we already showed."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
 def _sanitize_thought(
     text: str,
     *,
@@ -3728,6 +4189,18 @@ def _sanitize_thought(
     display = " ".join(cleaned.split()).strip()
     sentences = re.split(r"(?<=[.!?])\s+", display)
     sentences = [s.strip() for s in sentences if s.strip()]
+    # Small quantized models fall into "same sentence forever" loops. Keep the
+    # first occurrence only, otherwise the thought bubble fills with one line.
+    unique: list[str] = []
+    seen_sentences: set[str] = set()
+    for sentence in sentences:
+        key = _thought_key(sentence)
+        if key in seen_sentences:
+            continue
+        seen_sentences.add(key)
+        unique.append(sentence)
+    sentences = unique
+    display = " ".join(sentences)
     cap = max(1, int(max_sentences))
     if len(sentences) > cap:
         display = " ".join(sentences[:cap])

@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
 import { useAgent } from "../context/AgentSession";
+import { loadThinkingLevel } from "../lib/thinkingLevel";
+import {
+  loadThoughtMaxTokens,
+  saveThoughtMaxTokens,
+  THOUGHT_TOKEN_PRESETS,
+} from "../lib/thoughtTokens";
 import styles from "../styles/modal.module.css";
 
 export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element {
@@ -9,12 +15,18 @@ export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element
   const [topP, setTopP] = useState("0.95");
   const [nCtx, setNCtx] = useState("");
   const [configPath, setConfigPath] = useState("");
+  const [thoughtMaxTokens, setThoughtMaxTokens] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const thinkingLevel = loadThinkingLevel();
+  const presetThought = THOUGHT_TOKEN_PRESETS[thinkingLevel] ?? 128;
 
   useEffect(() => {
     void (async () => {
       setConfigPath(await window.mango.app.configPath());
+      const stored = loadThoughtMaxTokens();
+      setThoughtMaxTokens(stored == null ? "" : String(stored));
       try {
         const settings = await window.mango.sidecar.settings();
         setModelPath(String(settings.model_path ?? ""));
@@ -39,8 +51,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element
     setBusy(true);
     setError(null);
     try {
-      await window.mango.sidecar.setModelPath(modelPath);
-      await selectModel(modelPath);
+      const raw = thoughtMaxTokens.trim();
+      if (!raw) {
+        saveThoughtMaxTokens(null);
+      } else {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 32 || n > 4096) {
+          throw new Error("Thought max tokens must be between 32 and 4096 (or empty for auto).");
+        }
+        saveThoughtMaxTokens(Math.round(n));
+      }
+      if (modelPath.trim()) {
+        await window.mango.sidecar.setModelPath(modelPath);
+        await selectModel(modelPath);
+      }
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -53,7 +77,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element
     <div className={styles.overlay} onClick={onClose} role="presentation">
       <div className={styles.panel} onClick={(event) => event.stopPropagation()} role="dialog">
         <div className={styles.head}>
-          <span>Settings</span>
+          <span>Customize</span>
           <button className={styles.close} type="button" onClick={onClose}>
             ×
           </button>
@@ -62,6 +86,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element
           <label>
             MODEL PATH
             <input value={modelPath} onChange={(event) => setModelPath(event.target.value)} />
+          </label>
+          <label>
+            THOUGHT MAX TOKENS
+            <input
+              value={thoughtMaxTokens}
+              onChange={(event) => setThoughtMaxTokens(event.target.value)}
+              placeholder={`auto (${presetThought} from Thinking · ${thinkingLevel})`}
+              inputMode="numeric"
+            />
           </label>
           <label>
             TEMPERATURE
@@ -85,7 +118,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }): JSX.Element
               Cancel
             </button>
             <button className={styles.primary} type="button" disabled={busy} onClick={() => void save()}>
-              Save path
+              Save
             </button>
           </div>
         </div>

@@ -19,10 +19,12 @@ def compress_reasoning_state(
         lines.append("Next: " + _clip(reasoning_state.next_action, 160))
     _extend_bullets(lines, "Facts", reasoning_state.known_facts, 3, 100)
     _extend_bullets(lines, "Decisions", reasoning_state.decisions, 2, 100)
-    _extend_bullets(lines, "Avoid", reasoning_state.failed_attempts, 3, 100)
-    _extend_bullets(lines, "Open", reasoning_state.open_questions, 2, 100)
+    # Assumptions before Avoid: long verification dumps used to truncate the
+    # Assume line under the action-prompt char budget, dropping the next fix.
     if reasoning_state.assumptions:
-        _extend_bullets(lines, "Assume", reasoning_state.assumptions, 1, 100)
+        _extend_bullets(lines, "Assume", reasoning_state.assumptions, 2, 120)
+    _extend_bullets(lines, "Avoid", reasoning_state.failed_attempts, 2, 80)
+    _extend_bullets(lines, "Open", reasoning_state.open_questions, 2, 100)
 
     summary = "\n".join(lines).strip()
     if len(summary) <= max_chars:

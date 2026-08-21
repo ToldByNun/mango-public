@@ -72,7 +72,24 @@ def usable_api_brief(value: Any) -> bool:
     if len(text) < 40:
         return False
     low = text.lower()
-    if any(token in low for token in ("i will ", "i'll ", "let me ", "using the doc_lookup", "using the tool")):
+    if any(
+        token in low
+        for token in (
+            "i will ",
+            "i'll ",
+            "let me ",
+            "using the doc_lookup",
+            "using the tool",
+            "import failed",
+            "no module named",
+            "attribute failed",
+            "install failed",
+            "auto-installed:",
+        )
+    ):
+        return False
+    # Error cards from format_usage_card: "discord: not found"
+    if re.search(r":\s*not found\s*$", low) or low.strip().endswith("not found"):
         return False
     if _JUNK_SIG.search(text) and "append" not in low and "import " not in low:
         return False

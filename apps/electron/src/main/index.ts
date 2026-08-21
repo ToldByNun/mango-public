@@ -149,17 +149,24 @@ function registerIpc(): void {
         workspace?: string;
         generateTitle?: boolean;
         thinkingLevel?: string;
+        thoughtMaxTokens?: number | null;
       },
     ) => {
     const child = await ensureSidecar();
     const ws = resolveAgentWorkspace(payload.sessionId, payload.workspace);
     sidecar?.setWorkspace(ws);
+    const thoughtRaw = payload.thoughtMaxTokens;
+    const thoughtMaxTokens =
+      typeof thoughtRaw === "number" && Number.isFinite(thoughtRaw)
+        ? Math.max(32, Math.min(4096, Math.round(thoughtRaw)))
+        : undefined;
     const result = await child.request("run", {
       session_id: payload.sessionId,
       goal: payload.goal,
       workspace: ws,
       generate_title: Boolean(payload.generateTitle),
       thinking_level: String(payload.thinkingLevel || "off"),
+      ...(thoughtMaxTokens != null ? { thought_max_tokens: thoughtMaxTokens } : {}),
     });
     modelLoaded = true;
     const used = typeof result.workspace === "string" && result.workspace ? String(result.workspace) : ws;

@@ -182,6 +182,7 @@
 
 .statusThought .statusBody {
   max-width: 72ch;
+  color: var(--text-tertiary);
 }
 
 .diffBlock {

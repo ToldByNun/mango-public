@@ -24,6 +24,10 @@ class InferenceConfig:
     temperature: float = 0.1
     top_p: float = 0.95
     stop: list[str] = field(default_factory=list)
+    # 1.0 disables the penalty, which makes low-temperature quantized models
+    # repeat one sentence until the token budget is gone.
+    repeat_penalty: float = 1.12
+    repeat_last_n: int = 256
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,8 @@ class RuntimeConfig:
                 temperature=float(inference.get("temperature", 0.1)),
                 top_p=float(inference.get("top_p", 0.95)),
                 stop=list(inference.get("stop", [])),
+                repeat_penalty=float(inference.get("repeat_penalty", 1.12)),
+                repeat_last_n=int(inference.get("repeat_last_n", 256)),
             ),
         )
 

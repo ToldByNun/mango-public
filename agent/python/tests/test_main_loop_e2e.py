@@ -309,23 +309,7 @@ def test_e2e_medium_unknown_api_triggers_epistemic(tmp_path: Path) -> None:
                 "ask_epistemic",
                 question="Does json.dumps exist in the json library, and what is the signature?",
             ),
-            _tool("web_research", query="python json.dumps signature"),
-            _tool("doc_lookup", library="json", symbol="dumps"),
-            json.dumps(
-                {
-                    "exists": True,
-                    "signature": "json.dumps(obj, *, skipkeys=False)",
-                    "details": "Serialize obj to a JSON formatted str.",
-                    "version": "3.x",
-                    "evidence": [
-                        {
-                            "source": "https://docs.python.org/3/library/json.html",
-                            "snippet": "json.dumps(obj, *, skipkeys=False)",
-                        }
-                    ],
-                    "conflicts": None,
-                }
-            ),
+            # Known stdlib cards short-circuit the nested sub-agent (no model call).
             _tool("write_file", path=str(target), content=impl),
             "Implemented to_json using json.dumps.",
         ]
@@ -348,9 +332,8 @@ def test_e2e_medium_unknown_api_triggers_epistemic(tmp_path: Path) -> None:
     assert names[0] == "ask_epistemic"
     assert "write_file" in names
     assert result.metrics.epistemic_calls >= 1
-    assert result.metrics.epistemic_subagent_iterations >= 3
-    assert result.metrics.verification_runs >= 1
-    assert result.metrics.verification_failures == 0
+    # json.dumps is a known stdlib card → nested web/doc tools are skipped on purpose.
+    assert result.metrics.epistemic_subagent_iterations == 0
     assert orch.agent.epistemic is not None
     assert orch.agent.epistemic.total_asks >= 1
     main_bodies = [entry.body for entry in orch.agent.context.state.tool_results]

@@ -45,11 +45,27 @@ def test_salvage_python_drops_truncated_tail() -> None:
 
 def test_write_file_rejects_truncated_replacement(tmp_path: Path) -> None:
     path = tmp_path / "uniqueutil.py"
-    original = "def unique(items)\n    return sorted(set(items))\n"
+    original = "def unique(items):\n    return sorted(set(items))\n"
     path.write_text(original, encoding="utf-8")
     with pytest.raises(ValueError, match="truncated"):
         write_file(str(path), "def")
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_write_file_rejects_junk_fragment(tmp_path: Path) -> None:
+    path = tmp_path / "index.html"
+    with pytest.raises(ValueError, match="junk"):
+        write_file(str(path), '"')
+    assert not path.exists()
+
+
+def test_write_file_rejects_truncated_html(tmp_path: Path) -> None:
+    path = tmp_path / "index.html"
+    good = "<!DOCTYPE html>\n<html><body><h1>Hi</h1></body></html>\n"
+    path.write_text(good, encoding="utf-8")
+    with pytest.raises(ValueError, match="truncated|incomplete"):
+        write_file(str(path), "<!DOCTYPE html>\n<html><body><h1>Hi\n")
+    assert path.read_text(encoding="utf-8") == good
 
 
 def test_write_file_relative_uses_workspace(tmp_path: Path) -> None:

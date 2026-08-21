@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AgentEvent, Session, TranscriptBlock } from "@shared/events";
 import { applyAgentEvent, composeAgentGoal, createSession, newId } from "../lib/session";
+import { loadThoughtMaxTokens } from "../lib/thoughtTokens";
 
 type MangoApi = typeof window.mango;
 
@@ -241,6 +242,7 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
         runWorkspace,
         generateTitle,
         thinkingLevel,
+        loadThoughtMaxTokens(),
       );
       void runPromise
         .then(async (result) => {

@@ -156,15 +156,20 @@ def _render(
 
 
 def build_idle_retry_prompt(context_state: ContextState) -> str:
-    """Tiny follow-up after a no-tool reply so idle turns do not resend the full window."""
+    """Tiny follow-up after a no-tool reply — keep Goal short to avoid thought re-planning."""
     sections: list[str] = [
         "Your previous reply had no tool call. Do not give a final answer.",
     ]
     if context_state.tool_instruction.strip():
         sections.append(context_state.tool_instruction.strip())
-    sections.append(f"## Goal\n{context_state.goal.strip()}")
+    goal = (context_state.goal or "").strip()
+    if goal:
+        first = goal.splitlines()[0].strip()
+        if len(first) > 160:
+            first = first[:157].rstrip() + "…"
+        sections.append(f"## Goal\n{first}")
     if getattr(context_state, "memory", None) is not None and not context_state.memory.is_empty():
-        memory_text = context_state.memory.render(max_chars=min(800, context_state.budget.memory_max_chars))
+        memory_text = context_state.memory.render(max_chars=min(400, context_state.budget.memory_max_chars))
         if memory_text:
             sections.append("## Memory\n" + memory_text)
     if context_state.verification_feedback.strip():
@@ -180,7 +185,7 @@ def build_idle_retry_prompt(context_state: ContextState) -> str:
     else:
         next_bit = (
             "Emit a tool call now (edit_symbol, read_file, or write_file). "
-            "Do not finish yet."
+            "Do not restate the goal. Do not finish yet."
         )
     sections.append("## Next\n" + next_bit)
     return "\n\n".join(sections) + "\n"

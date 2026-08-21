@@ -42,6 +42,9 @@ class GGUFLoader:
             "n_ubatch": n_ubatch,
             "n_gpu_layers": hardware.n_gpu_layers,
             "n_threads": hardware.n_threads or None,
+            # Window the repeat penalty looks back over; the default 64 is too
+            # short to break a repeated sentence.
+            "last_n_tokens_size": max(64, self._config.inference.repeat_last_n),
             "offload_kqv": True,
             "flash_attn": True,
             # Gemma 4 ISWA: full-size SWA cache at n_ctx=16k fills 16GB and

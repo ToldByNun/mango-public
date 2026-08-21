@@ -22,10 +22,14 @@ export function pythonExecutable(repoRoot: string): string {
   const candidates =
     process.platform === "win32"
       ? [
+          // Portable embeddable Python shipped in the installer
+          join(repoRoot, "python", "python.exe"),
           join(repoRoot, ".venv", "Scripts", "python.exe"),
           join(repoRoot, "agent", "python", ".venv", "Scripts", "python.exe"),
         ]
       : [
+          join(repoRoot, "python", "bin", "python"),
+          join(repoRoot, "python", "python"),
           join(repoRoot, ".venv", "bin", "python"),
           join(repoRoot, "agent", "python", ".venv", "bin", "python"),
         ];

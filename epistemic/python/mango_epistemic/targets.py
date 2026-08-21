@@ -30,15 +30,18 @@ _MODULE_DEFAULTS: dict[str, list[tuple[str, str]]] = {
     "argparse": [("argparse", "ArgumentParser")],
     "pathlib": [("pathlib", "Path")],
     "pandas": [("pandas", "read_csv")],
-        "json": [("json", "dumps")],
-        "csv": [("csv", "DictReader")],
-        "concurrent": [("concurrent.futures", "ThreadPoolExecutor")],
-        "futures": [("concurrent.futures", "ThreadPoolExecutor")],
-        "os": [("os", "path")],
+    "json": [("json", "dumps")],
+    "csv": [("csv", "DictReader")],
+    "concurrent": [("concurrent.futures", "ThreadPoolExecutor")],
+    "futures": [("concurrent.futures", "ThreadPoolExecutor")],
+    "os": [("os", "path")],
     "sys": [("sys", "argv")],
     "re": [("re", "compile")],
     "asyncio": [("asyncio", "Lock")],
+    "discord": [("discord", "Client"), ("discord.ext.commands", "Bot")],
 }
+
+_SKIP_BARE = frozenset({"commands", "ext", "bot", "client", "utils", "helpers"})
 
 
 def lookup_targets(question: str, *, limit: int = 6) -> list[tuple[str, str]]:
@@ -60,6 +63,11 @@ def lookup_targets(question: str, *, limit: int = 6) -> list[tuple[str, str]]:
         if package.lower() == "concurrent" and symbol.lower() == "futures":
             add("concurrent.futures", "ThreadPoolExecutor")
             continue
+        # PyPI names like discord.py are not package.symbol lookups.
+        if symbol.lower() == "py":
+            for item in _MODULE_DEFAULTS.get(package.lower()) or [(package, "")]:
+                add(*item)
+            continue
         add(package, symbol)
 
     words = _WORD.findall(blob)
@@ -68,7 +76,10 @@ def lookup_targets(question: str, *, limit: int = 6) -> list[tuple[str, str]]:
         if alias:
             add(*alias)
     for word in words:
-        for item in _MODULE_DEFAULTS.get(word.lower()) or []:
+        key = word.lower()
+        if key in _SKIP_BARE:
+            continue
+        for item in _MODULE_DEFAULTS.get(key) or []:
             add(*item)
     return found[:limit]
 

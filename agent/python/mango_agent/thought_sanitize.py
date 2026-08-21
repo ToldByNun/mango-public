@@ -17,8 +17,13 @@ _FENCE_RE = re.compile(r"```[\w+-]*\n[\s\S]*?```", re.MULTILINE)
 def strip_thought_markup(text: str) -> str:
     if not text:
         return ""
-    cut = re.search(r"<tool_call\b", text, flags=re.IGNORECASE)
-    head = text[: cut.start()] if cut else text
+    cuts = []
+    for pat in (r"<tool_call\b", r"<\s*write_file\b"):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            cuts.append(m.start())
+    cut_at = min(cuts) if cuts else None
+    head = text[:cut_at] if cut_at is not None else text
     dump = re.search(r"[A-Za-z_][\w.]*\([^)]*\)\s*\|", head)
     until_dump = head[: dump.start()] if dump else head
     cleaned = _CHANNEL_RE.sub("", until_dump)

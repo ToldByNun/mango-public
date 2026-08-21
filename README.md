@@ -213,6 +213,8 @@ Artifacts land in `apps/electron/release/` (e.g. `Mango-Setup-0.1.0.exe`). Optio
 
 Installed builds check **Help → Check for Updates** against [mango-public releases](https://github.com/ToldByNun/mango-public/releases).
 
+The installer ships a **portable embeddable Python** (not a machine-local `.venv`). Recipients set their GGUF path under **Settings** after install.
+
 ## Tests
 
 CI runs the full unit suite on every push/PR (excludes `smoke` / `swebench_live`). Locally:

@@ -8,15 +8,23 @@ from mango_tools.format import TOOL_CALL_PREFIX
 # Applied only AFTER TOOL_CALL_PREFIX. Flat JSON strings only — cheaper token masks.
 _PAYLOAD_GBNF = r"""
 string ::= "\"" char* "\""
-char   ::= [^"\\] | "\\" (["\\] | "n" | "t" | "/")
+char   ::= [^"\\] | "\\" (["\\] | "n" | "t" | "/" | "r")
 ws     ::= [ \t]*
 """
 
+# write_file: prefer markdown fence (raw body, real newlines). Recursive write-body so
+# the closing ``` is reachable (unlike greedy wr-char{n,}). Short JSON content is an
+# alternate for tiny skeletons.
 _WRITE_FILE_GBNF = r"""
-write-file-full ::= "write_file" " : " write-file-obj ">" "\n" "```" "\n" write-raw "```"
-write-file-obj ::= "{" ws "\"path\"" ":" ws string ws "}"
-write-raw ::= wr-char{24,}
+write-file-full ::= write-file-fence | write-file-json
+write-file-fence ::= "write_file" " : " write-file-path ">" "\n" "```" "\n" write-body
+write-file-path ::= "{" ws "\"path\"" ":" ws string ws "}"
+write-body ::= "```" | wr-char write-body
 wr-char ::= [^`] | "`" [^`] | "``" [^`]
+write-file-json ::= "write_file" " : " write-file-json-obj ">"
+write-file-json-obj ::= "{" ws "\"path\"" ":" ws string ws "," ws "\"content\"" ":" ws content-string ws "}"
+content-string ::= "\"" content-char{8,500} "\""
+content-char ::= [^"\\] | "\\" (["\\] | "n" | "t" | "/" | "r")
 """
 
 _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
@@ -44,8 +52,8 @@ def tool_call_gbnf(
 ) -> str:
     """GBNF for the bytes after `<tool_call=`. Thought stays unconstrained.
 
-    write_file uses a markdown fence after the JSON path so file bodies are
-    raw Python (real newlines), not a JSON-escaped string that truncates.
+    write_file prefers a markdown fence after ``{"path": ...}>`` so bodies use
+    raw newlines. A short JSON ``content`` alternate exists for tiny files.
     """
     del allow_final_answer
     names = [name for name in tool_names if name and name.replace("_", "").isalnum()]

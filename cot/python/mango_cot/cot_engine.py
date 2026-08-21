@@ -16,6 +16,29 @@ REASONING_MARKER = "[Mango reasoning cycle]"
 SHORT_MAX_TOKENS = 192
 EXTENDED_MAX_TOKENS = 384
 
+# Under a JSON grammar the model sometimes copies the schema from the prompt
+# instead of filling it in, which used to surface as "[summary] string | next=string".
+_SCHEMA_PLACEHOLDERS = frozenset(
+    {
+        "string",
+        "str",
+        "strings",
+        "text",
+        "thought",
+        "summary",
+        "next_action",
+        "verify_plan",
+        "known_facts",
+        "...",
+        "…",
+        "n/a",
+        "none",
+        "null",
+        "todo",
+        "tbd",
+    }
+)
+
 
 class ModelRunnerLike(Protocol):
     def complete(self, prompt: str, **kwargs: Any) -> Any: ...
@@ -177,7 +200,11 @@ class CoTEngine:
             raw = str(getattr(completion, "text", completion) or "")
             payload = parse_reasoning_payload(raw)
             text = _chain_step_text(payload, raw)
-            step_texts.append(text)
+            # A repeated step adds nothing and would push the real content out of
+            # the next step's prompt.
+            fresh = bool(text) and text not in step_texts
+            if fresh:
+                step_texts.append(text)
             self._cycle_counter += 1
             self.trace.add(
                 need=ReasoningNeed.EXTENDED,
@@ -186,7 +213,7 @@ class CoTEngine:
                 summary=text[:240],
                 cycle=self._cycle_counter,
             )
-            if on_step is not None:
+            if on_step is not None and fresh:
                 on_step(index, text)
 
         if not step_texts:
@@ -253,8 +280,11 @@ def _chain_step_text(payload: dict[str, Any], raw: str) -> str:
         bits.append("facts=" + "; ".join(facts[:4]))
     if bits:
         return " | ".join(bits)
+    if payload:
+        # Parsed fine but every field was a schema placeholder — nothing to report.
+        return ""
     compact = " ".join(raw.split())
-    return compact[:500] if compact else "(empty step)"
+    return compact[:500] if compact else ""
 
 
 def _chain_summary_text(payload: dict[str, Any], step_texts: list[str]) -> str:
@@ -395,20 +425,29 @@ def _context_snapshot(context_state: Any, *, max_chars: int = 1_200) -> str:
     return text[: max_chars - 14].rstrip() + "\n...[truncated]"
 
 
+def _is_placeholder(value: str) -> bool:
+    """True for values echoed straight from the JSON schema in the prompt."""
+    compact = " ".join(str(value or "").split()).strip().strip("\"'[]<>").lower()
+    return compact in _SCHEMA_PLACEHOLDERS
+
+
 def _as_text(value: Any) -> str:
     if value is None:
         return ""
-    return _one_line(str(value), 240)
+    text = _one_line(str(value), 240)
+    return "" if _is_placeholder(text) else text
 
 
 def _as_str_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item).strip()]
-    return [str(value)]
+        items = [value]
+    elif isinstance(value, list):
+        items = [str(item) for item in value]
+    else:
+        items = [str(value)]
+    return [item for item in items if item.strip() and not _is_placeholder(item)]
 
 
 def _one_line(text: str, limit: int) -> str:

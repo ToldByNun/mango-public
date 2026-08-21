@@ -15,12 +15,22 @@ _XML_TAG = re.compile(
     re.IGNORECASE,
 )
 
+# Models often invent `<write_file | {...}>` instead of `<tool_call=write_file : {...}>`.
+_TOOL_NAMES = (
+    "write_file|edit_file|read_file|edit_symbol|rename_symbol|search_code|"
+    "codebase_lookup|ask_epistemic|declare_apis|run_terminal_command|measure|run_tests"
+)
+_INFORMAL_TAG = re.compile(
+    rf"<\s*({_TOOL_NAMES})\s*[|:]\s*",
+    re.IGNORECASE,
+)
+
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
     """Extract embedded tool calls from model output."""
     calls: list[ToolCall] = []
     seen: set[tuple[int, str]] = set()
-    for pattern in (_OPEN_TAG, _XML_TAG):
+    for pattern in (_OPEN_TAG, _XML_TAG, _INFORMAL_TAG):
         for match in pattern.finditer(text):
             name = match.group(1)
             json_start = match.end()
@@ -31,10 +41,13 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
             if arguments is None:
                 continue
             if name.replace("-", "_").lower() == "write_file":
-                fenced, fence_end = _extract_fenced_content(text, json_end)
-                if fenced is not None:
+                fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
+                if fenced is not None and fence_complete:
                     arguments["content"] = fenced
                     json_end = fence_end
+                elif fenced is not None and not fence_complete:
+                    # Truncated generation: do not treat partial fence as a successful write.
+                    continue
             if name.replace("-", "_").lower() == "write_file" and not str(arguments.get("content") or ""):
                 continue
             key = (match.start(), name)
@@ -95,11 +108,16 @@ def _extract_json_object(text: str, start: int) -> tuple[str | None, int]:
     return None, start
 
 
-def _extract_fenced_content(text: str, after_json: int) -> tuple[str | None, int]:
+def _extract_fenced_content(text: str, after_json: int) -> tuple[str | None, int, bool]:
+    """Return (content, end_index, fence_closed).
+
+    If the opening ``` is present but the closing fence is missing, content is
+    the partial body and fence_closed is False — callers must not write it.
+    """
     rest = text[after_json:]
     start = rest.find("```")
     if start < 0:
-        return None, after_json
+        return None, after_json, True
     body = start + 3
     if body < len(rest) and rest[body] in "\r\n":
         body += 1
@@ -113,11 +131,11 @@ def _extract_fenced_content(text: str, after_json: int) -> tuple[str | None, int
     end = rest.find("```", body)
     if end < 0:
         content = rest[body:]
-        return content, after_json + len(rest)
+        return content, after_json + len(rest), False
     content = rest[body:end]
     if content.startswith("python\n"):
         content = content[7:]
-    return content, after_json + end + 3
+    return content, after_json + end + 3, True
 
 
 def _find_closing_bracket(text: str, after_json: int) -> int:

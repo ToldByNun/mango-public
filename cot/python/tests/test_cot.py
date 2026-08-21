@@ -180,6 +180,25 @@ def test_compress_reasoning_state_is_compact() -> None:
     assert len(summary) < len(raw)
 
 
+def test_compress_keeps_assumptions_under_tight_budget() -> None:
+    fact = "round discount to cents before money truncates"
+    state = ReasoningState(
+        goal="Fix pricing",
+        known_facts=["money() uses int(n * 100) and truncates fractional cents"],
+        decisions=["quantize discount to 2 decimals before formatting"],
+        assumptions=[fact],
+        failed_attempts=[
+            "verification: Verification failed (attempt 1/5) Tests: 2 passed, 1 failed "
+            "still failing: test_discount_money_cents -> discount_money_cents() AssertionError "
+            + ("x" * 200)
+        ],
+        next_action="write discount and money",
+    )
+    summary = compress_reasoning_state(state, max_chars=360)
+    assert fact in summary
+    assert "Assume:" in summary
+
+
 def test_thought_for_ui_is_plain_language() -> None:
     from mango_cot import thought_for_ui
 
@@ -237,3 +256,31 @@ def test_run_chained_cumulative_visibility_and_summary_only() -> None:
     assert "STEP_ONE_UNIQUE" not in summary
     assert "STEP_TWO_UNIQUE" not in summary
     assert len(seen) == 3
+
+
+def test_chain_summary_drops_schema_placeholders() -> None:
+    from mango_cot.cot_engine import _chain_step_text, _chain_summary_text
+
+    # Placeholder-only payload must not emit "string | next=string".
+    empty = _chain_summary_text(
+        {"summary": "string", "next_action": "string", "verify_plan": ["string"]},
+        [],
+    )
+    assert "next=string" not in empty
+    assert empty != "string | next=string | verify=string"
+    fallback = _chain_summary_text(
+        {"summary": "string", "next_action": "string", "verify_plan": ["string"]},
+        ["Inspect bot.py"],
+    )
+    assert "Inspect bot.py" in fallback
+    step = _chain_step_text(
+        {"thought": "string", "next_action": "string", "known_facts": ["string"]},
+        '{"thought":"string"}',
+    )
+    assert step == ""
+    real = _chain_summary_text(
+        {"summary": "Ship the bot", "next_action": "run_tests", "verify_plan": ["smoke"]},
+        [],
+    )
+    assert "Ship the bot" in real
+    assert "next=run_tests" in real

@@ -87,6 +87,29 @@ def test_parse_fenced_write_file() -> None:
     assert calls[0].arguments["content"] == "class EventBus:\n    pass\n"
 
 
+def test_parse_truncated_fence_not_a_write() -> None:
+    text = (
+        '<tool_call=write_file : {"path": "index.html"}>\n'
+        "```\n"
+        "<!DOCTYPE html>\n"
+        "<html><body>\n"
+        "<h1>Hello\n"
+    )
+    assert parse_tool_calls(text) == []
+
+
+def test_parse_informal_write_file_pipe() -> None:
+    text = (
+        'I will create the file.\n'
+        '<write_file | {"path": "index.html", "content": "<!DOCTYPE html>\\n<html></html>"}>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "write_file"
+    assert calls[0].arguments["path"] == "index.html"
+    assert "<!DOCTYPE html>" in calls[0].arguments["content"]
+
+
 def test_parse_invalid_json_skipped() -> None:
     text = '<tool_call=read_file : {not json}>'
     assert parse_tool_calls(text) == []

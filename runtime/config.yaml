@@ -15,3 +15,5 @@ inference:
   temperature: 0.1
   top_p: 0.95
   stop: []
+  repeat_penalty: 1.12   # 1.0 = off; low temperature + off = the model repeats one sentence
+  repeat_last_n: 256

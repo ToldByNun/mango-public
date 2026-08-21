@@ -83,6 +83,8 @@ def test_llama_kwargs_use_windowed_swa_cache(tmp_path: Path) -> None:
     loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(gguf), n_ctx=16384, n_batch=512)))
     kwargs = loader.llama_kwargs()
     assert kwargs["swa_full"] is False
-    assert kwargs["type_k"] == 8
-    assert kwargs["type_v"] == 8
+    # 2 = GGML_TYPE_Q4_0: half the KV-cache VRAM of Q8_0.
+    assert kwargs["type_k"] == 2
+    assert kwargs["type_v"] == 2
     assert kwargs["n_ctx"] == 16384
+    assert kwargs["last_n_tokens_size"] >= 256

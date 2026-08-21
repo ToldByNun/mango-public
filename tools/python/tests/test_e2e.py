@@ -26,7 +26,7 @@ def test_e2e_read_file_from_model_output(tmp_path: Path) -> None:
     assert result.tool_name == "read_file"
     assert result.error is None
     assert result.output["content"] == "Mango tools OK\n"
-    assert result.output["path"] == str(sample.resolve())
+    assert result.output["absolute_path"] == str(sample.resolve())
     assert result.to_dict()["success"] is True
 
 

@@ -213,6 +213,13 @@ class AgentServer:
         workspace = resolve_run_workspace(str(params.get("workspace") or ""), self._session_id)
         goal = str(params.get("goal") or "")
         thinking_level = str(params.get("thinking_level") or "off")
+        thought_raw = params.get("thought_max_tokens")
+        thought_max_tokens: int | None = None
+        if thought_raw is not None and str(thought_raw).strip() != "":
+            try:
+                thought_max_tokens = max(32, min(4096, int(thought_raw)))
+            except (TypeError, ValueError):
+                thought_max_tokens = None
         if not goal.strip():
             self._busy = False
             raise ServeError("goal is empty")
@@ -226,7 +233,7 @@ class AgentServer:
                 self.emit("agent.title", {"title": title})
         thread = threading.Thread(
             target=self._run,
-            args=(str(workspace), goal, thinking_level),
+            args=(str(workspace), goal, thinking_level, thought_max_tokens),
             daemon=True,
             name="agent-run",
         )
@@ -234,13 +241,23 @@ class AgentServer:
         thread.start()
         return {"status": "started", "session_id": self._session_id, "workspace": str(workspace)}
 
-    def _run(self, workspace: str, goal: str, thinking_level: str = "off") -> None:
+    def _run(
+        self,
+        workspace: str,
+        goal: str,
+        thinking_level: str = "off",
+        thought_max_tokens: int | None = None,
+    ) -> None:
         try:
             if self._runner is None:
                 self._load_model()
             preset = thinking_preset(thinking_level)
+            effective_thought = (
+                thought_max_tokens if thought_max_tokens is not None else preset.thought_max_tokens
+            )
             print(
-                f"[mango] agent loop workspace={workspace} thinking={preset.level}",
+                f"[mango] agent loop workspace={workspace} thinking={preset.level} "
+                f"thought_max_tokens={effective_thought}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -259,8 +276,8 @@ class AgentServer:
                 require_tools=True,
                 plan_apis_first=True,
                 task_wants_tests=True,
-                thought_max_tokens=preset.thought_max_tokens,
-                tool_max_tokens=2048,
+                thought_max_tokens=effective_thought,
+                tool_max_tokens=3072,
                 thinking_level=preset.level,
             )
             self._current_agent = orch.agent

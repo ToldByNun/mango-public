@@ -252,13 +252,16 @@ class ModelRunner:
                     should_cancel=should_cancel,
                 )
             else:
+                compiled = self._compile_grammar(grammar)
                 inference = self._merge_inference(
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     stop=stop,
+                    # A grammar already constrains the shape; penalizing repeats
+                    # would corrupt file bodies that repeat indentation and quotes.
+                    repeat_penalty=1.0 if compiled is not None else None,
                 )
-                compiled = self._compile_grammar(grammar)
                 if compiled is not None:
                     inference["grammar"] = compiled
                 if on_token is None and should_cancel is None:
@@ -354,17 +357,68 @@ class ModelRunner:
             stop=thought_stops,
         )
         thought_seen = 0
+        thought_buf = ""
+
+        def _thought_looks_like_code_dump(text: str) -> bool:
+            sample = text[-1200:] if len(text) > 1200 else text
+            if "```" in sample:
+                return True
+            lower = sample.lower()
+            if "<write_file" in lower or "<tool_call" in lower:
+                return True
+            if "</invoke>" in lower or "</function>" in lower:
+                return True
+            if "<!doctype" in lower or "<html" in lower:
+                return True
+            if "function(" in sample or "const canvas" in sample or "addEventListener" in sample:
+                return True
+            if sample.count("\n") >= 8 and (
+                "def " in sample or "class " in sample or "import " in sample
+            ):
+                return True
+            return False
 
         def _thought_token(delta: str) -> None:
-            nonlocal thought_seen
+            nonlocal thought_seen, thought_buf
             thought_seen += 1
+            thought_buf += delta
             if thought_seen == 1 or thought_seen % 32 == 0:
                 print(f"[mango] thought tokens={thought_seen}", file=sys.stderr, flush=True)
             if on_token is not None:
                 on_token(delta)
 
+        def _thought_should_stop(partial: str) -> bool:
+            # When a tool call is mandatory, cut thought early if the model dumps code/HTML
+            # into the unconstrained phase (burns budget and never reaches a clean tool call).
+            if not force_grammar:
+                return False
+            try:
+                from mango_tools.tool_parser import parse_tool_calls
+
+                if parse_tool_calls(partial):
+                    return True
+            except Exception:
+                pass
+            low = partial.lower()
+            if "</invoke>" in low or "</function>" in low:
+                return True
+            # Informal write started but never closed — don't burn the whole thought budget.
+            if "<write_file" in low and len(partial) > 2500:
+                return True
+            if len(partial) < 80:
+                return False
+            # Still emitting an informal/canonical call — wait for JSON to finish.
+            if "<write_file" in low or "<tool_call" in low:
+                return False
+            return _thought_looks_like_code_dump(partial)
+
         thought_text, thought_choice, thought_usage = self._stream_completion(
-            llama, prompt, thought_params, _thought_token, should_cancel=should_cancel
+            llama,
+            prompt,
+            thought_params,
+            _thought_token,
+            should_cancel=should_cancel,
+            should_stop=_thought_should_stop,
         )
         if should_cancel is not None and should_cancel():
             prompt_tokens = int(thought_usage.get("prompt_tokens", 0) or 0)
@@ -392,6 +446,21 @@ class ModelRunner:
             completion_tokens = self._estimate_tokens(llama, thought_text)
         fired = self._generated_contains_trigger(llama, grammar_trigger, completion_tokens)
 
+        # Model often dumps `<write_file | {...}>` in thought instead of `<tool_call=...>`.
+        # Recover that before burning thousands of constrained tokens on garbage XML.
+        recovered = self._recover_informal_tool_call(thought_text)
+        if recovered is not None:
+            print("[mango] recovered informal tool call from thought", file=sys.stderr, flush=True)
+            prompt_tokens = int(thought_usage.get("prompt_tokens", 0) or 0)
+            return CompletionResult(
+                text=recovered,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                stopped_eos=True,
+                model_path=str(self._loader.model_path),
+            )
+
         if not fired and not force_grammar:
             prompt_tokens = int(thought_usage.get("prompt_tokens", 0) or 0)
             return CompletionResult(
@@ -412,6 +481,9 @@ class ModelRunner:
             temperature=temperature,
             top_p=top_p,
             stop=stops,
+            # No repetition penalty for the constrained tool decode: file bodies
+            # legitimately repeat indentation, quotes and identifiers.
+            repeat_penalty=1.0,
         )
         compiled = self._compile_grammar(grammar)
         if compiled is not None:
@@ -432,7 +504,14 @@ class ModelRunner:
             except ImportError:
                 return False
             stitched = stitch_triggered_completion(thought_text, grammar_trigger, partial)
-            return bool(parse_tool_calls(stitched))
+            if parse_tool_calls(stitched):
+                return True
+            # Grammar failed open into XML junk — abort. Do NOT abort open ``` fences:
+            # that truncated real write_file bodies (e.g. test modules) mid-file.
+            low = partial.lower()
+            if "</invoke>" in low or "</function>" in low:
+                return True
+            return False
 
         def _tool_heartbeat(delta: str) -> None:
             nonlocal tool_seen
@@ -577,14 +656,40 @@ class ModelRunner:
             return False
         return trigger in text
 
+    def _recover_informal_tool_call(self, thought_text: str) -> str | None:
+        """If thought already contains a parseable informal/canonical tool call, use it."""
+        try:
+            from mango_tools.format import TOOL_CALL_PREFIX, format_tool_call
+            from mango_tools.tool_parser import parse_tool_calls
+        except ImportError:
+            return None
+        calls = parse_tool_calls(thought_text)
+        if not calls:
+            return None
+        call = calls[0]
+        # Prefer a complete write_file with real content; skip empty shells.
+        if call.name.replace("-", "_").lower() == "write_file":
+            content = str(call.arguments.get("content") or "")
+            if len(content.strip()) < 8:
+                return None
+        canonical = format_tool_call(call.name.replace("-", "_"), dict(call.arguments))
+        # Keep a short thought prefix for the UI, then the canonical call.
+        cut = thought_text.find("<")
+        prefix = thought_text[:cut].strip() if cut > 0 else ""
+        if prefix:
+            # Drop long code dumps from the visible prefix.
+            if len(prefix) > 400:
+                prefix = prefix[:400].rsplit("\n", 1)[0]
+            return f"{prefix}\n{canonical}"
+        return canonical
+
     def _compile_grammar(self, grammar: Any) -> Any:
         if grammar is None:
             return None
         if not isinstance(grammar, str):
             return grammar
-        cached = self._grammar_cache.get(grammar)
-        if cached is not None:
-            return cached
+        # Do NOT reuse LlamaGrammar instances — they are stateful and after one
+        # completion often fail open (unconstrained garbage like </invoke>).
         try:
             from llama_cpp import LlamaGrammar
         except ImportError:  # pragma: no cover - older llama-cpp-python layouts
@@ -593,7 +698,6 @@ class ModelRunner:
         print("[mango] compiling tool grammar ...", file=sys.stderr, flush=True)
         compiled = LlamaGrammar.from_string(grammar)
         print("[mango] tool grammar ready", file=sys.stderr, flush=True)
-        self._grammar_cache[grammar] = compiled
         return compiled
 
     def _merge_inference(
@@ -603,6 +707,7 @@ class ModelRunner:
         temperature: float | None,
         top_p: float | None,
         stop: list[str] | None,
+        repeat_penalty: float | None = None,
     ) -> dict[str, Any]:
         defaults = self._config.inference
         stops = list(stop if stop is not None else defaults.stop)
@@ -615,6 +720,10 @@ class ModelRunner:
             temperature=temperature if temperature is not None else defaults.temperature,
             top_p=top_p if top_p is not None else defaults.top_p,
             stop=stops,
+            repeat_penalty=(
+                defaults.repeat_penalty if repeat_penalty is None else repeat_penalty
+            ),
+            repeat_last_n=defaults.repeat_last_n,
         )
         params: dict[str, Any] = {
             "max_tokens": merged.max_tokens,
@@ -622,7 +731,9 @@ class ModelRunner:
             "top_p": merged.top_p,
             "top_k": 40,
             "min_p": 0.05,
-            "repeat_penalty": 1.0,
+            # The penalty window itself is `last_n_tokens_size` on the Llama
+            # constructor; create_completion only takes the penalty strength.
+            "repeat_penalty": merged.repeat_penalty,
         }
         if merged.stop:
             params["stop"] = merged.stop

@@ -17,6 +17,7 @@ export class Sidecar {
   private seq = 0;
   private onEvent: ((event: AgentEvent) => void) | null = null;
   private activeRunSessionId: string | null = null;
+  private stderrTail = "";
 
   constructor(
     private repoRoot: string,
@@ -35,6 +36,7 @@ export class Sidecar {
     if (this.running) return;
     const python = pythonExecutable(this.repoRoot);
     const config = runtimeConfigPath(this.repoRoot);
+    this.stderrTail = "";
     this.child = spawn(
       python,
       ["-u", "-m", "mango_agent.serve", "--config", config],
@@ -44,6 +46,7 @@ export class Sidecar {
         env: {
           ...process.env,
           PYTHONUNBUFFERED: "1",
+          PYTHONNOUSERSITE: "1",
           GGML_CUDA_DISABLE_GRAPHS: "1",
           GGML_CUDA_ENABLE_GRAPHS: "0",
           MANGO_PROMPTS_DIR: promptsDir(this.repoRoot),
@@ -54,16 +57,21 @@ export class Sidecar {
     const child = this.child;
     child.on("error", (err) => {
       console.error("[sidecar] spawn error", err);
-      this.failPending(err instanceof Error ? err : new Error(String(err)));
+      const detail = err instanceof Error ? err.message : String(err);
+      this.failPending(new Error(`sidecar spawn failed (${python}): ${detail}`));
       this.child = null;
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8").trim();
-      if (text) console.error("[sidecar]", text);
+      const text = chunk.toString("utf8");
+      if (text.trim()) console.error("[sidecar]", text.trim());
+      this.stderrTail = `${this.stderrTail}${text}`.slice(-4000);
     });
     child.on("exit", (code) => {
       this.child = null;
-      const message = `sidecar exited (${code ?? "null"})`;
+      const tip = this.stderrTail.trim().replace(/\s+/g, " ").slice(-500);
+      const message = tip
+        ? `sidecar exited (${code ?? "null"}): ${tip}`
+        : `sidecar exited (${code ?? "null"}) — python=${python}`;
       this.failPending(new Error(message));
       if (this.activeRunSessionId) {
         const sessionId = this.activeRunSessionId;

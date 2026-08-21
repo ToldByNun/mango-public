@@ -71,7 +71,8 @@ def test_feedback_md_lookup_by_function_heading() -> None:
     assert "global lock" in exact.lower()
     assert "{{" not in exact
 
-    assert "compact" in feedback("run.truncated_json").lower()
+    assert "short" in feedback("run.truncated_json").lower() or "fence" in feedback("run.truncated_json").lower()
+    assert "missing" in feedback("missing_dependency", pkgs="discord", command="pip install discord.py").lower()
 
     def _handle_run_tests_results() -> str:
         return feedback("stress")
@@ -106,3 +107,37 @@ def test_cot_prompt_renders_placeholders() -> None:
     assert "{{goal}}" not in text
     assert "thought" in text.lower()
     assert "natural" in text.lower()
+
+
+def test_every_feedback_call_site_resolves() -> None:
+    """A missing snippet raises KeyError mid-run, so catch it here instead."""
+    import ast
+
+    import mango_agent
+
+    sections = parse_feedback_sections(load_system_prompt("feedback"))
+    package = Path(mango_agent.__file__).resolve().parent
+    missing: list[str] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        scopes: dict[ast.AST, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(node):
+                    scopes.setdefault(child, node.name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == "feedback"):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            name = node.args[0].value
+            if not isinstance(name, str):
+                continue
+            caller = scopes.get(node, "")
+            if name in sections or f"{caller}.{name}" in sections:
+                continue
+            missing.append(f"{path.name}:{node.lineno} feedback({name!r}) in {caller or '<module>'}()")
+    assert not missing, "feedback sections missing from prompts/feedback.md:\n" + "\n".join(missing)

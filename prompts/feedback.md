@@ -14,7 +14,7 @@ If you will use a third-party library (pandas, numpy, requests, …), first call
 Tests never passed within iteration limit.
 
 # tests_still_red
-Tests still failing. Do NOT finish or summarize. Next output MUST be a tool call that fixes the failing assertion.
+Tests still failing. Do NOT finish or summarize. NEXT tool MUST be read_file on the failing implementation, then edit_file (short old_string), then run_tests.
 
 # run.thought_has_code
 Do not put source code in thought. Call write_file or edit_file with the code.
@@ -34,10 +34,25 @@ Do not finish yet. Fix the verification errors with a tool call.{{next_edit}}{{s
 Do not finish. Repair the listed syntax error with write_file or edit_file. write_file fence body must be the COMPLETE file (full def + body), never a single keyword like `def`.
 
 # run.truncated_json
-Your last tool call JSON was truncated. write_file content is JSON-escaped and long — do NOT retry a huge blob. NEXT write_file ONE compact implementation file only (not tests). Tests in a later write_file.
+Your last tool call was truncated (incomplete ``` fence or cut-off JSON). File was NOT written. NEXT write_file must be SHORT: for tests write ONE TestCase with ONE test method only (<40 lines), close the ``` fence, then edit_file to add more. Do not dump a full suite in one call.
+
+# truncated_write_markup
+Your last write_file for HTML/CSS was truncated or incomplete (file not changed). Do NOT dump a full landing page in one tool call. NEXT: write_file a SHORT skeleton only (<80 lines: html/head/body + one heading + one script/style stub). Then edit_file to add sections one at a time.
+
+# run.large_markup_goal
+This goal needs a large HTML/CSS/JS page. Do NOT plan the whole file in thought and do NOT write_file the full animation in one call. FIRST tool: write_file a SHORT skeleton (<60 lines) with canvas + empty script. Then edit_file to add drawing code in small chunks.
+
+# stalled
+You have now written the same answer several times without calling a tool, so nothing changed. Stop restating the plan. Emit ONE tool call in the canonical format on your very next line, e.g. <tool_call=read_file : {"path": "the file you need"}>. If you truly cannot act, call run_tests.
 
 # run.emit_tool
 Do not finish yet. Emit a tool call now (read_file, search_code, or edit_file).
+
+# run.continue_work
+Do not finish yet. Your last message said more work remains (tests/edits). Emit the next tool call now (write_file or edit_file). Keep files short.
+
+# continue_work
+Do not finish yet. Your last message said more work remains (tests/edits). Emit the next tool call now (write_file or edit_file). Keep files short.
 
 # research_next
 Still missing API lookups: {{needed}}. Do not write the brief yet. NEXT tool MUST be package_source_lookup {{example}}. One symbol per call.
@@ -69,6 +84,9 @@ API research done. Use the usage brief (imports and real calls). NEXT you may wr
 # _note_plan_progress.epistemic_retry
 ask_epistemic must return a usage brief for {{needed}}. unittest/pytest do not count. Then write_file — do not ask again.
 
+# _note_plan_progress.install_failed
+Could not install {{pkgs}}. Command: {{command}}. Fix the package name or install manually, then ask_epistemic again.
+
 # _feedback_failed_tools.retry
 Retry with ALL required keys. edit_file needs path, old_string, new_string. Copy old_string exactly from an implementation file, including whitespace. Do not edit testing/ or test_*.py unless the bug is in the test.
 
@@ -96,7 +114,7 @@ BLOCKED by the runner. Edit the implementation module first, not test_*.py, unle
 # blocked_edit_fuzzy
 BLOCKED by the runner. Fuzzy match rejected on {{path}}. read_file the file and copy old_string exactly (including whitespace).
 
-# run.no_impl_change
+# no_impl_change
 You have not changed any implementation file and tests did not pass. Do NOT finish. read_file the target module, edit_file with a verbatim old_string, then run_tests.
 
 # _handle_run_tests_results.stress
@@ -113,6 +131,15 @@ Tests {{hint}} after {{attempts}} automatic attempts. Stopping the fix loop and 
 
 # _handle_run_tests_results.failed
 Tests {{hint}} (attempt {{attempt}}/{{attempts}}, {{remaining}} left). Fix the failing code or tests. The runner will re-test after the next write.{{extra}}{{detail}}
+
+# failed_read_first
+Tests {{hint}} (attempt {{attempt}}/{{attempts}}, {{remaining}} left). Do NOT restate the bug in thought. NEXT tool MUST be read_file path="{{path}}" (copy exact source), then edit_file with a short old_string from that file (e.g. call register in __init__). Then run_tests.{{extra}}{{detail}}
+
+# missing_dependency
+Tests failed because a package is missing: {{pkgs}}. Do NOT rewrite unrelated files. Command: {{command}}. NEXT: after install, run_tests again. Prefer mocking discord in unit tests or lazy-importing it inside the bot entrypoint.
+
+# missing_dependency_installed
+Installed {{pkgs}} ({{command}}). Do NOT thrash other files. NEXT tool MUST be run_tests.
 
 # _handle_run_tests_results.concurrent_hint
  This code is concurrent — also add a ThreadPoolExecutor/threading.Thread stress test; happy-path tests will miss race bugs.

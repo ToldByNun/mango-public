@@ -65,7 +65,9 @@ def test_verification_fix_loop_recovers_from_forced_bug(tmp_path: Path) -> None:
     assert len(second_prompt.split("## Verification", 1)[1]) < 2_000
     assert "===== FAILURES =====" not in second_prompt
     assert "passed" in (result.verification_report or "").lower()
-    assert "write_file" in result.final_answer
+    assert "y.py" in result.final_answer.lower()
+    assert "tests passed" in result.final_answer.lower()
+    assert "write_file" not in result.final_answer
     assert "read_file" not in str(runner.grammars[1])
     assert "edit_symbol" in str(runner.grammars[1]) or "write_file" in str(runner.grammars[1])
     assert agent.context is not None

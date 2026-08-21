@@ -33,6 +33,7 @@ export type MangoBridge = {
       workspace?: string,
       generateTitle?: boolean,
       thinkingLevel?: string,
+      thoughtMaxTokens?: number | null,
     ) => Promise<Record<string, unknown>>;
     cancel: (sessionId: string) => Promise<Record<string, unknown>>;
     onEvent: (handler: (event: AgentEvent) => void) => () => void;

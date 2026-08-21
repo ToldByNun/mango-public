@@ -51,7 +51,7 @@ def test_build_prompt_passed_feedback_does_not_look_like_failure() -> None:
 
 def test_idle_retry_prompt_is_compact_and_demands_a_tool_call() -> None:
     state = ContextState(
-        goal="Implement function Y",
+        goal="Implement function Y\n\nMore details that should not all be echoed.",
         tool_instruction="<tool_call=write_file : {\"path\": \"y.py\"}>",
         verification_feedback="Verification failed (attempt 1/5)\nTests: 0 passed, 1 failed",
         relevant_files=["y.py"],
@@ -64,8 +64,10 @@ def test_idle_retry_prompt_is_compact_and_demands_a_tool_call() -> None:
     compact = build_idle_retry_prompt(state)
     full = build_prompt(state)
     assert "## Goal" in compact
+    assert "Implement function Y" in compact
+    assert "More details that should not all be echoed" not in compact
     assert "## Verification" in compact
-    assert "Do not finish yet" in compact
+    assert "Do not finish yet" in compact or "Do not restate the goal" in compact
     assert "Your previous reply had no tool call" in compact
     assert "You are Mango." not in compact
     assert "### [1] write_file" not in compact

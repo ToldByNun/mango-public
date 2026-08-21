@@ -36,7 +36,6 @@ def _run_shell_command(
                     stdin=subprocess.DEVNULL,
                     stdout=out_f,
                     stderr=err_f,
-                    check=False,
                     creationflags=flags,
                     env=env,
                 )

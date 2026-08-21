@@ -96,7 +96,7 @@ function upsertStream(
   const rawDelta = String(payload.delta ?? "");
   const done = Boolean(payload.done);
   const rawFull = payload.text != null ? String(payload.text) : null;
-  const delta = kind === "thought" && /<tool_call\b/i.test(rawDelta) ? "" : rawDelta;
+  const delta = kind === "thought" && /<(?:tool_call|write_file)\b/i.test(rawDelta) ? "" : rawDelta;
   const full = kind === "thought" && rawFull != null ? stripThoughtMarkup(rawFull) : rawFull;
   const durationMs = Number(payload.duration_ms ?? 0);
   const turnStart = lastUserIndex(messages);

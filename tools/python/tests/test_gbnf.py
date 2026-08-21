@@ -61,15 +61,13 @@ def _llama_grammar_cls():
     return grammar_cls
 
 
-def test_gbnf_write_file_uses_fence_not_json_content() -> None:
+def test_gbnf_write_file_prefers_fence_with_json_alt() -> None:
     grammar = tool_call_gbnf(["write_file", "read_file"])
     assert "write-file-full" in grammar
-    assert "write-raw" in grammar
-    assert '"\\"content\\""' not in grammar
-    # Opening + closing markdown fences so generation must terminate.
-    assert grammar.count("```") == 2
-    assert "wr-char{800,}" not in grammar
-    assert "wr-char{24,}" in grammar
+    assert "write-file-fence" in grammar
+    assert "write-body" in grammar
+    assert '"\\"content\\""' in grammar
+    assert "content-char{8,500}" in grammar
     grammar = tool_call_gbnf(["edit_symbol", "write_file", "read_file", "rename_symbol"])
     assert grammar.strip().startswith("root ::=")
     assert '">"' in grammar
