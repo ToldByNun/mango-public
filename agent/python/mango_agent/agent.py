@@ -202,6 +202,7 @@ _STALL_ESCALATE = 2
 _STALL_LIMIT = 4
 _WRITE_TOOL_MAX_TOKENS = 3072
 _TRUNCATED_WRITE_TOOL_MAX_TOKENS = 4096
+_CLI_SKELETON_WRITE_MAX_TOKENS = 1024
 _MAX_REASONING_CYCLES_PER_ITER = 3
 _UNFINISHED_ANSWER = re.compile(
     r"(?i)\b("
@@ -413,6 +414,10 @@ class Agent:
         self._shell_read_counts: dict[str, int] = {}
         self._goal_wants_file_io = False
         self._large_markup_goal = False
+        self._cli_goal = False
+        self._write_truncation_streak = 0
+        self._incomplete_impl_writes = 0
+        self._prefer_edit_gaps = False
         self._run_tests_failures = 0
         self._runtime_smoke_failures = 0
         self._stress_nudges = 0
@@ -838,6 +843,10 @@ class Agent:
         self._goal_deliverable_files = list(targets.files)
         self._goal_wants_file_io = bool(_GOAL_WANTS_FILE_IO.search(task or ""))
         self._large_markup_goal = bool(_GOAL_LARGE_MARKUP.search(task or ""))
+        self._cli_goal = bool(goal_wants_runnable_script(task or ""))
+        self._write_truncation_streak = 0
+        self._incomplete_impl_writes = 0
+        self._prefer_edit_gaps = False
         if self._require_tools:
             # UI create-from-scratch tasks should not scan/index the whole repo first.
             self._pending_symbol_lookups = []
@@ -890,6 +899,9 @@ class Agent:
         self._last_tool_truncated = False
         self._fix_hint_path = ""
         self._write_tool_max_tokens = _WRITE_TOOL_MAX_TOKENS
+        self._write_truncation_streak = 0
+        self._incomplete_impl_writes = 0
+        self._prefer_edit_gaps = False
         self._edit_fail_counts = {}
         self._review_needed = False
         self._review_done = False
@@ -941,6 +953,11 @@ class Agent:
             self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
             # Cap constrained write so GBNF short-content rule can finish (skeleton only).
             self._write_tool_max_tokens = 768
+        elif self._cli_goal:
+            # Full CLI dumps truncate mid-JSON and loop forever (gauntlet G6).
+            engine.set_verification_feedback(feedback("cli_skeleton_first"))
+            self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
+            self._write_tool_max_tokens = _CLI_SKELETON_WRITE_MAX_TOKENS
         engine.set_work_plan(build_work_plan(task))
         self._seed_impl_status(engine)
         steps: list[AgentStep] = []
@@ -1346,11 +1363,21 @@ class Agent:
                 truncated = TOOL_CALL_PREFIX in model_output
                 unfinished = bool(_UNFINISHED_ANSWER.search(model_output or ""))
                 if truncated:
-                    self._write_tool_max_tokens = max(
-                        self._write_tool_max_tokens, _TRUNCATED_WRITE_TOOL_MAX_TOKENS
-                    )
-                    self._prefer_write_file = True
+                    self._write_truncation_streak += 1
                     self._last_tool_truncated = True
+                    if self._cli_goal or self._large_markup_goal or self._write_truncation_streak >= 2:
+                        # Raising the budget makes the dump-and-truncate loop worse.
+                        self._write_tool_max_tokens = min(
+                            int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
+                            _CLI_SKELETON_WRITE_MAX_TOKENS if self._cli_goal else 768,
+                        )
+                        self._prefer_write_file = True
+                        self._prefer_edit_gaps = False
+                    else:
+                        self._write_tool_max_tokens = max(
+                            self._write_tool_max_tokens, _TRUNCATED_WRITE_TOOL_MAX_TOKENS
+                        )
+                        self._prefer_write_file = True
                 self._trace(
                     f"iter {iteration} no tool call"
                     + (" (truncated/invalid JSON)" if truncated else "")
@@ -1509,7 +1536,9 @@ class Agent:
                         self._prefer_write_file = True
                         # Next thought must stay tiny; the model was dumping the page into chat.
                         self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 64)
-                        if self._large_markup_goal or ".html" in model_output.lower():
+                        if self._cli_goal:
+                            engine.set_verification_feedback(feedback("truncated_write_cli"))
+                        elif self._large_markup_goal or ".html" in model_output.lower():
                             engine.set_verification_feedback(feedback("truncated_write_markup"))
                         else:
                             engine.set_verification_feedback(feedback("truncated_json"))
@@ -1760,6 +1789,9 @@ class Agent:
                 self._readonly_iters = 0
                 self._clear_edit_failures(tool_results)
                 self._arm_design_review_state(tool_results, snapshots)
+                if any(result.success and result.tool_name == "write_file" for result in tool_results):
+                    self._write_truncation_streak = 0
+                    self._last_tool_truncated = False
             else:
                 self._readonly_iters += 1
             if self._require_tools:
@@ -1776,6 +1808,29 @@ class Agent:
             if not syntax_bad:
                 self._handle_run_tests_results(tool_results, engine)
             self._refresh_impl_completeness(engine)
+            if (
+                self._cli_goal
+                and self._impl_gaps
+                and any(result.success and result.tool_name == "write_file" for result in tool_results)
+            ):
+                self._incomplete_impl_writes += 1
+                if self._incomplete_impl_writes >= 1:
+                    # File exists but still gappy — stop full rewrites; edit the gaps.
+                    self._prefer_edit_gaps = True
+                    self._prefer_write_file = False
+                    self._prefer_read_file = True
+                    primary = self._primary_impl_path()
+                    if primary:
+                        self._forced_read_path = primary
+                    engine.set_verification_feedback(
+                        feedback(
+                            "impl_incomplete",
+                            gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                        )
+                    )
+            elif self._cli_goal and not self._impl_gaps:
+                self._prefer_edit_gaps = False
+                self._incomplete_impl_writes = 0
             auto_results = [] if syntax_bad else self._auto_run_tests_if_needed(tool_results, iteration)
             if auto_results:
                 tool_results = [*tool_results, *auto_results]
@@ -2418,6 +2473,14 @@ class Agent:
             return "read_file"
         if self._prefer_write_file and self._missing_attempted_paths and "write_file" in enabled:
             return "write_file"
+        # CLI gap fill: never force another full write_file dump.
+        if self._prefer_edit_gaps and self._impl_gaps:
+            if self._prefer_read_file and "read_file" in enabled:
+                return "read_file"
+            if "edit_file" in enabled:
+                return "edit_file"
+            if "write_file" in enabled:
+                return "write_file"
         if self._prefer_read_file and "read_file" in enabled:
             return "read_file"
         if (
@@ -2510,6 +2573,11 @@ class Agent:
                 _add("edit_file", "read_file", "write_file", "run_tests")
         elif self._prefer_write_file:
             _add("write_file", "edit_file", "read_file")
+        elif self._prefer_edit_gaps and self._impl_gaps:
+            if self._prefer_read_file:
+                _add("read_file", "edit_file", "write_file")
+            else:
+                _add("edit_file", "read_file", "write_file")
         elif self._prefer_read_file:
             _add("read_file", "edit_file", "write_file")
         elif self._rename_pair:
@@ -2631,6 +2699,10 @@ class Agent:
             names = [name for name in names if name != "run_terminal_command"]
         if self._impl_gaps and self._plan_gate_phase() is None:
             names = [name for name in names if name != "run_terminal_command"]
+            if self._prefer_edit_gaps:
+                names = [name for name in names if name in {"read_file", "edit_file", "write_file"}]
+                if not self._prefer_read_file and "edit_file" in names:
+                    names = ["edit_file", *[n for n in names if n != "edit_file"]]
         return names
 
     def _action_tool_names_legacy(self) -> list[str]:
@@ -2648,7 +2720,14 @@ class Agent:
             names = [name for name in names if name != "run_terminal_command"]
         if self._impl_gaps and self._plan_gate_phase() is None:
             names = [name for name in names if name != "run_terminal_command"]
-            if "write_file" in names:
+            if self._prefer_edit_gaps:
+                # Prefer edit over full rewrite once a skeleton exists.
+                names = [name for name in names if name in {"read_file", "edit_file", "write_file"}]
+                if "edit_file" in names:
+                    names = ["edit_file", *[n for n in names if n != "edit_file"]]
+                if self._prefer_read_file and "read_file" in names:
+                    names = ["read_file", *[n for n in names if n != "read_file"]]
+            elif "write_file" in names and not self._prefer_edit_gaps:
                 names = ["write_file", *[name for name in names if name != "write_file"]]
         if self._tests_still_required() and self._plan_gate_phase() is None:
             # Keep read_file available — without it the model cannot fix assertion failures
@@ -2758,6 +2837,14 @@ class Agent:
                     self._prefer_write_file = True
                     self._prefer_read_file = False
                     lines.append(feedback("file_missing_write", path=self._display_path(abs_missing)))
+            if result.tool_name == "write_file" and (
+                "truncated" in err_l or "incomplete" in err_l
+            ):
+                self._write_truncation_streak += 1
+                if self._cli_goal:
+                    self._write_tool_max_tokens = _CLI_SKELETON_WRITE_MAX_TOKENS
+                    self._prefer_write_file = True
+                    lines.append(feedback("truncated_write_cli"))
             if (
                 path
                 and "old_string not found" not in err_l

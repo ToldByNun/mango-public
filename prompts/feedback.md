@@ -36,6 +36,12 @@ Do not finish. Repair the listed syntax error with write_file or edit_file. writ
 # run.truncated_json
 Your last tool call was truncated (incomplete ``` fence or cut-off JSON). File was NOT written. NEXT write_file must be SHORT: for tests write ONE TestCase with ONE test method only (<40 lines), close the ``` fence, then edit_file to add more. Do not dump a full suite in one call.
 
+# truncated_write_cli
+Your last write_file was truncated (tool JSON cut off). File was NOT fully written. Do NOT dump the whole CLI in one call. NEXT write_file a SHORT skeleton only (<40 lines: imports + load/save stubs + `if __name__ == '__main__': pass`). Then edit_file to add ONE subcommand at a time. Keep each tool call small.
+
+# cli_skeleton_first
+This goal is a console/CLI Python project. Do NOT write the entire inventory CLI in one write_file (it will truncate). FIRST tool: write_file a SHORT skeleton (<40 lines) with argparse stubs. Then edit_file to add add/remove/update/describe handlers one by one. Finish only when __main__ + subcommands are complete.
+
 # truncated_write_markup
 Your last write_file for HTML/CSS was truncated or incomplete (file not changed). Do NOT dump a full landing page in one tool call. NEXT: write_file a SHORT skeleton only (<80 lines: html/head/body + one heading + one script/style stub). Then edit_file to add sections one at a time.
 
@@ -164,7 +170,7 @@ BLOCKED: do not use `type`/`cat`/`Get-Content` to read source files. NEXT tool M
 # impl_incomplete
 Implementation is NOT finished — the runner will reject finish until these are fixed:
 {{gaps}}
-NEXT: read_file the file, then edit_file / write_file the COMPLETE module (all handlers + main block). Do not summarize or stop while stub functions or `#` placeholders remain.
+NEXT: read_file the current file, then edit_file to ADD only the missing pieces (do NOT rewrite the whole file in one write_file — that truncates). Keep each edit small.
 
 # goal_deliverables_missing
 Goal requires these files on disk but they do not exist yet: {{files}}

@@ -220,3 +220,33 @@ def test_edit_missing_file_redirects_to_write(tmp_path: Path) -> None:
     assert reason is not None
     assert "write_file" in reason.lower()
     assert agent._prefer_write_file is True
+
+
+def test_cli_goal_caps_write_tokens_and_switches_to_edit_after_gaps(tmp_path: Path) -> None:
+    """Inventory-style CLI must not dump/rewrite forever after a partial write."""
+    from mango_context import ContextEngine
+
+    agent = _agent(tmp_path)
+    # Don't call full run — just arm CLI goal state like Agent.run does.
+    agent._cli_goal = True
+    agent._write_tool_max_tokens = 1024
+    agent._task = (
+        "schreib ein python projekt, das über die konsole läuft. "
+        "inventory: add, update, remove, beschreibungen"
+    )
+    agent._verification_root = tmp_path
+    agent._require_tools = True
+    (tmp_path / "inventory.py").write_text(
+        "import argparse\n\ndef load_inventory():\n    return {}\n",
+        encoding="utf-8",
+    )
+    engine = ContextEngine(goal=agent._task)
+    agent._refresh_impl_completeness(engine)
+    assert agent._impl_gaps
+    agent._incomplete_impl_writes = 1
+    agent._prefer_edit_gaps = True
+    agent._prefer_write_file = False
+    agent._prefer_read_file = True
+    assert agent._forced_tool_name() == "read_file"
+    agent._prefer_read_file = False
+    assert agent._forced_tool_name() == "edit_file"
