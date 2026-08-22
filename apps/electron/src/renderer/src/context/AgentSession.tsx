@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { AgentEvent, Session, TranscriptBlock } from "@shared/events";
 import { applyAgentEvent, composeAgentGoal, createSession, newId } from "../lib/session";
 import { loadThoughtMaxTokens } from "../lib/thoughtTokens";
@@ -61,19 +61,31 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
   const [search, setSearch] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [diff, setDiff] = useState<{ path: string; diff: string } | null>(null);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  // Model tokens can arrive faster than React can lay out the transcript. Keep
+  // the complete ordered stream, but render it at most once per animation frame.
+  const pendingTokenEvents = useRef<AgentEvent[]>([]);
+  const tokenFrame = useRef<number | null>(null);
+  const pendingSave = useRef(false);
+
+  // Persist sessions exactly once per state change, not inside every updater.
+  // This removes the race where multiple async saves could overwrite each other.
+  useEffect(() => {
+    if (sessionsLoaded && pendingSave.current) {
+      pendingSave.current = false;
+      void api().sessions.save(sessions);
+    }
+  }, [sessions, sessionsLoaded]);
 
   const persist = useCallback((next: Session[]) => {
+    pendingSave.current = true;
     setSessions(next);
-    void api().sessions.save(next);
   }, []);
 
   const patchActive = useCallback(
     (updater: (session: Session) => Session) => {
-      setSessions((prev) => {
-        const next = prev.map((item) => (item.id === activeId ? updater(item) : item));
-        void api().sessions.save(next);
-        return next;
-      });
+      pendingSave.current = true;
+      setSessions((prev) => prev.map((item) => (item.id === activeId ? updater(item) : item)));
     },
     [activeId],
   );
@@ -85,6 +97,7 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
       setWorkspace(ws);
       if (listed[0]) setActiveId(listed[0].id);
       if (ws) setBranch(await api().workspace.branch());
+      setSessionsLoaded(true);
       try {
         const settings = await api().sidecar.settings();
         const path = String(settings.model_path ?? "");
@@ -109,28 +122,65 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
       setModelLoaded(status.modelLoaded);
       if (status.ready) setSidecarError(null);
     })();
-    const offEvent = api().agent.onEvent((event: AgentEvent) => {
-      if (event.payload?.completion_tokens) {
-        setTokens((n) => n + Number(event.payload.completion_tokens));
-      }
-      if (
-        event.event === "agent.started" &&
-        typeof event.payload?.workspace === "string" &&
-        event.payload.workspace
-      ) {
-        setWorkspace(event.payload.workspace);
-      }
-      const persistEvent = event.event !== "agent.token" || event.payload?.done === true;
-      setSessions((prev) => {
-        const next = prev.map((item) =>
-          item.id === event.session_id ? applyAgentEvent(item, event) : item,
+    const applyEvents = (events: AgentEvent[]): void => {
+      if (events.length === 0) return;
+      if (events.some((event) => event.payload?.completion_tokens)) {
+        setTokens((n) =>
+          n + events.reduce((total, event) => total + Number(event.payload?.completion_tokens ?? 0), 0),
         );
-        if (persistEvent) void api().sessions.save(next);
+      }
+      const started = events.find(
+        (event) =>
+          event.event === "agent.started" &&
+          typeof event.payload?.workspace === "string" &&
+          Boolean(event.payload.workspace),
+      );
+      if (started && typeof started.payload.workspace === "string") {
+        setWorkspace(started.payload.workspace);
+      }
+      const shouldPersist = events.some(
+        (event) => event.event !== "agent.token" || event.payload?.done === true,
+      );
+      if (shouldPersist) pendingSave.current = true;
+      setSessions((prev) => {
+        const knownIds = new Set(prev.map((item) => item.id));
+        let next = prev;
+        for (const event of events) {
+          if (!knownIds.has(event.session_id)) continue;
+          next = next.map((item) =>
+            item.id === event.session_id ? applyAgentEvent(item, event) : item,
+          );
+        }
         return next;
       });
+    };
+    const flushTokenEvents = (): void => {
+      tokenFrame.current = null;
+      const events = pendingTokenEvents.current;
+      pendingTokenEvents.current = [];
+      applyEvents(events);
+    };
+    const offEvent = api().agent.onEvent((event: AgentEvent) => {
+      if (event.event === "agent.token") {
+        pendingTokenEvents.current.push(event);
+        if (tokenFrame.current === null) {
+          tokenFrame.current = window.requestAnimationFrame(flushTokenEvents);
+        }
+        return;
+      }
+      // Preserve event order: a tool/final/stopped event must see all preceding
+      // token deltas before it updates the same session.
+      if (pendingTokenEvents.current.length > 0) {
+        if (tokenFrame.current !== null) window.cancelAnimationFrame(tokenFrame.current);
+        flushTokenEvents();
+      }
+      applyEvents([event]);
     });
     const offErr = api().agent.onSidecarError((message) => setSidecarError(message));
     return () => {
+      if (tokenFrame.current !== null) window.cancelAnimationFrame(tokenFrame.current);
+      tokenFrame.current = null;
+      pendingTokenEvents.current = [];
       offEvent();
       offErr();
     };
@@ -170,14 +220,17 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
           setSidecarError(err instanceof Error ? err.message : String(err));
         }
       }
-      const next = sessions.filter((item) => item.id !== id);
-      persist(next);
-      if (activeId === id) {
-        setActiveId(next[0]?.id ?? null);
-        setTokens(0);
-      }
+      pendingSave.current = true;
+      setSessions((prev) => {
+        const next = prev.filter((item) => item.id !== id);
+        if (activeId === id) {
+          setActiveId(next[0]?.id ?? null);
+          setTokens(0);
+        }
+        return next;
+      });
     },
-    [activeId, persist, sessions],
+    [activeId, sessions],
   );
 
   const send = useCallback(
@@ -254,20 +307,18 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
           if (autoWorkspace) {
             setWorkspace(autoWorkspace);
             setBranch(await api().workspace.branch().catch(() => "no git"));
-            setSessions((cur) => {
-              const patched = cur.map((item) =>
-                item.id === sessionId ? { ...item, workspace: autoWorkspace } : item,
-              );
-              void api().sessions.save(patched);
-              return patched;
-            });
+            pendingSave.current = true;
+            setSessions((cur) =>
+              cur.map((item) => (item.id === sessionId ? { ...item, workspace: autoWorkspace } : item)),
+            );
           }
         })
         .catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
           setSidecarError(message);
-          setSessions((cur) => {
-            const patched = cur.map((item) => {
+          pendingSave.current = true;
+          setSessions((cur) =>
+            cur.map((item) => {
               if (item.id !== sessionId) return item;
               const alreadyErrored = item.messages.some(
                 (m) => m.kind === "error" && "text" in m && m.text === message,
@@ -287,10 +338,8 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
                       },
                     ],
               };
-            });
-            void api().sessions.save(patched);
-            return patched;
-          });
+            }),
+          );
         });
       return true;
     },
@@ -379,19 +428,26 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
       void closeSession(id);
     },
     renameSession: (id, title) => {
-      persist(sessions.map((item) => (item.id === id ? { ...item, title } : item)));
+      pendingSave.current = true;
+      setSessions((prev) => prev.map((item) => (item.id === id ? { ...item, title } : item)));
     },
     deleteSession: (id) => {
-      const next = sessions.filter((item) => item.id !== id);
-      persist(next);
-      if (activeId === id) setActiveId(next[0]?.id ?? null);
+      pendingSave.current = true;
+      setSessions((prev) => {
+        const next = prev.filter((item) => item.id !== id);
+        if (activeId === id) setActiveId(next[0]?.id ?? null);
+        return next;
+      });
     },
     deleteWorkspaceSessions: (workspacePath) => {
-      const next = sessions.filter((item) => item.workspace !== workspacePath);
-      persist(next);
-      if (activeId && !next.some((item) => item.id === activeId)) {
-        setActiveId(next[0]?.id ?? null);
-      }
+      pendingSave.current = true;
+      setSessions((prev) => {
+        const next = prev.filter((item) => item.workspace !== workspacePath);
+        if (activeId && !next.some((item) => item.id === activeId)) {
+          setActiveId(next[0]?.id ?? null);
+        }
+        return next;
+      });
     },
     pickWorkspace,
     selectWorkspace,

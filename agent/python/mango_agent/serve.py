@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -14,7 +15,6 @@ from typing import Any, TextIO
 from mango_agent.agent_context import AgentLimits
 from mango_agent.thinking import thinking_preset
 from mango_agent.orchestrator import Orchestrator
-from mango_agent.prompt import render_system_prompt
 from mango_runtime.config import load_config, resolve_config_path
 
 
@@ -69,6 +69,7 @@ class AgentServer:
         self._out = out
         self._out_lock = threading.Lock()
         self._runner: Any | None = None
+        self._runner_lock = threading.RLock()
         self._agent_lock = threading.Lock()
         self._busy = False
         self._current_agent: Any | None = None
@@ -118,10 +119,11 @@ class AgentServer:
     def _load_model(self) -> dict[str, Any]:
         from mango_runtime import ModelRunner
 
-        if self._runner is None:
-            runner = ModelRunner(str(self._config_path))
-            runner.load()
-            self._runner = runner
+        with self._runner_lock:
+            if self._runner is None:
+                runner = ModelRunner(str(self._config_path))
+                runner.load()
+                self._runner = runner
         config = load_config(self._config_path)
         return {
             "status": "loaded",
@@ -157,8 +159,9 @@ class AgentServer:
         if count == 0:
             raise ServeError("could not find model.path in config.yaml")
         self._config_path.write_text(updated, encoding="utf-8")
-        runner = self._runner
-        self._runner = None
+        with self._runner_lock:
+            runner = self._runner
+            self._runner = None
         if runner is not None:
             unload = getattr(runner, "unload", None)
             if callable(unload):
@@ -171,38 +174,14 @@ class AgentServer:
             return line or "New agent"
         return f"{line[:41]}…"
 
-    def _clean_generated_title(self, raw: str) -> str:
-        text = raw.strip().strip("\"'").strip()
-        if not text:
-            return ""
-        text = text.splitlines()[0].strip()
-        if text.lower().startswith("title:"):
-            text = text[6:].strip()
-        text = text.rstrip(".")
-        if len(text) > 48:
-            text = f"{text[:47]}…"
-        return text
-
-    def _generate_title(self, goal: str) -> str:
-        if self._runner is None:
-            self._load_model()
-        snippet = goal.strip()[:600]
-        prompt = render_system_prompt("title", goal=snippet)
-        result = self._runner.complete(
-            prompt,
-            max_tokens=24,
-            temperature=0.2,
-            reset_cache=True,
-        )
-        title = self._clean_generated_title(str(result.text or ""))
-        return title or self._fallback_title(goal)
-
     def _generate_title_request(self, params: dict[str, Any]) -> dict[str, Any]:
         goal = str(params.get("goal") or "")
         if not goal.strip():
             raise ServeError("goal is empty")
-        title = self._generate_title(goal)
-        return {"title": title}
+        # A title must never contend with the active coding request for the one
+        # llama.cpp context.  The old implementation generated 24 model tokens
+        # synchronously here, delaying every new GUI request by a full prefill.
+        return {"title": self._fallback_title(goal)}
 
     def _start_run(self, params: dict[str, Any]) -> dict[str, Any]:
         with self._agent_lock:
@@ -224,13 +203,10 @@ class AgentServer:
             self._busy = False
             raise ServeError("goal is empty")
         if bool(params.get("generate_title")):
-            try:
-                title = self._generate_title(goal)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[mango] title generation failed: {exc}", file=sys.stderr, flush=True)
-                title = self._fallback_title(goal)
-            if title:
-                self.emit("agent.title", {"title": title})
+            # Keep request acknowledgement and model execution independent.
+            # A deterministic title is instant and avoids a second, serial model
+            # completion before the agent thread has even started.
+            self.emit("agent.title", {"title": self._fallback_title(goal)})
         thread = threading.Thread(
             target=self._run,
             args=(str(workspace), goal, thinking_level, thought_max_tokens),
@@ -324,8 +300,9 @@ class AgentServer:
         thread.join(timeout=timeout_s)
 
     def _unload_runner(self, *, timeout_s: float = 4.0) -> None:
-        runner = self._runner
-        self._runner = None
+        with self._runner_lock:
+            runner = self._runner
+            self._runner = None
         if runner is None:
             return
         unload = getattr(runner, "unload", None)
@@ -333,23 +310,48 @@ class AgentServer:
             unload(timeout_s=timeout_s)
 
     def exit_process(self) -> None:
-        """Cancel → join run → unload model → exit. CUDA free is timed."""
+        """Cancel the run, neutralize CUDA, and exit as cleanly as possible.
+
+        A hard process kill while the GPU is actively decoding can crash the
+        Windows NVIDIA driver. We therefore cancel the agent loop, skip the
+        blocking llama.cpp destructor, and let the OS reclaim VRAM safely.
+        """
         self._cancel()
         self._join_run(2.0)
-        self._unload_runner(timeout_s=4.0)
+
+        # Skip the CUDA teardown that deadlocks on Windows. The OS will reclaim
+        # the GPU memory once the process exits.
+        with self._runner_lock:
+            runner = self._runner
+            self._runner = None
+        if runner is not None:
+            llama = getattr(runner, "_llama", None)
+            if llama is not None:
+                try:
+                    llama._closed = True
+                    llama.close = lambda *args, **kwargs: None
+                except Exception:
+                    pass
+
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+        # Exit immediately. Python cleanup (including the non-daemon threads
+        # created by the request pool) can hang; the OS reclaims the GPU context.
         os._exit(0)
 
 
 def serve_loop(server: AgentServer, inp: TextIO, out: TextIO) -> None:
-    for raw in inp:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError as exc:
-            server._write({"id": None, "ok": False, "error": f"invalid json: {exc}"})
-            continue
+    # Process each JSONL request in a thread pool so a slow handler (e.g.
+    # load_model) cannot block the read loop from handling health/cancel.
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="mango-serve-"
+    )
+    shutdown_requested = threading.Event()
+
+    def _dispatch(message: dict[str, Any]) -> None:
         ident = message.get("id")
         try:
             result = server.handle(message)
@@ -359,7 +361,26 @@ def serve_loop(server: AgentServer, inp: TextIO, out: TextIO) -> None:
         except Exception as exc:  # noqa: BLE001
             server._write({"id": ident, "ok": False, "error": str(exc)})
         if message.get("method") == "shutdown":
-            server.exit_process()
+            shutdown_requested.set()
+
+    try:
+        for raw in inp:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError as exc:
+                server._write({"id": None, "ok": False, "error": f"invalid json: {exc}"})
+                continue
+            executor.submit(_dispatch, message)
+            if shutdown_requested.is_set():
+                break
+    finally:
+        # Do not wait for a slow handler (e.g. a stuck model load) to finish.
+        # Cancel pending work and let exit_process terminate the process.
+        executor.shutdown(wait=False, cancel_futures=True)
+        server.exit_process()
 
 
 def main(argv: list[str] | None = None) -> int:

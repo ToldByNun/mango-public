@@ -288,7 +288,13 @@ app.whenReady().then(() => {
   });
 });
 
-app.on("window-all-closed", () => {
+// Graceful shutdown prevents the Python sidecar from being force-killed while
+// it still holds GPU memory. A force-kill on Windows can crash the NVIDIA driver.
+let isQuitting = false;
+app.on("before-quit", (event) => {
+  if (isQuitting) return;
+  event.preventDefault();
+  isQuitting = true;
   persist();
   const child = sidecar;
   sidecar = null;
@@ -301,6 +307,10 @@ app.on("window-all-closed", () => {
       app.quit();
     }
   })();
+});
+
+app.on("window-all-closed", () => {
+  app.quit();
 });
 
 function isMangoSource(path: string): boolean {

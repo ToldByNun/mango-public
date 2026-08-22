@@ -5,7 +5,7 @@ from pathlib import Path
 
 from mango_agent.events import line_stats, tool_title, unified_diff
 from mango_agent.serve import AgentServer, is_mango_source_tree, resolve_run_workspace
-from test_agent_loop import FakeModelRunner
+from test_agent_loop import FakeCompletion, FakeModelRunner
 from mango_agent import Agent, StopReason
 from mango_tools import create_default_registry
 
@@ -78,6 +78,45 @@ def test_serve_health_and_run_jsonl(tmp_path: Path) -> None:
     dumped = out.getvalue()
     assert "agent.started" in dumped
     assert "agent.stopped" in dumped
+
+
+def test_serve_title_is_immediate_and_does_not_use_model(tmp_path: Path) -> None:
+    """Starting a GUI run must not spend a model completion on its tab title."""
+    import threading
+    import time
+
+    class BlockingRunner:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def complete(self, _prompt: str, **_kwargs) -> FakeCompletion:
+            self.started.set()
+            self.release.wait(2)
+            return FakeCompletion(text="All done.")
+
+    out = StringIO()
+    server = AgentServer(None, out)
+    runner = BlockingRunner()
+    server._runner = runner
+    started_at = time.monotonic()
+    started = server.handle(
+        {
+            "method": "run",
+            "params": {
+                "session_id": "title-ui",
+                "goal": "Implement a useful feature with a descriptive name",
+                "workspace": str(tmp_path),
+                "generate_title": True,
+            },
+        }
+    )
+    assert started["status"] == "started"
+    assert time.monotonic() - started_at < 0.25
+    dumped = out.getvalue()
+    assert '"event": "agent.title"' in dumped
+    assert runner.started.wait(1)
+    runner.release.set()
 
 
 def test_resolve_run_workspace_rejects_mango_repo(tmp_path: Path) -> None:

@@ -158,11 +158,13 @@ export class Sidecar {
       child.once("exit", () => resolve());
     });
     try {
-      await this.request("shutdown", {}, 2_000);
+      // Ask the Python side to cancel the run, neutralize CUDA, and exit.
+      await this.request("shutdown", {}, 3_000);
     } catch {
       /* ignore — process may already be exiting */
     }
-    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 8_000))]);
+    // Large models need time to cancel the decode and finish sys.exit teardown.
+    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 15_000))]);
     if (child.exitCode === null) {
       try {
         child.kill();
@@ -179,7 +181,7 @@ export class Sidecar {
       } catch {
         /* ignore */
       }
-      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 1_500))]);
+      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 3_000))]);
     }
     this.child = null;
     this.activeRunSessionId = null;
