@@ -329,6 +329,22 @@ export function applyAgentEvent(session: Session, event: AgentEvent): Session {
         }),
       );
       break;
+    case "agent.checkpoint": {
+      const phase = payload.phase === "undo" ? "undo" : "snapshot";
+      next.messages.push(
+        block({
+          kind: "checkpoint",
+          phase,
+          checkpointId: payload.checkpoint_id != null ? String(payload.checkpoint_id) : undefined,
+          paths: Array.isArray(payload.paths)
+            ? payload.paths.map((item) => String(item))
+            : Array.isArray(payload.restored)
+              ? payload.restored.map((item) => String(item))
+              : undefined,
+        }),
+      );
+      break;
+    }
     case "agent.experiment":
       next.messages.push(
         block({

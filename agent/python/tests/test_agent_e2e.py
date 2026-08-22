@@ -17,8 +17,10 @@ MODEL_PATH = os.environ.get(
 
 
 @pytest.mark.skipif(not Path(MODEL_PATH).is_file(), reason="GGUF model not available")
-def test_e2e_file_read_edit_scenario() -> None:
-    os.environ["MANGO_GGUF_MODEL_PATH"] = MODEL_PATH
+def test_e2e_file_read_edit_scenario(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Restore after the run so the env var cannot leak into other test modules
+    # (it used to break runtime config tests in combined suite runs).
+    monkeypatch.setenv("MANGO_GGUF_MODEL_PATH", MODEL_PATH)
 
     with tempfile.TemporaryDirectory(prefix="mango-agent-e2e-") as tmp:
         sample = Path(tmp) / "message.txt"

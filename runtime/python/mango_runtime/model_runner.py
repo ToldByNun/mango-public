@@ -70,6 +70,10 @@ DEFAULT_THOUGHT_MAX_TOKENS = 512
 MAX_CONSTRAINED_TOOL_TOKENS = 384
 _GEMMA4_STOPS = ("<turn|>", "<|turn>user", "<|turn>system", "<eos>")
 
+# If the backend produces no token for this long mid-generation, the CUDA context
+# or the pipe is wedged; aborting beats hanging the whole GUI forever.
+TOKEN_GAP_TIMEOUT_S = 180.0
+
 
 def split_completion_budget(
     max_tokens: int,
@@ -141,6 +145,7 @@ class ModelRunner:
         self._loader = GGUFLoader(self._config)
         self._llama: Llama | None = None
         self._grammar_cache: dict[str, Any] = {}
+        self._infer_lock = threading.RLock()
 
     @property
     def config(self) -> RuntimeConfig:
@@ -224,62 +229,80 @@ class ModelRunner:
         should_cancel: Callable[[], bool] | None = None,
     ) -> CompletionResult:
         llama = self._ensure_loaded()
-        if reset_cache:
-            llama.reset()
-        prompt = format_completion_prompt(prompt, model_path=self._loader.model_path)
-        print(
-            f"[mango] generate prompt_chars={len(prompt)} force_grammar={force_grammar}",
-            file=sys.stderr,
-            flush=True,
-        )
-        started = time.monotonic()
-        try:
-            if grammar is not None and grammar_trigger:
-                result = self._complete_lazy(
-                    llama,
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    grammar=grammar,
-                    grammar_trigger=grammar_trigger,
-                    thought_max_tokens=thought_max_tokens,
-                    tool_max_tokens=tool_max_tokens,
-                    force_grammar=force_grammar,
-                    on_token=on_token,
-                    on_phase=on_phase,
-                    should_cancel=should_cancel,
-                )
-            else:
-                compiled = self._compile_grammar(grammar)
-                inference = self._merge_inference(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    # A grammar already constrains the shape; penalizing repeats
-                    # would corrupt file bodies that repeat indentation and quotes.
-                    repeat_penalty=1.0 if compiled is not None else None,
-                )
-                if compiled is not None:
-                    inference["grammar"] = compiled
-                if on_token is None and should_cancel is None:
-                    response = llama.create_completion(prompt=prompt, stream=False, **inference)
-                    result = self._result_from_response(response)
-                else:
-                    text, choice, usage = self._stream_completion(
-                        llama, prompt, inference, on_token, should_cancel=should_cancel
-                    )
-                    result = self._result_from_parts(text, choice, usage)
-        finally:
+        with self._infer_lock:
+            if reset_cache:
+                llama.reset()
+            prompt = format_completion_prompt(prompt, model_path=self._loader.model_path)
             print(
-                f"[mango] generate done {time.monotonic() - started:.1f}s "
-                f"prompt_chars={len(prompt)} force_grammar={force_grammar}",
+                f"[mango] generate prompt_chars={len(prompt)} force_grammar={force_grammar}",
                 file=sys.stderr,
                 flush=True,
             )
-        return result
+            started = time.monotonic()
+            try:
+                if grammar is not None and grammar_trigger:
+                    result = self._complete_lazy(
+                        llama,
+                        prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        grammar=grammar,
+                        grammar_trigger=grammar_trigger,
+                        thought_max_tokens=thought_max_tokens,
+                        tool_max_tokens=tool_max_tokens,
+                        force_grammar=force_grammar,
+                        on_token=on_token,
+                        on_phase=on_phase,
+                        should_cancel=should_cancel,
+                        reset_cache=reset_cache,
+                    )
+                else:
+                    compiled = self._compile_grammar(grammar)
+                    inference = self._merge_inference(
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        # A grammar already constrains the shape; penalizing repeats
+                        # would corrupt file bodies that repeat indentation and quotes.
+                        repeat_penalty=1.0 if compiled is not None else None,
+                    )
+                    if compiled is not None:
+                        inference["grammar"] = compiled
+                    if on_token is None and should_cancel is None:
+                        response = llama.create_completion(prompt=prompt, stream=False, **inference)
+                        result = self._result_from_response(response, reset_cache=reset_cache)
+                        # Non-streaming: approximate prefill as whole elapsed, decode unknown.
+                        elapsed = time.monotonic() - started
+                        result = CompletionResult(
+                            text=result.text,
+                            prompt_tokens=result.prompt_tokens,
+                            completion_tokens=result.completion_tokens,
+                            total_tokens=result.total_tokens,
+                            stopped_eos=result.stopped_eos,
+                            model_path=result.model_path,
+                            ttft_ms=elapsed * 1000.0,
+                            prefill_s=elapsed,
+                            decode_s=0.0,
+                            reset_cache=reset_cache,
+                        )
+                    else:
+                        text, choice, usage, timing = self._stream_completion(
+                            llama, prompt, inference, on_token, should_cancel=should_cancel
+                        )
+                        result = self._result_from_parts(
+                            text, choice, usage, timing=timing, reset_cache=reset_cache
+                        )
+            finally:
+                print(
+                    f"[mango] generate done {time.monotonic() - started:.1f}s "
+                    f"prompt_chars={len(prompt)} force_grammar={force_grammar}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return result
 
     def complete_stream(
         self,
@@ -343,6 +366,7 @@ class ModelRunner:
         on_token: Callable[[str], None] | None = None,
         on_phase: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        reset_cache: bool = False,
     ) -> CompletionResult:
         defaults = self._config.inference
         total = max_tokens if max_tokens is not None else defaults.max_tokens
@@ -412,7 +436,7 @@ class ModelRunner:
                 return False
             return _thought_looks_like_code_dump(partial)
 
-        thought_text, thought_choice, thought_usage = self._stream_completion(
+        thought_text, thought_choice, thought_usage, thought_timing = self._stream_completion(
             llama,
             prompt,
             thought_params,
@@ -432,6 +456,10 @@ class ModelRunner:
                 total_tokens=prompt_tokens + completion_tokens,
                 stopped_eos=True,
                 model_path=str(self._loader.model_path),
+                ttft_ms=float(thought_timing.get("ttft_ms", 0.0)),
+                prefill_s=float(thought_timing.get("prefill_s", 0.0)),
+                decode_s=float(thought_timing.get("decode_s", 0.0)),
+                reset_cache=reset_cache,
             )
         preview = thought_text.replace("\n", " ").strip()
         if len(preview) > 240:
@@ -459,6 +487,10 @@ class ModelRunner:
                 total_tokens=prompt_tokens + completion_tokens,
                 stopped_eos=True,
                 model_path=str(self._loader.model_path),
+                ttft_ms=float(thought_timing.get("ttft_ms", 0.0)),
+                prefill_s=float(thought_timing.get("prefill_s", 0.0)),
+                decode_s=float(thought_timing.get("decode_s", 0.0)),
+                reset_cache=reset_cache,
             )
 
         if not fired and not force_grammar:
@@ -470,6 +502,10 @@ class ModelRunner:
                 total_tokens=prompt_tokens + completion_tokens,
                 stopped_eos=thought_choice.get("finish_reason") == "stop",
                 model_path=str(self._loader.model_path),
+                ttft_ms=float(thought_timing.get("ttft_ms", 0.0)),
+                prefill_s=float(thought_timing.get("prefill_s", 0.0)),
+                decode_s=float(thought_timing.get("decode_s", 0.0)),
+                reset_cache=reset_cache,
             )
 
         continuation = prompt + thought_text
@@ -521,7 +557,7 @@ class ModelRunner:
             # Tool JSON is not shown as thought stream in the UI.
             del delta
 
-        tool_text, tool_choice, tool_usage = self._stream_completion(
+        tool_text, tool_choice, tool_usage, tool_timing = self._stream_completion(
             llama,
             continuation,
             tool_params,
@@ -547,6 +583,12 @@ class ModelRunner:
             total_tokens=prompt_tokens + completion_tokens,
             stopped_eos=tool_choice.get("finish_reason") == "stop",
             model_path=str(self._loader.model_path),
+            ttft_ms=float(thought_timing.get("ttft_ms", 0.0)),
+            prefill_s=float(thought_timing.get("prefill_s", 0.0))
+            + float(tool_timing.get("prefill_s", 0.0)),
+            decode_s=float(thought_timing.get("decode_s", 0.0))
+            + float(tool_timing.get("decode_s", 0.0)),
+            reset_cache=reset_cache,
         )
 
     def _stream_completion(
@@ -558,7 +600,7 @@ class ModelRunner:
         *,
         should_cancel: Callable[[], bool] | None = None,
         should_stop: Callable[[str], bool] | None = None,
-    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, float]]:
         started = time.monotonic()
         print(
             f"[mango] waiting for first token (prompt eval) prompt_chars={len(prompt)} ...",
@@ -569,15 +611,30 @@ class ModelRunner:
         text = ""
         last: dict[str, Any] = {}
         first = True
+        prefill_s = 0.0
+        first_token_at = 0.0
+        last_token_at = started
         try:
             for chunk in stream:
+                now = time.monotonic()
                 if should_cancel is not None and should_cancel():
                     break
+                if now - last_token_at > TOKEN_GAP_TIMEOUT_S:
+                    print(
+                        f"[mango] token gap watchdog fired after {now - last_token_at:.0f}s "
+                        "without progress; aborting stream",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise TimeoutError(
+                        f"no tokens for {TOKEN_GAP_TIMEOUT_S:.0f}s — backend appears wedged"
+                    )
                 last = chunk
                 delta = chunk["choices"][0].get("text", "")
                 if delta:
                     if first:
-                        prefill_s = time.monotonic() - started
+                        first_token_at = now
+                        prefill_s = first_token_at - started
                         usage_hint = chunk.get("usage") or last.get("usage") or {}
                         prompt_tokens = (
                             usage_hint.get("prompt_tokens") if isinstance(usage_hint, dict) else None
@@ -590,6 +647,7 @@ class ModelRunner:
                         )
                         first = False
                     text += delta
+                    last_token_at = now
                     if on_token is not None:
                         on_token(delta)
                     if should_stop is not None and should_stop(text):
@@ -601,6 +659,15 @@ class ModelRunner:
                     close()
                 except Exception:
                     pass
+        ended = time.monotonic()
+        if first_token_at <= 0:
+            # No token arrived (cancel / empty). Treat whole wait as prefill.
+            prefill_s = ended - started
+            decode_s = 0.0
+            ttft_ms = prefill_s * 1000.0
+        else:
+            decode_s = max(0.0, ended - first_token_at)
+            ttft_ms = prefill_s * 1000.0
         choice = last.get("choices", [{}])[0] if last else {}
         usage = last.get("usage", {}) if last else {}
         if not isinstance(usage, dict):
@@ -610,7 +677,8 @@ class ModelRunner:
                 **usage,
                 "completion_tokens": self._estimate_tokens(llama, text),
             }
-        return text, choice, usage
+        timing = {"ttft_ms": ttft_ms, "prefill_s": prefill_s, "decode_s": decode_s}
+        return text, choice, usage, timing
 
     def _estimate_tokens(self, llama: Llama, text: str) -> int:
         if not text:
@@ -627,9 +695,13 @@ class ModelRunner:
         text: str,
         choice: dict[str, Any],
         usage: dict[str, Any],
+        *,
+        timing: dict[str, float] | None = None,
+        reset_cache: bool = False,
     ) -> CompletionResult:
         completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        timing = timing or {}
         return CompletionResult(
             text=text,
             prompt_tokens=prompt_tokens,
@@ -637,6 +709,10 @@ class ModelRunner:
             total_tokens=int(usage.get("total_tokens", 0) or prompt_tokens + completion_tokens),
             stopped_eos=choice.get("finish_reason") == "stop",
             model_path=str(self._loader.model_path),
+            ttft_ms=float(timing.get("ttft_ms", 0.0)),
+            prefill_s=float(timing.get("prefill_s", 0.0)),
+            decode_s=float(timing.get("decode_s", 0.0)),
+            reset_cache=reset_cache,
         )
 
     def _generated_contains_trigger(
@@ -739,7 +815,9 @@ class ModelRunner:
             params["stop"] = merged.stop
         return params
 
-    def _result_from_response(self, response: dict[str, Any]) -> CompletionResult:
+    def _result_from_response(
+        self, response: dict[str, Any], *, reset_cache: bool = False
+    ) -> CompletionResult:
         choice = response["choices"][0]
         usage = response.get("usage", {})
         return CompletionResult(
@@ -749,4 +827,5 @@ class ModelRunner:
             total_tokens=int(usage.get("total_tokens", 0)),
             stopped_eos=choice.get("finish_reason") == "stop",
             model_path=str(self._loader.model_path),
+            reset_cache=reset_cache,
         )

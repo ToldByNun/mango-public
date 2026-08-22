@@ -71,3 +71,8 @@ class CompletionResult:
     total_tokens: int
     stopped_eos: bool
     model_path: str
+    # Observability (A0a). Optional so FakeCompletion and older callers stay valid.
+    ttft_ms: float = 0.0
+    prefill_s: float = 0.0
+    decode_s: float = 0.0
+    reset_cache: bool = False

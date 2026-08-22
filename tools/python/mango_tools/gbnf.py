@@ -29,8 +29,11 @@ content-char ::= [^"\\] | "\\" (["\\] | "n" | "t" | "/" | "r")
 
 _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
+    "list_dir": (),
+    "glob_files": ("pattern",),
     "write_file": ("path",),
     "edit_file": ("path", "old_string", "new_string"),
+    "delete_file": ("path",),
     "edit_symbol": ("path", "symbol", "body"),
     "rename_symbol": ("old_name", "new_name"),
     "search_code": ("pattern",),

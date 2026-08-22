@@ -68,8 +68,13 @@ def test_verification_fix_loop_recovers_from_forced_bug(tmp_path: Path) -> None:
     assert "y.py" in result.final_answer.lower()
     assert "tests passed" in result.final_answer.lower()
     assert "write_file" not in result.final_answer
-    assert "read_file" not in str(runner.grammars[1])
-    assert "edit_symbol" in str(runner.grammars[1]) or "write_file" in str(runner.grammars[1])
+    # Complete tool-filter mode (default): every recovery-core tool stays in the
+    # grammar; steering happens via the prompt hint instead of stripping.
+    assert "read_file" in str(runner.grammars[1])
+    assert "write_file" in str(runner.grammars[1])
+    assert "Preferred next tools:" in second_prompt
+    preferred_line = second_prompt.rsplit("Preferred next tools:", 1)[1].splitlines()[0]
+    assert "edit" in preferred_line or "write" in preferred_line
     assert agent.context is not None
     assert any(entry.tool_name == "verification" and not entry.success for entry in agent.context.state.tool_results)
     assert any(entry.tool_name == "verification" and entry.success for entry in agent.context.state.tool_results)

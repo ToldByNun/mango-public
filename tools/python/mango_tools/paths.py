@@ -28,7 +28,8 @@ def resolve_tool_path(path: str, context: dict[str, Any] | None = None) -> Path:
 
     Prefer a path that actually exists, including real `src/` layouts. Fall back to
     stripping invented prefixes such as `src/math_utils.py` when that file is at the
-    workspace root.
+    workspace root. Without a workspace, relative paths resolve against the directory
+    of the last read file (the model's de-facto working directory), then cwd.
     """
     original = path.strip().replace("\\", "/")
     orig_path = Path(original).expanduser()
@@ -39,6 +40,11 @@ def resolve_tool_path(path: str, context: dict[str, Any] | None = None) -> Path:
     workspace = (context or {}).get("workspace")
     if not workspace:
         raw = Path(normalized or original).expanduser()
+        if not raw.is_absolute():
+            # The model usually continues in the directory it just read from.
+            anchor = (context or {}).get("last_read_dir")
+            if anchor:
+                return (Path(str(anchor)) / raw).resolve()
         return raw.resolve()
 
     ws = Path(str(workspace))
@@ -63,6 +69,26 @@ def resolve_tool_path(path: str, context: dict[str, Any] | None = None) -> Path:
         if candidate.exists():
             return candidate.resolve()
     return (ws / (normalized or original.lstrip("/"))).resolve()
+
+
+def ensure_inside_workspace(file_path: Path, context: dict[str, Any] | None, *, tool: str) -> None:
+    """Refuse paths that resolve outside the declared workspace jail (mutating tools).
+
+    The jail is enforced when the caller marks the context (`enforce_jail`) or when
+    the workspace was declared by the run itself (GUI/Orchestrator). Bare library
+    use without a declared workspace stays unrestricted for backwards compatibility.
+    """
+    workspace = (context or {}).get("workspace")
+    if not workspace:
+        return
+    enforce = bool((context or {}).get("enforce_jail"))
+    if not enforce:
+        return
+    ws = Path(str(workspace)).resolve()
+    try:
+        file_path.resolve().relative_to(ws)
+    except ValueError as exc:
+        raise PermissionError(f"{tool} blocked outside workspace: {file_path}") from exc
 
 
 def display_tool_path(file_path: Path, context: dict[str, Any] | None = None) -> str:

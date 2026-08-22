@@ -180,6 +180,14 @@ function registerIpc(): void {
     if (!sidecar?.running) return { ok: true };
     return sidecar.request("cancel", { session_id: sessionId });
   });
+  ipcMain.handle("agent:continueStall", async (_event, sessionId: string) => {
+    if (!sidecar?.running) return { ok: false, continued: false };
+    return sidecar.request("continue_stall", { session_id: sessionId });
+  });
+  ipcMain.handle("agent:undoLastMutation", async (_event, sessionId: string) => {
+    if (!sidecar?.running) return { ok: false, error: "sidecar not running" };
+    return sidecar.request("undo_last_mutation", { session_id: sessionId });
+  });
   ipcMain.handle("app:open-path", async (_event, target: string) => {
     await shell.openPath(target);
   });

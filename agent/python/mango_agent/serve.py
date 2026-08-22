@@ -75,6 +75,10 @@ class AgentServer:
         self._current_agent: Any | None = None
         self._run_thread: threading.Thread | None = None
         self._session_id = ""
+        # Per-session undo state survives the run so the UI can still revert the
+        # last mutation after agent.stopped.
+        self._undo_history: dict[str, set[str]] = {}
+        self._undo_workspace: dict[str, str] = {}
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any]:
         method = str(message.get("method") or "")
@@ -98,6 +102,10 @@ class AgentServer:
             return self._generate_title_request(params)
         if method == "cancel":
             return self._cancel()
+        if method == "continue_stall":
+            return self._continue_stall()
+        if method == "undo_last_mutation":
+            return self._undo_last_mutation()
         if method == "shutdown":
             return self._begin_shutdown()
         raise ServeError(f"unknown method {method}")
@@ -270,6 +278,20 @@ class AgentServer:
             self.emit("agent.error", {"text": str(exc)})
             self.emit("agent.stopped", {"reason": "error", "error": str(exc)})
         finally:
+            # Remember the last checkpoint per session so undo_last_mutation still
+            # works after the run thread finished and _current_agent is None.
+            session = self._session_id or "default"
+            agent = self._current_agent
+            consumed = self._undo_history.setdefault(session, set())
+            if agent is not None and getattr(agent, "_last_checkpoint_id", ""):
+                self._undo_workspace[session] = str(getattr(agent, "_checkpoint_workspace", ""))
+                # Mark everything except the newest checkpoint as consumed so the
+                # first post-run undo reverts exactly that newest mutation.
+                from mango_agent.checkpoints import _checkpoint_entries
+
+                for path, _key in _checkpoint_entries(getattr(agent, "_run_id", "") or "default"):
+                    if path.name != agent._last_checkpoint_id:
+                        consumed.add(path.name)
             self._current_agent = None
             self._run_thread = None
             self._busy = False
@@ -286,6 +308,58 @@ class AgentServer:
         if agent is not None:
             agent.cancel()
         return {"status": "cancelling"}
+
+    def _continue_stall(self) -> dict[str, Any]:
+        agent = self._current_agent
+        if agent is None:
+            return {"status": "idle", "continued": False}
+        continue_fn = getattr(agent, "continue_after_stall", None)
+        if callable(continue_fn):
+            continue_fn()
+            return {"status": "continued", "continued": True}
+        clear = getattr(agent, "_clear_stall", None)
+        if callable(clear):
+            clear()
+        if hasattr(agent, "_user_continue_stall"):
+            agent._user_continue_stall = True
+        return {"status": "continued", "continued": True}
+
+    def _undo_last_mutation(self) -> dict[str, Any]:
+        agent = self._current_agent
+        session = self._session_id or "default"
+        if agent is not None:
+            undo = getattr(agent, "undo_last_mutation", None)
+            if callable(undo):
+                result = undo()
+                if result.get("ok"):
+                    self._mark_undone(session, str(result.get("checkpoint_id") or ""))
+                return result
+        # Run already finished: fall back to the persisted per-session history.
+        from mango_agent import checkpoints as ck
+
+        consumed = self._undo_history.setdefault(session, set())
+        workspace = self._undo_workspace.get(session) or None
+        result = ck.undo_last_mutation(
+            session_id=self._last_checkpoint_session(), workspace=workspace, consumed=consumed
+        )
+        return result
+
+    def _mark_undone(self, session: str, checkpoint_id: str) -> None:
+        if checkpoint_id:
+            self._undo_history.setdefault(session, set()).add(checkpoint_id)
+
+    @staticmethod
+    def _last_checkpoint_session() -> str:
+        """The run id doubles as the checkpoints subfolder; use the newest one."""
+        try:
+            root = ck.checkpoints_root()
+            candidates = [p for p in root.iterdir() if p.is_dir() and any(p.iterdir())]
+        except OSError:
+            return "default"
+        if not candidates:
+            return "default"
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        return newest.name
 
     def _begin_shutdown(self) -> dict[str, Any]:
         self._cancel()

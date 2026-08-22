@@ -9,7 +9,7 @@ import {
   THINKING_OPTIONS,
   type ThinkingLevel,
 } from "../lib/thinkingLevel";
-import { ContextRing, IconArrowUp, IconGitBranch, IconMic, IconMonitor, IconPlus, IconStop, IconThink } from "./Icons";
+import { ContextRing, IconArrowUp, IconGitBranch, IconMic, IconMonitor, IconPlus, IconStop, IconThink, IconUndo } from "./Icons";
 import { ModelPicker } from "./ModelPicker";
 
 export function Composer(): JSX.Element {
@@ -22,6 +22,8 @@ export function Composer(): JSX.Element {
     selectModel,
     send,
     cancel,
+    continueStall,
+    undoLastMutation,
     sidecarError,
     workspace,
     pickWorkspace,
@@ -190,9 +192,27 @@ export function Composer(): JSX.Element {
               <IconMic size={15} />
             </button>
             {running ? (
-              <button className={`${styles.send} ${styles.stop}`} type="button" onClick={() => void cancel()}>
-                <IconStop />
-              </button>
+              <>
+                <button
+                  className={styles.iconBtn}
+                  type="button"
+                  title="Undo last file change"
+                  onClick={() => void undoLastMutation()}
+                >
+                  <IconUndo size={15} />
+                </button>
+                <button
+                  className={styles.iconBtn}
+                  type="button"
+                  title="Continue after stall"
+                  onClick={() => void continueStall()}
+                >
+                  Go
+                </button>
+                <button className={`${styles.send} ${styles.stop}`} type="button" onClick={() => void cancel()}>
+                  <IconStop />
+                </button>
+              </>
             ) : (
               <button className={styles.send} type="button" disabled={!text.trim()} onClick={() => void submit()}>
                 <IconArrowUp size={14} />

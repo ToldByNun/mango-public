@@ -272,6 +272,18 @@ function StatusRow({
   if (segment.kind === "experiment") {
     return <ExperimentStatus item={segment.item} open={open} onToggle={onToggle} />;
   }
+  if (segment.kind === "checkpoint") {
+    const cp = segment.item;
+    const undo = cp.phase === "undo";
+    const label = undo ? "Restored checkpoint" : "Checkpoint";
+    const detail = (cp.paths || []).map((p) => p.split(/[/\\]/).pop()).join(", ");
+    return (
+      <div className={styles.statusRow}>
+        <span className={styles.statusVerb}>{label}</span>
+        <span className={styles.statusMeta}> {detail}</span>
+      </div>
+    );
+  }
   return (
     <div className={styles.statusRow}>
       <span className={styles.statusMeta}>{segment.item.text}</span>

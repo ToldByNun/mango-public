@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from mango_tools.implementations.delete_file import delete_file
 from mango_tools.implementations.edit_file import edit_file
 from mango_tools.implementations.edit_symbol import edit_symbol
+from mango_tools.implementations.glob_files import glob_files
+from mango_tools.implementations.list_dir import list_dir
 from mango_tools.implementations.measure import measure
 from mango_tools.implementations.read_file import read_file
 from mango_tools.implementations.rename_symbol import rename_symbol
@@ -12,7 +15,18 @@ from mango_tools.implementations.write_file import write_file
 from mango_tools.tool_registry import ToolRegistry
 
 
-def register_builtin_tools(registry: ToolRegistry) -> None:
+def register_builtin_tools(registry: ToolRegistry, *, enable_delete: bool | None = None) -> None:
+    if enable_delete is None:
+        import os
+
+        raw = os.environ.get("MANGO_DELETE_TOOL")
+        if raw is None:
+            # Default on only when checkpoints are on.
+            ck = os.environ.get("MANGO_FILE_CHECKPOINTS", "1")
+            enable_delete = str(ck).strip().lower() not in {"0", "false", "no", "off", ""}
+        else:
+            enable_delete = str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
     registry.register(
         "read_file",
         read_file,
@@ -23,6 +37,27 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             "max_bytes": {"type": "integer", "description": "Optional read cap in bytes"},
         },
         required=["path"],
+    )
+    registry.register(
+        "list_dir",
+        list_dir,
+        description="List files and directories under a path (workspace-jailed).",
+        parameters={
+            "path": {"type": "string", "description": "Directory path", "default": "."},
+            "max_entries": {"type": "integer", "description": "Max entries to return", "default": 200},
+        },
+        required=[],
+    )
+    registry.register(
+        "glob_files",
+        glob_files,
+        description="Find files matching a glob pattern under a path (workspace-jailed).",
+        parameters={
+            "pattern": {"type": "string", "description": "Glob pattern, e.g. **/*.py"},
+            "path": {"type": "string", "description": "Root directory", "default": "."},
+            "max_results": {"type": "integer", "description": "Max matches", "default": 200},
+        },
+        required=["pattern"],
     )
     registry.register(
         "write_file",
@@ -49,6 +84,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         },
         required=["path", "old_string", "new_string"],
     )
+    if enable_delete:
+        registry.register(
+            "delete_file",
+            delete_file,
+            description="Delete a file inside the workspace (not directories).",
+            parameters={
+                "path": {"type": "string", "description": "File path to delete"},
+            },
+            required=["path"],
+        )
     registry.register(
         "edit_symbol",
         edit_symbol,
@@ -129,7 +174,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     )
 
 
-def create_default_registry() -> ToolRegistry:
+def create_default_registry(*, enable_delete: bool | None = None) -> ToolRegistry:
     registry = ToolRegistry()
-    register_builtin_tools(registry)
+    register_builtin_tools(registry, enable_delete=enable_delete)
     return registry

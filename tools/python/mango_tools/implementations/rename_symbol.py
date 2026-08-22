@@ -6,7 +6,7 @@ import tokenize
 from pathlib import Path
 from typing import Any
 
-from mango_tools.paths import resolve_tool_path
+from mango_tools.paths import ensure_inside_workspace, resolve_tool_path
 
 _SKIP_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".tox", ".mango", ".devdeck"}
 _UNCHANGED = "file unchanged; tests still fail; change the implementation"
@@ -34,6 +34,7 @@ def rename_symbol(
             path = str(workspace)
 
     root = resolve_tool_path(path, _context)
+    ensure_inside_workspace(root, _context, tool="rename_symbol")
     files = _python_files(root)
     if not files:
         raise FileNotFoundError(f"No Python files under {root}")

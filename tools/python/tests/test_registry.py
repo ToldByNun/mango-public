@@ -26,11 +26,14 @@ def test_duplicate_registration_raises() -> None:
 
 
 def test_builtin_tools_registered() -> None:
-    registry = create_default_registry()
+    registry = create_default_registry(enable_delete=True)
     names = registry.list_tools()
     assert names == [
+        "delete_file",
         "edit_file",
         "edit_symbol",
+        "glob_files",
+        "list_dir",
         "measure",
         "read_file",
         "rename_symbol",
@@ -39,6 +42,13 @@ def test_builtin_tools_registered() -> None:
         "search_code",
         "write_file",
     ]
+
+
+def test_delete_tool_gated_by_checkpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MANGO_FILE_CHECKPOINTS", "0")
+    monkeypatch.delenv("MANGO_DELETE_TOOL", raising=False)
+    names = create_default_registry().list_tools()
+    assert "delete_file" not in names
 
 
 def test_missing_required_args_raises() -> None:

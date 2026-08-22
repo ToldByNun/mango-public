@@ -36,6 +36,8 @@ export type MangoBridge = {
       thoughtMaxTokens?: number | null,
     ) => Promise<Record<string, unknown>>;
     cancel: (sessionId: string) => Promise<Record<string, unknown>>;
+    continueStall: (sessionId: string) => Promise<Record<string, unknown>>;
+    undoLastMutation: (sessionId: string) => Promise<Record<string, unknown>>;
     onEvent: (handler: (event: AgentEvent) => void) => () => void;
     onSidecarError: (handler: (message: string) => void) => () => void;
   };

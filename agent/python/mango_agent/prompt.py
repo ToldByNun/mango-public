@@ -147,13 +147,27 @@ _LEVEL_SUFFIX = {
 
 
 def compose_agent_system_prompt(level: str | None = None, *, start: Path | None = None) -> str:
-    """Base `agent.md` plus an optional thinking-level suffix."""
-    base = load_system_prompt("agent", start=start)
+    """Base agent prompt (variant-aware) plus an optional thinking-level suffix."""
+    base_name = _prompt_variant_name()
+    base = load_system_prompt(base_name, start=start)
     name = _LEVEL_SUFFIX.get(str(level or "off").strip().lower(), "")
     if not name:
         return base
     extra = load_system_prompt(name, start=start)
     return f"{base}\n\n{extra}".strip()
+
+
+def _prompt_variant_name() -> str:
+    """Select agent.md (v1) or agent_v2.md via MANGO_PROMPT_VARIANT / flags."""
+    try:
+        from mango_agent.flags import prompt_variant
+
+        variant = prompt_variant()
+    except Exception:
+        variant = os.environ.get("MANGO_PROMPT_VARIANT", "v2").strip().lower() or "v2"
+    if variant in {"v2", "ab_test"}:
+        return "agent_v2"
+    return "agent"
 
 
 DEFAULT_SYSTEM_PROMPT = load_system_prompt("agent")

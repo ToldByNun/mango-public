@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from mango_tools.paths import resolve_tool_path
+from mango_tools.paths import ensure_inside_workspace, resolve_tool_path
 
 _DEF_HEAD = re.compile(r"^\s*(?:async\s+)?def\s+\w+\s*\(|^\s*class\s+\w+", re.M)
 
@@ -22,6 +22,7 @@ def edit_symbol(
 ) -> dict[str, Any]:
     """Replace a function/class/method via AST. Neighbors and imports stay put."""
     file_path = resolve_tool_path(path, _context)
+    ensure_inside_workspace(file_path, _context, tool="edit_symbol")
     if not file_path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
 

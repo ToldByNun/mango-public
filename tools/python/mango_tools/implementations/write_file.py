@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from mango_tools.paths import file_tool_result, resolve_tool_path
+from mango_tools.paths import ensure_inside_workspace, file_tool_result, resolve_tool_path
 from mango_tools.syntax import python_syntax_error, salvage_python_source
 
 _UNCHANGED = "file unchanged; tests still fail; change the implementation"
@@ -23,6 +23,7 @@ def write_file(
 ) -> dict[str, Any]:
     """Write content to a file, creating parent directories when needed."""
     file_path = resolve_tool_path(path, _context)
+    ensure_inside_workspace(file_path, _context, tool="write_file")
     existing = ""
     if file_path.is_file():
         existing = file_path.read_text(encoding=encoding)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from mango_tools.fuzzy_edit import apply_replace
-from mango_tools.paths import file_tool_result, resolve_tool_path
+from mango_tools.paths import ensure_inside_workspace, file_tool_result, resolve_tool_path
 from mango_tools.syntax import python_syntax_error
 
 
@@ -18,6 +18,7 @@ def edit_file(
 ) -> dict[str, Any]:
     """Replace old_string with new_string in a file."""
     file_path = resolve_tool_path(path, _context)
+    ensure_inside_workspace(file_path, _context, tool="edit_file")
     if not file_path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
 
@@ -26,12 +27,22 @@ def edit_file(
     require_grounded = bool(context.get("require_grounded_edits"))
     abs_path = str(file_path.resolve())
     allow_fuzzy = True
+    allow_whitespace = False
     if require_grounded:
         if abs_path not in files_read:
             allow_fuzzy = False
+            allow_whitespace = False
         else:
-            # After read_file: exact and newline-normalized only (no fuzzy/indent/whitespace).
+            # After read_file: exact + newlines; optionally whitespace via flag.
             allow_fuzzy = False
+            try:
+                from mango_agent.flags import edit_match_mode
+
+                allow_whitespace = edit_match_mode() == "grounded_ws"
+            except Exception:
+                allow_whitespace = str(
+                    (__import__("os").environ.get("MANGO_EDIT_MATCH_MODE") or "")
+                ).lower() == "grounded_ws"
 
     content = file_path.read_text(encoding=encoding)
     updated, replacements, match = apply_replace(
@@ -40,6 +51,7 @@ def edit_file(
         new_string,
         replace_all=replace_all,
         allow_fuzzy=allow_fuzzy,
+        allow_whitespace=allow_whitespace,
     )
 
     file_path.write_text(updated, encoding=encoding)
@@ -50,7 +62,7 @@ def edit_file(
         bytes_written=len(updated.encode(encoding)),
         match=match,
     )
-    if match not in {"exact", "newlines"}:
+    if match not in {"exact", "newlines", "whitespace"}:
         result["fuzzy"] = True
     syntax_error = python_syntax_error(file_path, source=updated)
     if syntax_error:

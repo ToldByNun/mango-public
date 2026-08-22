@@ -40,6 +40,27 @@ class LoopMetrics:
     verification_runs: int = 0
     verification_failures: int = 0
     elapsed_seconds: float = 0.0
+    edit_fail_count: int = 0
+    write_fail_count: int = 0
+    edit_attempts: int = 0
+    write_attempts: int = 0
+    edit_fail_rate: float = 0.0
+    identical_tool_repeat_max: int = 0
+    stall_triggered: bool = False
+    stall_stopped: bool = False
+    grammar_tool_count: int = 0
+    grammar_missing_core_tools: list[str] = field(default_factory=list)
+    grammar_filtered_tools: list[str] = field(default_factory=list)
+    ttft_ms: float = 0.0
+    total_prefill_s: float = 0.0
+    total_decode_s: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    plan_gate_turns: int = 0
+    prompt_variant: str = "v1"
+    tool_filter_mode: str = "complete"
+    tool_profile: str = "standard"
+    reset_cache_used: int = 0
 
     def format_log(self, scenario: str = "", *, stop_reason: str = "") -> str:
         title = scenario.strip() or "run"
@@ -52,6 +73,9 @@ class LoopMetrics:
             f"  reasoning_cycles={self.reasoning_cycles}",
             f"  epistemic_calls={self.epistemic_calls} epistemic_subagent_iterations={self.epistemic_subagent_iterations}",
             f"  verification_runs={self.verification_runs} verification_failures={self.verification_failures}",
+            f"  edit_fail_rate={self.edit_fail_rate} stall_stopped={self.stall_stopped}",
+            f"  grammar_missing_core={self.grammar_missing_core_tools or '(none)'}",
+            f"  ttft_ms={self.ttft_ms} prefill_s={self.total_prefill_s} decode_s={self.total_decode_s}",
         ]
         return "\n".join(lines)
 
@@ -103,6 +127,27 @@ class AgentResult:
                 "verification_runs": self.metrics.verification_runs,
                 "verification_failures": self.metrics.verification_failures,
                 "elapsed_seconds": self.metrics.elapsed_seconds,
+                "edit_fail_count": self.metrics.edit_fail_count,
+                "write_fail_count": self.metrics.write_fail_count,
+                "edit_attempts": self.metrics.edit_attempts,
+                "write_attempts": self.metrics.write_attempts,
+                "edit_fail_rate": self.metrics.edit_fail_rate,
+                "identical_tool_repeat_max": self.metrics.identical_tool_repeat_max,
+                "stall_triggered": self.metrics.stall_triggered,
+                "stall_stopped": self.metrics.stall_stopped,
+                "grammar_tool_count": self.metrics.grammar_tool_count,
+                "grammar_missing_core_tools": self.metrics.grammar_missing_core_tools,
+                "grammar_filtered_tools": self.metrics.grammar_filtered_tools,
+                "ttft_ms": self.metrics.ttft_ms,
+                "total_prefill_s": self.metrics.total_prefill_s,
+                "total_decode_s": self.metrics.total_decode_s,
+                "prompt_tokens": self.metrics.prompt_tokens,
+                "completion_tokens": self.metrics.completion_tokens,
+                "plan_gate_turns": self.metrics.plan_gate_turns,
+                "prompt_variant": self.metrics.prompt_variant,
+                "tool_filter_mode": self.metrics.tool_filter_mode,
+                "tool_profile": self.metrics.tool_profile,
+                "reset_cache_used": self.metrics.reset_cache_used,
             },
             "steps": [
                 {

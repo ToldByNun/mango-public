@@ -33,6 +33,8 @@ type Store = {
   selectModel: (path: string) => Promise<void>;
   send: (goal: string, attachments: string[], thinkingLevel?: string) => Promise<boolean>;
   cancel: () => Promise<void>;
+  continueStall: () => Promise<void>;
+  undoLastMutation: () => Promise<void>;
 };
 
 export declare function AgentProvider({ children }: { children: ReactNode }): JSX.Element;

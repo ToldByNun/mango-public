@@ -13,6 +13,7 @@ export type ActivitySegment =
   | { id: string; kind: "verification"; item: Extract<TranscriptBlock, { kind: "verification" }> }
   | { id: string; kind: "syntax"; item: Extract<TranscriptBlock, { kind: "syntax" }> }
   | { id: string; kind: "experiment"; item: Extract<TranscriptBlock, { kind: "experiment" }> }
+  | { id: string; kind: "checkpoint"; item: Extract<TranscriptBlock, { kind: "checkpoint" }> }
   | { id: string; kind: "status"; item: Extract<TranscriptBlock, { kind: "status" }> };
 
 const SEARCH_TOOLS = new Set(["search_code", "web_research"]);
@@ -96,6 +97,8 @@ export function segmentActivity(blocks: TranscriptBlock[]): ActivitySegment[] {
       segments.push({ id: item.id, kind: "syntax", item });
     } else if (item.kind === "experiment") {
       segments.push({ id: item.id, kind: "experiment", item });
+    } else if (item.kind === "checkpoint") {
+      segments.push({ id: item.id, kind: "checkpoint", item });
     } else if (item.kind === "status" && item.text) {
       segments.push({ id: item.id, kind: "status", item });
     }

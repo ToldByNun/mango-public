@@ -5,6 +5,7 @@ export const AGENT_EVENTS = [
   "agent.token",
   "agent.tool",
   "agent.file",
+  "agent.checkpoint",
   "agent.verification",
   "agent.syntax",
   "agent.experiment",
@@ -68,6 +69,15 @@ export type TranscriptBlock =
       createdAt: number;
     }
   | { id: string; kind: "verification"; ok: boolean; report: string; createdAt: number }
+  | { id: string; kind: "syntax"; path: string; message: string; createdAt: number }
+  | {
+      id: string;
+      kind: "checkpoint";
+      phase: "snapshot" | "undo";
+      checkpointId?: string;
+      paths?: string[];
+      createdAt: number;
+    }
   | { id: string; kind: "syntax"; path: string; message: string; createdAt: number }
   | {
       id: string;

@@ -14,6 +14,7 @@ def apply_replace(
     *,
     replace_all: bool = False,
     allow_fuzzy: bool = True,
+    allow_whitespace: bool = False,
 ) -> tuple[str, int, str]:
     """Replace old_string in content. Returns (updated, count, match_kind)."""
     if old_string == new_string:
@@ -34,17 +35,27 @@ def apply_replace(
         n = count if replace_all else 1
         return _restore_newlines(updated, newline), n, "newlines"
 
+    if allow_whitespace or allow_fuzzy:
+        span = _unique_normalized_span(normalized, old_n, strip_indent=False)
+        if span is not None:
+            start, end, _original = span
+            updated = normalized[:start] + new_n + normalized[end:]
+            return _restore_newlines(updated, newline), 1, "whitespace"
+        if allow_whitespace:
+            span = _unique_ws_collapsed_span(normalized, old_n)
+            if span is not None:
+                start, end, _original = span
+                updated = normalized[:start] + new_n + normalized[end:]
+                return _restore_newlines(updated, newline), 1, "whitespace"
+
     if not allow_fuzzy:
+        hint = _nearest_snippet(normalized, old_n)
         raise ValueError(
             "old_string not found in file. read_file first and copy old_string exactly "
-            "(no fuzzy/whitespace match)."
+            "(no fuzzy/indent match)."
+            + (f" Nearest snippet:\n{hint}" if hint else "")
+            + " Suggested next tool: read_file (or write_file for a full rewrite)."
         )
-
-    span = _unique_normalized_span(normalized, old_n, strip_indent=False)
-    if span is not None:
-        start, end, _original = span
-        updated = normalized[:start] + new_n + normalized[end:]
-        return _restore_newlines(updated, newline), 1, "whitespace"
 
     span = _unique_normalized_span(normalized, old_n, strip_indent=True)
     if span is not None:
@@ -58,10 +69,37 @@ def apply_replace(
         updated = normalized[:start] + _align_indent(original, new_n) + normalized[end:]
         return _restore_newlines(updated, newline), 1, "fuzzy"
 
+    hint = _nearest_snippet(normalized, old_n)
     raise ValueError(
         "old_string not found in file. Copy a unique snippet from the file, "
         "or call write_file with the complete file contents."
+        + (f" Nearest snippet:\n{hint}" if hint else "")
+        + " Suggested next tool: read_file (or write_file for a full rewrite)."
     )
+
+
+def _nearest_snippet(content: str, needle: str, *, radius: int = 2) -> str:
+    """Best-effort nearby lines for edit recovery errors."""
+    if not content or not needle:
+        return ""
+    lines = content.splitlines()
+    needle_lines = [line.strip() for line in needle.splitlines() if line.strip()]
+    if not needle_lines or not lines:
+        return ""
+    target = needle_lines[0]
+    best_i = -1
+    best_score = -1.0
+    for i, line in enumerate(lines):
+        score = difflib.SequenceMatcher(None, line.strip(), target).ratio()
+        if score > best_score:
+            best_score = score
+            best_i = i
+    if best_i < 0 or best_score < 0.4:
+        return ""
+    start = max(0, best_i - radius)
+    end = min(len(lines), best_i + radius + 1)
+    numbered = [f"{idx + 1:>4}| {lines[idx]}" for idx in range(start, end)]
+    return "\n".join(numbered)
 
 
 def _commit_exact(content: str, old: str, new: str, count: int, replace_all: bool) -> str:
@@ -109,6 +147,30 @@ def _norm_line(line: str, *, strip_indent: bool) -> str:
     text = line.expandtabs(4) if strip_indent else line
     text = text.rstrip()
     return text.lstrip() if strip_indent else text
+
+
+def _collapse_ws(line: str) -> str:
+    return " ".join(line.expandtabs(4).split())
+
+
+def _unique_ws_collapsed_span(content: str, old: str) -> tuple[int, int, str] | None:
+    old_lines = old.split("\n")
+    file_lines = _line_spans(content)
+    n = len(old_lines)
+    if n == 0 or n > len(file_lines):
+        return None
+    old_norm = [_collapse_ws(line) for line in old_lines]
+    hits: list[tuple[int, int, str]] = []
+    for i in range(len(file_lines) - n + 1):
+        window = [_collapse_ws(file_lines[i + k][2]) for k in range(n)]
+        if window != old_norm:
+            continue
+        start = file_lines[i][0]
+        end = _span_end(content, file_lines, i + n - 1, old)
+        hits.append((start, end, content[start:end]))
+        if len(hits) > 1:
+            return None
+    return hits[0] if hits else None
 
 
 def _span_end(content: str, file_lines: list[tuple[int, int, str]], last_index: int, old: str) -> int:

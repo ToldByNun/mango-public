@@ -112,8 +112,9 @@ export class Sidecar {
       this.activeRunSessionId = null;
     }
     // Streaming / long-running RPCs: no client timeout (cancel or process exit ends them).
+    // load_model can take many minutes for multi-GB GGUFs on cold caches.
     const effectiveTimeout =
-      method === "run" || method === "cancel" ? 0 : timeoutMs;
+      method === "run" || method === "cancel" || method === "load_model" ? 0 : timeoutMs;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
       const timer =

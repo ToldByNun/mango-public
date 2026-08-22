@@ -47,7 +47,9 @@ def test_sanitize_thought_dedupes_repeated_sentences() -> None:
     assert display.count("bot is complete") == 1
 
 
-def test_note_stall_stops_after_identical_answers() -> None:
+def test_note_stall_stops_after_identical_answers(monkeypatch) -> None:
+    monkeypatch.setenv("MANGO_STALL_MODE", "hard")
+
     class _Engine:
         def __init__(self) -> None:
             self.feedback = ""

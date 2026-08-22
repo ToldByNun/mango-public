@@ -1,0 +1,27 @@
+{
+  "v1": {
+    "variant": "v1",
+    "stop_reason": "completed",
+    "edit_fail_rate": 0.0,
+    "stall_stopped": false,
+    "identical_tool_repeat_max": 1,
+    "tool_calls_by_name": {
+      "read_file": 1,
+      "edit_file": 1
+    },
+    "final_ok": true
+  },
+  "v2": {
+    "variant": "v2",
+    "stop_reason": "completed",
+    "edit_fail_rate": 0.0,
+    "stall_stopped": false,
+    "identical_tool_repeat_max": 1,
+    "tool_calls_by_name": {
+      "read_file": 1,
+      "edit_file": 1
+    },
+    "final_ok": true
+  },
+  "merge_v2": true
+}

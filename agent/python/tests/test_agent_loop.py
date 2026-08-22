@@ -539,7 +539,8 @@ def test_inspect_before_edit_blocks_hallucinated_test_edit(tmp_path: Path) -> No
     assert "assert True" in (testing / "test_assertrewrite.py").read_text(encoding="utf-8")
     first_grammar = str(runner.grammars[0])
     assert "search_code" in first_grammar
-    assert "edit_file" not in first_grammar
+    # Complete mode keeps edit_file in GBNF; hallucinated edits are blocked at execution.
+    assert "edit_file" in first_grammar
     assert any("rewrite.py" in prompt for prompt in runner.prompts[1:])
 
 
@@ -710,8 +711,9 @@ def test_plan_apis_first_blocks_write_until_epistemic(tmp_path: Path) -> None:
     names = [call.name for step in result.steps for call in step.tool_calls]
     assert names[:3] == ["write_file", "declare_apis", "ask_epistemic"]
     grammars = [str(item) for item in runner.grammars if item]
-    assert any("declare_apis" in item and "write_file" not in item for item in grammars[:1])
-    assert any("ask_epistemic" in item and "write_file" not in item for item in grammars)
+    # Complete mode: write_file stays in grammar; plan gate blocks execution until declare/epistemic.
+    assert any("declare_apis" in item and "write_file" in item for item in grammars[:1])
+    assert any("ask_epistemic" in item for item in grammars)
 
 
 def test_plan_apis_ignores_unittest_and_uses_declared_lookups(tmp_path: Path) -> None:
@@ -810,7 +812,7 @@ def test_plan_apis_ignores_uuid_traceback_and_locks_write_file(tmp_path: Path) -
     assert names.count("write_file") == 1
     write_turn = str(runner.grammars[2] or "")
     assert "write_file" in write_turn
-    assert "ask_epistemic" not in write_turn
+    # Complete mode may still list ask_epistemic; preference steers toward write_file.
 
 
 def test_missing_tests_prefer_write_file_over_run_tests(tmp_path: Path) -> None:
@@ -959,8 +961,19 @@ def test_plan_apis_follow_up_allows_read_then_epistemic(tmp_path: Path) -> None:
     assert names[:2] == ["read_file", "ask_epistemic"]
     assert target.read_text(encoding="utf-8") == "x = 1\n"
     grammars = [str(item) for item in runner.grammars if item]
-    assert any("read_file" in item and "write_file" not in item for item in grammars[:1])
-    assert any("ask_epistemic" in item and "write_file" not in item for item in grammars[:1])
+    # Complete mode keeps write_file in GBNF; steering is via preferred feedback / plan gate.
+    assert any("read_file" in item for item in grammars[:1])
+    assert any("ask_epistemic" in item for item in grammars[:1])
+    # Legacy strip characterization (rollback path).
+    import os
+
+    os.environ["MANGO_TOOL_FILTER_MODE"] = "legacy"
+    try:
+        legacy_names = agent._action_tool_names_legacy()
+        # Follow-up inspect path in legacy may exclude write_file.
+        assert "read_file" in legacy_names or "ask_epistemic" in legacy_names
+    finally:
+        os.environ.pop("MANGO_TOOL_FILTER_MODE", None)
 
 
 def test_write_file_syntax_error_blocks_finish(tmp_path: Path) -> None:
@@ -1550,7 +1563,9 @@ def test_gui_grounded_blocks_edit_without_read(tmp_path: Path) -> None:
         if not item.success and "BLOCKED" in str(item.error or "")
     ]
     assert blocked
-    assert "edit_file" not in str(runner.grammars[0])
+    # Complete mode keeps edit_file in GBNF; grounding is enforced by the runner block.
+    assert "edit_file" in str(runner.grammars[0])
+    assert "read_file" in str(runner.grammars[0])
 
 
 def test_gui_grounded_blocks_test_edit_before_impl(tmp_path: Path) -> None:

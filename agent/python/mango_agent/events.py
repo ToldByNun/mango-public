@@ -12,6 +12,9 @@ FILE = "agent.file"
 VERIFICATION = "agent.verification"
 SYNTAX = "agent.syntax"
 EXPERIMENT = "agent.experiment"
+CHECKPOINT = "agent.checkpoint"
+METRICS = "agent.metrics"
+PHASE = "agent.phase"
 FINAL = "agent.final"
 STOPPED = "agent.stopped"
 ERROR = "agent.error"
@@ -69,6 +72,15 @@ def tool_title(name: str, arguments: dict[str, Any] | None = None) -> str:
     if name == "read_file":
         path = str(args.get("path") or "").strip()
         return f"Reading `{Path(path).name}`" if path else "Reading file"
+    if name == "list_dir":
+        path = str(args.get("path") or ".").strip()
+        return f"Listing `{path}`"
+    if name == "glob_files":
+        pattern = str(args.get("pattern") or "").strip()
+        return f"Finding `{pattern}`" if pattern else "Finding files"
+    if name == "delete_file":
+        path = str(args.get("path") or "").strip()
+        return f"Deleting `{Path(path).name}`" if path else "Deleting file"
     if name == "codebase_lookup":
         symbol = args.get("symbol") or args.get("query") or args.get("name")
         return f"Looked up symbol {symbol}" if symbol else "Looked up symbol"

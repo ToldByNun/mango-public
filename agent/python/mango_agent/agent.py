@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -42,9 +43,27 @@ from mango_agent.experiment import (
 )
 from mango_agent.prompt import compose_agent_system_prompt, feedback, render_system_prompt
 from mango_agent.thinking import thinking_preset, verify_hint_for
+from mango_agent.checkpoints import (
+    MUTATING_TOOLS as _CHECKPOINT_MUTATING_TOOLS,
+    paths_for_tool_call,
+    snapshot_paths,
+    undo_last_mutation as restore_last_mutation,
+)
+from mango_agent.flags import (
+    OPTIONAL_TOOLS_TINY,
+    RECOVERY_CORE_TOOLS,
+    kv_prefix_reuse_enabled,
+    metrics_enabled,
+    prompt_variant,
+    resolve_tool_profile,
+    stall_mode,
+    tool_filter_mode,
+    tool_profile,
+)
+from mango_agent.metrics import build_run_metrics, emit_stderr_json, persist_run_metrics
 from mango_agent.types import AgentResult, AgentStep, LoopMetrics, ModelRunnerProtocol, StopReason
 
-_CODE_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "edit_symbol", "rename_symbol"})
+_CODE_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "edit_symbol", "rename_symbol", "delete_file"})
 _WORK_TOOLS = _CODE_MUTATING_TOOLS | {"run_tests", "run_terminal_command"}
 _RESEARCH_TOOLS = frozenset({"web_research", "doc_lookup", "package_source_lookup"})
 _ACTING_TOOLS = _WORK_TOOLS | _RESEARCH_TOOLS
@@ -308,6 +327,19 @@ class Agent:
         self._context: ContextEngine | None = None
         self._cot: CoTEngine | None = None
         self._verification_root = Path(verification_root).resolve() if verification_root else None
+        # Explicitly declared run workspace (Orchestrator/GUI always declare one).
+        # Only this grants the mutating-tool jail; a bare Agent() (tests/library)
+        # keeps the historical freedom to touch any path it names.
+        self._declared_workspace = (
+            Path(codeintel_root).resolve()
+            if codeintel_root
+            else self._verification_root
+        )
+        # Checkpoint/undo root. Falls back to cwd so undo still targets the
+        # process working directory when nothing was declared.
+        self._checkpoint_workspace = (
+            self._declared_workspace if self._declared_workspace else Path.cwd().resolve()
+        )
         self._verification_config = verification_config
         self._failed_verifications = 0
         self._verification_runs = 0
@@ -381,6 +413,30 @@ class Agent:
         self._experiment_exhausted = False
         self._experiment_locked_paths: set[str] = set()
         self._last_hypothesis = "this edit"
+        # A0a observability counters (reset each run).
+        self._metric_edit_fail = 0
+        self._metric_write_fail = 0
+        self._metric_edit_attempts = 0
+        self._metric_write_attempts = 0
+        self._metric_identical_repeat_max = 0
+        self._metric_stall_triggered = False
+        self._metric_stall_stopped = False
+        self._metric_last_grammar_names: list[str] = []
+        self._metric_filtered_tools: list[str] = []
+        self._metric_ttft_ms = 0.0
+        self._metric_prefill_s = 0.0
+        self._metric_decode_s = 0.0
+        self._metric_prompt_tokens = 0
+        self._metric_completion_tokens = 0
+        self._metric_plan_gate_turns = 0
+        self._metric_reset_cache = 0
+        self._metric_tool_signature = ""
+        self._metric_tool_signature_repeats = 0
+        self._user_continue_stall = False
+        self._last_read_dir = ""
+        self._files_read: set[str] = set()
+        self._last_preferred_tools: list[str] = []
+        self._last_checkpoint_id = ""
 
     @property
     def limits(self) -> AgentLimits:
@@ -441,6 +497,13 @@ class Agent:
             },
             required=["libraries"],
         )
+
+    def _should_reset_cache(self, iteration: int) -> bool:
+        """A5: reuse KV prefix on follow-up iterations when enabled."""
+        if not kv_prefix_reuse_enabled():
+            return True
+        # Always reset on first iteration of a run; keep cache warm afterward.
+        return iteration <= 1
 
     def _plan_apis_enabled(self) -> bool:
         return bool(self._plan_apis_first)
@@ -800,6 +863,27 @@ class Agent:
         self._experiment_exhausted = False
         self._experiment_locked_paths = set()
         self._last_hypothesis = "this edit"
+        self._metric_edit_fail = 0
+        self._metric_write_fail = 0
+        self._metric_edit_attempts = 0
+        self._metric_write_attempts = 0
+        self._metric_identical_repeat_max = 0
+        self._metric_stall_triggered = False
+        self._metric_stall_stopped = False
+        self._metric_last_grammar_names = []
+        self._metric_filtered_tools = []
+        self._metric_ttft_ms = 0.0
+        self._metric_prefill_s = 0.0
+        self._metric_decode_s = 0.0
+        self._metric_prompt_tokens = 0
+        self._metric_completion_tokens = 0
+        self._metric_plan_gate_turns = 0
+        self._metric_reset_cache = 0
+        self._metric_tool_signature = ""
+        self._metric_tool_signature_repeats = 0
+        self._user_continue_stall = False
+        self._last_read_dir = ""
+        self._last_checkpoint_id = ""
         if self._plan_apis_enabled():
             if _is_follow_up_goal(task):
                 self._apis_declared_once = True
@@ -1042,11 +1126,16 @@ class Agent:
             engine.set_reasoning_summary(summary)
             if reasoning_cycles_this_iter == 0:
                 self._trace(f"iter {iteration} cot skipped need={cot.last_need.value}")
+            force_tool = self._needs_tool()
+            # Compute grammar names before building the prompt so preferred-tool
+            # feedback (complete mode) can land in the same turn's Verification block.
+            tool_names = self._action_tool_names() if self._use_tool_grammar else []
+            self._apply_preferred_tool_feedback(engine)
             prompt = engine.build_idle_retry_prompt() if idle_retry else engine.build_prompt()
             try:
-                force_tool = self._needs_tool()
-                grammar = self._action_grammar()
-                tool_names = self._action_tool_names() if grammar else []
+                grammar = self._action_grammar(tool_names=tool_names)
+                if not grammar:
+                    tool_names = []
                 thought_id = self._thought_id()
                 stream_started = time.monotonic()
                 stream_buf: list[str] = []
@@ -1087,6 +1176,7 @@ class Agent:
                 def on_phase(name: str) -> None:
                     nonlocal stream_phase
                     stream_phase = "tool" if name == "tool_grammar" else "thought"
+                    self._emit(agent_events.PHASE, {"phase": name})
 
                 if self._cancelled():
                     return self._result(
@@ -1108,7 +1198,7 @@ class Agent:
                     max_tokens=self._max_tokens,
                     temperature=self._temperature,
                     top_p=self._top_p,
-                    reset_cache=iteration == 1,
+                    reset_cache=self._should_reset_cache(iteration),
                     grammar=grammar,
                     grammar_trigger=TOOL_CALL_PREFIX if grammar else None,
                     thought_max_tokens=effective_thought_max_tokens,
@@ -1117,6 +1207,11 @@ class Agent:
                     on_token=on_token if self._on_event is not None else None,
                     on_phase=on_phase if self._on_event is not None else None,
                     should_cancel=self._cancelled,
+                )
+                self._note_completion_metrics(
+                    completion,
+                    tool_names=tool_names,
+                    reset_cache=self._should_reset_cache(iteration),
                 )
                 model_output = normalize_model_output(str(completion.text))
                 self._step_tokens = int(getattr(completion, "completion_tokens", 0) or 0)
@@ -1219,6 +1314,7 @@ class Agent:
                         f"iter {iteration} stalled: same answer x{self._stall_repeats + 1}"
                         " without a tool call; stopping"
                     )
+                    self._metric_stall_stopped = True
                     steps.append(
                         self._record_step(
                             engine,
@@ -1514,6 +1610,7 @@ class Agent:
                 )
             tool_results = self._reject_fuzzy_edits(tool_results)
             tool_results = self._fallback_failed_edits(tool_results)
+            self._note_tool_result_metrics(tool_results)
             self._note_review_reads(engine, tool_results)
             self._note_read_files(tool_results)
             if any(result.success and result.tool_name == "read_file" for result in tool_results):
@@ -1880,6 +1977,8 @@ class Agent:
             agent_events.STOPPED,
             {"reason": stop_reason.value, "error": error},
         )
+        if metrics_enabled():
+            self._emit_run_metrics(result)
         return result
 
     def _record_step(
@@ -1917,6 +2016,21 @@ class Agent:
             by_name[name] = by_name.get(name, 0) + 1
         last_prompt = steps[-1].prompt if steps else ""
         epistemic = self._epistemic
+        available = {
+            schema.name
+            for schema in self._registry.schemas()
+            if schema.name not in self._disabled_tools
+        }
+        grammar_names = list(self._metric_last_grammar_names)
+        missing = []
+        if grammar_names:
+            from mango_agent.metrics import missing_core_tools
+
+            missing = missing_core_tools(grammar_names, available=available)
+        profile = resolve_tool_profile()
+        edit_attempts = self._metric_edit_attempts
+        edit_fail = self._metric_edit_fail
+        edit_rate = (edit_fail / edit_attempts) if edit_attempts else 0.0
         return LoopMetrics(
             iterations=len(steps),
             final_prompt_chars=len(last_prompt),
@@ -1928,7 +2042,123 @@ class Agent:
             verification_runs=self._verification_runs,
             verification_failures=self._failed_verifications,
             elapsed_seconds=round(time.monotonic() - self._run_started, 4) if self._run_started else 0.0,
+            edit_fail_count=edit_fail,
+            write_fail_count=self._metric_write_fail,
+            edit_attempts=edit_attempts,
+            write_attempts=self._metric_write_attempts,
+            edit_fail_rate=round(edit_rate, 4),
+            identical_tool_repeat_max=self._metric_identical_repeat_max,
+            stall_triggered=self._metric_stall_triggered,
+            stall_stopped=self._metric_stall_stopped,
+            grammar_tool_count=len(grammar_names),
+            grammar_missing_core_tools=missing,
+            grammar_filtered_tools=list(self._metric_filtered_tools),
+            ttft_ms=round(self._metric_ttft_ms, 3),
+            total_prefill_s=round(self._metric_prefill_s, 4),
+            total_decode_s=round(self._metric_decode_s, 4),
+            prompt_tokens=self._metric_prompt_tokens,
+            completion_tokens=self._metric_completion_tokens,
+            plan_gate_turns=self._metric_plan_gate_turns,
+            prompt_variant=prompt_variant(),
+            tool_filter_mode=tool_filter_mode(),
+            tool_profile=profile if tool_profile() == "auto" else tool_profile(),
+            reset_cache_used=self._metric_reset_cache,
         )
+
+    def _note_completion_metrics(
+        self,
+        completion: Any,
+        *,
+        tool_names: list[str],
+        reset_cache: bool,
+    ) -> None:
+        if tool_names:
+            self._metric_last_grammar_names = list(tool_names)
+            available = {
+                schema.name
+                for schema in self._registry.schemas()
+                if schema.name not in self._disabled_tools
+            }
+            # Track what the filter removed relative to the full enabled registry.
+            filtered = sorted(available - set(tool_names))
+            self._metric_filtered_tools = filtered
+        if reset_cache:
+            self._metric_reset_cache += 1
+        if self._plan_gate_phase() is not None:
+            self._metric_plan_gate_turns += 1
+        ttft = float(getattr(completion, "ttft_ms", 0.0) or 0.0)
+        if self._metric_ttft_ms <= 0 and ttft > 0:
+            self._metric_ttft_ms = ttft
+        self._metric_prefill_s += float(getattr(completion, "prefill_s", 0.0) or 0.0)
+        self._metric_decode_s += float(getattr(completion, "decode_s", 0.0) or 0.0)
+        self._metric_prompt_tokens += int(getattr(completion, "prompt_tokens", 0) or 0)
+        self._metric_completion_tokens += int(getattr(completion, "completion_tokens", 0) or 0)
+
+    def _note_tool_result_metrics(self, tool_results: list[ToolResult]) -> None:
+        for result in tool_results:
+            name = result.tool_name
+            if name == "edit_file":
+                self._metric_edit_attempts += 1
+                if not result.success:
+                    self._metric_edit_fail += 1
+            elif name == "write_file":
+                self._metric_write_attempts += 1
+                if not result.success:
+                    self._metric_write_fail += 1
+        if not tool_results:
+            return
+        signature = "|".join(
+            f"{r.tool_name}:{int(bool(r.success))}:{str(r.error or '')[:80]}" for r in tool_results
+        )
+        if signature and signature == self._metric_tool_signature:
+            self._metric_tool_signature_repeats += 1
+            self._metric_identical_repeat_max = max(
+                self._metric_identical_repeat_max, self._metric_tool_signature_repeats
+            )
+        else:
+            self._metric_tool_signature = signature
+            self._metric_tool_signature_repeats = 1
+            self._metric_identical_repeat_max = max(self._metric_identical_repeat_max, 1)
+
+    def _emit_run_metrics(self, result: AgentResult) -> None:
+        if not metrics_enabled():
+            return
+        available = {
+            schema.name
+            for schema in self._registry.schemas()
+            if schema.name not in self._disabled_tools
+        }
+        payload = build_run_metrics(
+            run_id=self._run_id,
+            stop_reason=result.stop_reason.value,
+            iterations=result.metrics.iterations,
+            tool_calls_by_name=result.metrics.tool_calls_by_name,
+            edit_fail_count=result.metrics.edit_fail_count,
+            write_fail_count=result.metrics.write_fail_count,
+            edit_attempts=result.metrics.edit_attempts,
+            write_attempts=result.metrics.write_attempts,
+            identical_tool_repeat_max=result.metrics.identical_tool_repeat_max,
+            stall_triggered=result.metrics.stall_triggered,
+            stall_stopped=result.metrics.stall_stopped,
+            grammar_tool_names=self._metric_last_grammar_names,
+            grammar_filtered_tools=self._metric_filtered_tools,
+            available_tools=available,
+            ttft_ms=result.metrics.ttft_ms,
+            total_prefill_s=result.metrics.total_prefill_s,
+            total_decode_s=result.metrics.total_decode_s,
+            prompt_tokens=result.metrics.prompt_tokens,
+            completion_tokens=result.metrics.completion_tokens,
+            plan_gate_turns=result.metrics.plan_gate_turns,
+            epistemic_calls=result.metrics.epistemic_calls,
+            reset_cache_used=result.metrics.reset_cache_used,
+            elapsed_seconds=result.metrics.elapsed_seconds,
+            final_prompt_chars=result.metrics.final_prompt_chars,
+            verification_runs=result.metrics.verification_runs,
+            verification_failures=result.metrics.verification_failures,
+        )
+        self._emit(agent_events.METRICS, payload.to_dict())
+        emit_stderr_json(payload)
+        persist_run_metrics(payload)
 
     def _verification_enabled(self) -> bool:
         if self._verification_root is None:
@@ -1953,8 +2183,24 @@ class Agent:
             # Nudging with the same feedback clearly did not work — say so plainly
             # and let the model pick any tool instead of the one we were pushing.
             self._prefer_read_file = False
+            self._metric_stall_triggered = True
             engine.set_verification_feedback(feedback("stalled"))
+        mode = stall_mode()
+        if mode == "off":
+            return False
+        if self._user_continue_stall:
+            self._user_continue_stall = False
+            self._stall_repeats = 0
+            return False
+        if mode == "soft":
+            return False
         return self._stall_repeats >= _STALL_LIMIT
+
+    def continue_after_stall(self) -> None:
+        """User kill-switch: clear stall counters and allow the run to proceed."""
+        self._user_continue_stall = True
+        self._clear_stall()
+        self._metric_stall_stopped = False
 
     def _clear_stall(self) -> None:
         self._stall_key = ""
@@ -1998,19 +2244,144 @@ class Agent:
             return max(int(configured), floor)
         return configured
 
-    def _action_grammar(self) -> str | None:
+    def _action_grammar(self, tool_names: list[str] | None = None) -> str | None:
         if not self._use_tool_grammar:
             return None
         if self._verification_enabled() and self._last_verification_ok is True:
             return None
-        return tool_call_gbnf(self._action_tool_names(), schemas=self._registry.schemas())
+        names = tool_names if tool_names is not None else self._action_tool_names()
+        if not names:
+            return None
+        return tool_call_gbnf(names, schemas=self._registry.schemas())
 
     def _action_tool_names(self) -> list[str]:
-        names = [
+        if tool_filter_mode() == "legacy":
+            names = self._action_tool_names_legacy()
+            self._last_preferred_tools = list(names[:3])
+            return names
+        return self._action_tool_names_complete()
+
+    def _enabled_registry_names(self) -> list[str]:
+        return [
             schema.name
             for schema in self._registry.schemas()
             if schema.name not in self._disabled_tools
         ]
+
+    def _profile_excluded_optional(self) -> frozenset[str]:
+        profile = resolve_tool_profile()
+        if profile == "tiny":
+            return OPTIONAL_TOOLS_TINY
+        return frozenset()
+
+    def _ensure_recovery_core(self, names: list[str]) -> list[str]:
+        """Grammar completeness: never drop recovery-core tools that exist in the registry."""
+        enabled = set(self._enabled_registry_names())
+        have = set(names)
+        for name in sorted(RECOVERY_CORE_TOOLS):
+            if name in enabled and name not in have:
+                names.append(name)
+                have.add(name)
+        return names
+
+    def _preferred_action_tools(self, names: list[str]) -> list[str]:
+        """Prompt steering only — order is non-semantic for GBNF."""
+        available = set(names)
+        preferred: list[str] = []
+
+        def _add(*candidates: str) -> None:
+            for name in candidates:
+                if name in available and name not in preferred:
+                    preferred.append(name)
+
+        phase = self._plan_gate_phase()
+        if phase == "declare":
+            _add("declare_apis", "ask_epistemic", "read_file", "search_code")
+        elif phase == "epistemic":
+            _add("ask_epistemic", "read_file", "search_code")
+        elif self._research_still_required():
+            _add("doc_lookup", "package_source_lookup", "web_research")
+        elif self._design_review_still_required():
+            _add("read_file")
+        elif self._inspect_before_edit() and not self._inspected_once:
+            if self._located_once:
+                _add("read_file", "search_code", "codebase_lookup")
+            else:
+                _add("search_code", "codebase_lookup", "read_file")
+        elif self._tests_still_required() and phase is None:
+            if self._prefer_read_file:
+                _add("read_file", "edit_file", "write_file", "run_tests")
+            elif self._prefer_write_file or not self._discover_test_files():
+                _add("write_file", "edit_file", "read_file", "run_tests")
+            else:
+                _add("edit_file", "read_file", "write_file", "run_tests")
+        elif self._prefer_write_file:
+            _add("write_file", "edit_file", "read_file")
+        elif self._prefer_read_file:
+            _add("read_file", "edit_file", "write_file")
+        elif self._rename_pair:
+            _add("rename_symbol", "search_code", "read_file")
+        elif (
+            self._plan_apis_enabled()
+            and self._epistemic_once
+            and not self._acted_once
+        ):
+            _add("write_file", "edit_file", "read_file")
+        elif self._lock_coarsened and self._review_done:
+            _add("edit_file", "read_file", "write_file")
+        elif self._last_verification_ok is False:
+            _add("read_file", "edit_file", "write_file", "run_tests")
+        return preferred[:5]
+
+    def _apply_preferred_tool_feedback(self, engine: ContextEngine) -> None:
+        if tool_filter_mode() != "complete":
+            return
+        preferred = list(self._last_preferred_tools or [])
+        if not preferred:
+            return
+        line = "Preferred next tools: " + ", ".join(preferred[:3])
+        existing = ""
+        try:
+            existing = str(getattr(engine.state, "verification_feedback", "") or "").strip()
+        except Exception:
+            existing = ""
+        if "Preferred next tools:" in existing:
+            # Refresh the trailing preferred line without wiping other feedback.
+            head = existing.rsplit("Preferred next tools:", 1)[0].rstrip()
+            existing = head
+        combined = f"{existing}\n{line}".strip() if existing else line
+        engine.set_verification_feedback(combined)
+
+    def _action_tool_names_complete(self) -> list[str]:
+        """GBNF completeness mode: recovery-core always present; preference via prompt only."""
+        names = self._enabled_registry_names()
+        excluded = self._profile_excluded_optional()
+        if excluded:
+            names = [name for name in names if name not in excluded or name in RECOVERY_CORE_TOOLS]
+        names = self._ensure_recovery_core(names)
+        # Safety: after experiment exhaustion, block further mutations even in complete mode.
+        if self._experiment_exhausted:
+            names = [name for name in names if name not in _CODE_MUTATING_TOOLS]
+            names = self._ensure_recovery_core(names)
+            names = [name for name in names if name not in _CODE_MUTATING_TOOLS]
+            if not names:
+                names = [
+                    name
+                    for name in ("read_file", "run_tests", "measure")
+                    if self._registry.has(name) and name not in self._disabled_tools
+                ]
+        preferred = self._preferred_action_tools(names)
+        self._last_preferred_tools = preferred
+        # Prefer-order is for prompt readability only; llama.cpp does not weight GBNF alts.
+        if preferred:
+            head = [name for name in preferred if name in names]
+            tail = [name for name in names if name not in head]
+            return head + tail
+        return names
+
+    def _action_tool_names_legacy(self) -> list[str]:
+        """Pre-A0b stripping behavior (rollback via MANGO_TOOL_FILTER_MODE=legacy)."""
+        names = self._enabled_registry_names()
         if self._last_verification_ok is False:
             names = [name for name in names if name in _CODE_MUTATING_TOOLS or name == "run_tests"]
         if self._research_still_required():
@@ -2086,11 +2457,7 @@ class Agent:
             if inspect_names:
                 names = inspect_names
         if not names:
-            names = [
-                schema.name
-                for schema in self._registry.schemas()
-                if schema.name not in self._disabled_tools
-            ]
+            names = self._enabled_registry_names()
         if not names:
             names = [schema.name for schema in self._registry.schemas()]
         if self._experiment_exhausted:
@@ -2138,9 +2505,35 @@ class Agent:
             ):
                 if path and result.tool_name == "edit_file":
                     key = self._abs_impl_path(str(path))
-                    self._edit_fail_counts[key] = self._edit_fail_counts.get(key, 0) + 1
-                    if self._edit_fail_counts[key] >= 2:
+                    args_hash = hashlib.sha1(
+                        json.dumps(
+                            {
+                                "old": arguments.get("old_string"),
+                                "new": arguments.get("new_string"),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
+                    signature = f"{key}:{args_hash}"
+                    self._edit_fail_counts[signature] = self._edit_fail_counts.get(signature, 0) + 1
+                    fails = self._edit_fail_counts[signature]
+                    if fails >= 2:
+                        self._prefer_read_file = True
                         self._prefer_write_file = True
+                        lines.append(
+                            "edit_file failed twice with the same args. "
+                            "Preferred next tools: read_file, write_file."
+                        )
+                    if fails >= 3:
+                        self._metric_stall_triggered = True
+                        engine.set_verification_feedback(
+                            feedback("stalled")
+                            if hasattr(feedback, "__call__")
+                            else "Repeated identical edit_file failures — stalled. "
+                            "Call read_file or write_file, or wait for user Continue."
+                        )
+                        self._stall_repeats = max(self._stall_repeats, _STALL_ESCALATE)
                 locate = self._locate_failed_edit(arguments, err, path)
                 extra_snippets.extend(locate)
         if markup_truncated:
@@ -2214,7 +2607,12 @@ class Agent:
             if not path and call is not None and isinstance(call.arguments, dict):
                 path = str(call.arguments.get("path") or "")
             if path:
-                self._files_read.add(self._abs_impl_path(path))
+                abs_path = self._abs_impl_path(path)
+                self._files_read.add(abs_path)
+                # Relative follow-up calls should resolve next to the file the
+                # model just read — that is its de-facto working directory when
+                # no workspace was declared.
+                self._last_read_dir = str(Path(abs_path).parent)
 
     def _note_impl_mutations(self, tool_results: list[ToolResult]) -> None:
         for result in tool_results:
@@ -2268,7 +2666,7 @@ class Agent:
             blocked = [call for call in tool_calls if call.name not in allowed_names]
             results: list[ToolResult] = []
             if allowed:
-                results.extend(run_tool_calls(allowed, self._registry, context=tool_ctx))
+                results.extend(self._run_tools_with_checkpoints(allowed, tool_ctx))
             if blocked:
                 self._trace(
                     f"iter {self._current_iteration} blocked before {phase}="
@@ -2289,7 +2687,7 @@ class Agent:
             blocked = [call for call in tool_calls if call.name in _CODE_MUTATING_TOOLS]
             results: list[ToolResult] = []
             if allowed:
-                results.extend(run_tool_calls(allowed, self._registry, context=tool_ctx))
+                results.extend(self._run_tools_with_checkpoints(allowed, tool_ctx))
             if blocked:
                 err = feedback("experiment.exhausted")
                 results.extend(
@@ -2308,7 +2706,7 @@ class Agent:
             blocked = [call for call in tool_calls if call.name in _CODE_MUTATING_TOOLS]
             results: list[ToolResult] = []
             if allowed:
-                results.extend(run_tool_calls(allowed, self._registry, context=tool_ctx))
+                results.extend(self._run_tools_with_checkpoints(allowed, tool_ctx))
             if blocked:
                 self._trace(
                     f"iter {self._current_iteration} blocked premature edit="
@@ -2349,8 +2747,47 @@ class Agent:
             return grounded_blocked
         results = list(grounded_blocked)
         if grounded_allowed:
-            results.extend(run_tool_calls(grounded_allowed, self._registry, context=tool_ctx))
+            results.extend(self._run_tools_with_checkpoints(grounded_allowed, tool_ctx))
         return results
+
+    def _run_tools_with_checkpoints(
+        self,
+        tool_calls: list[ToolCall],
+        tool_ctx: dict[str, Any],
+    ) -> list[ToolResult]:
+        self._maybe_checkpoint_mutations(tool_calls)
+        return run_tool_calls(tool_calls, self._registry, context=tool_ctx)
+
+    def _maybe_checkpoint_mutations(self, tool_calls: list[ToolCall]) -> None:
+        paths: list[str] = []
+        for call in tool_calls:
+            if call.name not in _CHECKPOINT_MUTATING_TOOLS:
+                continue
+            args = call.arguments if isinstance(call.arguments, dict) else {}
+            paths.extend(paths_for_tool_call(call.name, args))
+        if not paths:
+            return
+        info = snapshot_paths(
+            paths,
+            session_id=self._run_id or "default",
+            workspace=self._checkpoint_workspace,
+        )
+        if info is not None:
+            self._last_checkpoint_id = info.checkpoint_id
+            self._emit(
+                agent_events.CHECKPOINT,
+                {
+                    "phase": "snapshot",
+                    "checkpoint_id": info.checkpoint_id,
+                    "paths": list(info.paths),
+                },
+            )
+
+    def undo_last_mutation(self) -> dict[str, Any]:
+        """Restore the most recent mutate/delete checkpoint for this run."""
+        return restore_last_mutation(
+            session_id=self._run_id or "default", workspace=self._checkpoint_workspace
+        )
 
     def _inspect_result_is_useful(self, result: ToolResult) -> bool:
         if not result.success:
@@ -3643,6 +4080,13 @@ class Agent:
         ctx: dict[str, Any] = {}
         if root is not None:
             ctx["workspace"] = str(root)
+        elif self._declared_workspace is not None:
+            ctx["workspace"] = str(self._declared_workspace)
+            ctx["enforce_jail"] = True
+        else:
+            last_read_dir = getattr(self, "_last_read_dir", "")
+            if last_read_dir:
+                ctx["last_read_dir"] = last_read_dir
         impl = self._plan_coverage_libraries()
         if impl:
             ctx["declared_libraries"] = impl

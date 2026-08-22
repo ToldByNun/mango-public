@@ -37,6 +37,8 @@ type Store = {
   selectModel: (path: string) => Promise<void>;
   send: (goal: string, attachments: string[], thinkingLevel?: string) => Promise<boolean>;
   cancel: () => Promise<void>;
+  continueStall: () => Promise<void>;
+  undoLastMutation: () => Promise<void>;
 };
 
 const Ctx = createContext<Store | null>(null);
@@ -355,6 +357,24 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
     }
   }, [activeId]);
 
+  const continueStall = useCallback(async () => {
+    if (!activeId) return;
+    try {
+      await api().agent.continueStall(activeId);
+    } catch (err) {
+      setSidecarError(err instanceof Error ? err.message : String(err));
+    }
+  }, [activeId]);
+
+  const undoLastMutation = useCallback(async () => {
+    if (!activeId) return;
+    try {
+      await api().agent.undoLastMutation(activeId);
+    } catch (err) {
+      setSidecarError(err instanceof Error ? err.message : String(err));
+    }
+  }, [activeId]);
+
   const selectModel = useCallback(async (path: string) => {
     if (!path || path === modelPath) return;
     setModelSwitching(true);
@@ -454,6 +474,8 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
     selectModel,
     send,
     cancel,
+    continueStall,
+    undoLastMutation,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

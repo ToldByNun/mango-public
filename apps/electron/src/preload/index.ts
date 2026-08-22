@@ -46,6 +46,10 @@ contextBridge.exposeInMainWorld("mango", {
       }),
     cancel: (sessionId: string): Promise<Record<string, unknown>> =>
       ipcRenderer.invoke("agent:cancel", sessionId),
+    continueStall: (sessionId: string): Promise<Record<string, unknown>> =>
+      ipcRenderer.invoke("agent:continueStall", sessionId),
+    undoLastMutation: (sessionId: string): Promise<Record<string, unknown>> =>
+      ipcRenderer.invoke("agent:undoLastMutation", sessionId),
     onEvent: (handler: (event: AgentEvent) => void): (() => void) => {
       const listener = (_event: unknown, payload: AgentEvent): void => handler(payload);
       ipcRenderer.on("agent:event", listener);

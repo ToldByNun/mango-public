@@ -12,6 +12,7 @@ from mango_agent.prompt import (
     parse_feedback_sections,
     render_system_prompt,
 )
+from mango_agent.prompt import _prompt_variant_name
 from mango_cot.prompt import render_system_prompt as render_cot_prompt
 
 
@@ -41,9 +42,12 @@ def test_thinking_level_suffixes_compose() -> None:
     think = compose_agent_system_prompt("think")
     deep = compose_agent_system_prompt("deep")
     maxed = compose_agent_system_prompt("max")
-    assert off == DEFAULT_SYSTEM_PROMPT
+    # Default variant is v2 (MANGO_PROMPT_VARIANT), so compose() returns agent_v2
+    # while DEFAULT_SYSTEM_PROMPT pins the v1 file. Compare against the same
+    # variant-aware source instead.
+    assert off == load_system_prompt(_prompt_variant_name())
     assert "Thinking level: think" in think
-    assert think.startswith(DEFAULT_SYSTEM_PROMPT)
+    assert think.startswith(off)
     assert "Thinking level: deep" in deep
     assert "inspect" in deep.lower()
     assert "Thinking level: max" in maxed

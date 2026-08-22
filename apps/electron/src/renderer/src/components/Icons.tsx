@@ -74,6 +74,26 @@ export function IconStop({ size = 10 }: IconProps): JSX.Element {
   );
 }
 
+export function IconUndo({ size = 16 }: IconProps): JSX.Element {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+    >
+      <path
+        d="M6.5 3.5L3 7l3.5 3.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M3 7h6a4 4 0 010 8H6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export function IconChevron({ open, size = 12 }: { open: boolean; size?: number }): JSX.Element {
   return (
     <svg
