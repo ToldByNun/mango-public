@@ -113,3 +113,75 @@ def test_parse_informal_write_file_pipe() -> None:
 def test_parse_invalid_json_skipped() -> None:
     text = '<tool_call=read_file : {not json}>'
     assert parse_tool_calls(text) == []
+
+
+def test_parse_function_tag_anthropic_style() -> None:
+    text = (
+        "<tool_call>\n"
+        "<function=Read>\n"
+        "<parameter=file_path>\n"
+        "sales_jan.csv\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "read_file"
+    assert calls[0].arguments["file_path"] == "sales_jan.csv"
+
+
+def test_parse_function_tag_bash_alias() -> None:
+    text = "<function=Bash>\n<parameter=command>dir</parameter>\n</function>"
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "run_terminal_command"
+    assert calls[0].arguments["command"] == "dir"
+
+
+def test_parse_function_tag_unknown_name_ignored() -> None:
+    text = "<function=WebSearch>\n<parameter=query>x</parameter>\n</function>"
+    assert parse_tool_calls(text) == []
+
+
+def test_parse_function_tag_multiple_parameters() -> None:
+    text = (
+        "<function=Edit>\n"
+        "<parameter=file_path>\ncart.py\n</parameter>\n"
+        "<parameter=old_string>\nint(s)\n</parameter>\n"
+        "<parameter=new_string>\ns\n</parameter>\n"
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "edit_file"
+    assert calls[0].arguments["file_path"] == "cart.py"
+    assert calls[0].arguments["old_string"] == "int(s)"
+    assert calls[0].arguments["new_string"] == "s"
+
+
+def test_parse_canonical_still_wins_over_function_tags() -> None:
+    text = (
+        '<tool_call=read_file : {"path": "main.py"}>\n'
+        "<function=Read><parameter=file_path>junk.txt</parameter></function>"
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "read_file"
+    assert calls[0].arguments["path"] == "main.py"
+
+
+def test_parse_json_name_format() -> None:
+    text = '{"name": "read_file", "arguments": {"path": "inventory.py"}}'
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "read_file"
+    assert calls[0].arguments["path"] == "inventory.py"
+
+
+def test_parse_loose_tool_prefix() -> None:
+    text = 'write_file : {"path": "inventory.py", "content": "print(1)"}'
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "write_file"
+    assert calls[0].arguments["path"] == "inventory.py"

@@ -46,6 +46,12 @@ class ContextEngine:
     def set_reasoning_summary(self, summary: str) -> None:
         self._state.reasoning_summary = summary.strip()
 
+    def set_work_plan(self, plan: str) -> None:
+        self._state.work_plan = plan.strip()
+
+    def set_impl_status(self, status: str) -> None:
+        self._state.impl_status = status.strip()
+
     def set_verification_feedback(self, report: str) -> None:
         self._state.verification_feedback = report.strip()
 
@@ -170,9 +176,14 @@ class ContextEngine:
                 return json.dumps(
                     {
                         k: output[k]
-                        for k in ("path", "symbol", "kind", "replacements", "bytes_written", "syntax_error")
+                        for k in ("path", "symbol", "kind", "replacements", "line_count", "syntax_error")
                         if k in output
                     },
+                    ensure_ascii=False,
+                )
+            if "path" in output and "line_count" in output:
+                return json.dumps(
+                    {k: output[k] for k in ("path", "line_count", "syntax_error") if k in output},
                     ensure_ascii=False,
                 )
             if "exists" in output and "evidence" in output:
@@ -195,7 +206,13 @@ def _as_tool_spec(item: ToolSpec | tuple[str, str]) -> ToolSpec:
 def _compact_terminal(output: dict[str, Any]) -> str:
     stdout = str(output.get("stdout") or "")
     stderr = str(output.get("stderr") or "")
-    parts = [f"exit_code: {output.get('exit_code')}"]
+    exit_code = output.get("exit_code")
+    parts: list[str] = []
+    # A non-zero exit is a failure even though the tool call itself succeeded;
+    # without the marker small models treat the command as verified.
+    if isinstance(exit_code, int) and exit_code != 0:
+        parts.append(f"COMMAND FAILED (exit_code={exit_code})")
+    parts.append(f"exit_code: {exit_code}")
     tail = _tail_clip(stdout, 12)
     if tail:
         parts.append(tail)

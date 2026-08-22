@@ -21,6 +21,7 @@ export type MangoBridge = {
     load: () => Promise<Record<string, unknown>>;
     settings: () => Promise<Record<string, unknown>>;
     setModelPath: (path: string) => Promise<Record<string, unknown>>;
+    updateSettings: (settings: Record<string, unknown>) => Promise<Record<string, unknown>>;
     selectModel: (path: string) => Promise<Record<string, unknown>>;
   };
   models: {

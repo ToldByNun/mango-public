@@ -15,6 +15,17 @@ _XML_TAG = re.compile(
     re.IGNORECASE,
 )
 
+# Anthropic-style XML some quantized models emit instead of the canonical form:
+#   <tool_call>\n<function=Read>\n<parameter=file_path>\nsales_jan.csv\n</parameter>
+_FUNCTION_TAG = re.compile(
+    r"<\s*function\s*=\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*>",
+    re.IGNORECASE,
+)
+_PARAMETER_TAG = re.compile(
+    r"<\s*parameter\s*=\s*([A-Za-z_][A-Za-z0-9_-]*)\s*>([\s\S]*?)<\s*/\s*parameter\s*>",
+    re.IGNORECASE,
+)
+
 # Models often invent `<write_file | {...}>` instead of `<tool_call=write_file : {...}>`.
 _TOOL_NAMES = (
     "write_file|edit_file|read_file|edit_symbol|rename_symbol|search_code|"
@@ -24,10 +35,183 @@ _INFORMAL_TAG = re.compile(
     rf"<\s*({_TOOL_NAMES})\s*[|:]\s*",
     re.IGNORECASE,
 )
+# OpenAI-style: {"name": "read_file", "arguments": {"path": "foo.py"}}
+_JSON_NAME_CALL = re.compile(
+    r'\{\s*"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"arguments"\s*:',
+    re.IGNORECASE,
+)
+# Missing <tool_call= prefix: write_file : {"path": "x.py"}
+_LOOSE_TOOL_PREFIX = re.compile(
+    rf"(?<![A-Za-z0-9_])({_TOOL_NAMES})\s*:\s*\{{",
+    re.IGNORECASE,
+)
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
     """Extract embedded tool calls from model output."""
+    calls = _parse_embedded_calls(text)
+    if calls:
+        return calls
+    calls = _parse_loose_prefix_calls(text)
+    if calls:
+        return calls
+    calls = _parse_json_name_calls(text)
+    if calls:
+        return calls
+    # Quantized models sometimes fall back to Anthropic-style XML
+    return _parse_function_tag_calls(text)
+
+
+def _parse_function_tag_calls(text: str) -> list[ToolCall]:
+    calls: list[ToolCall] = []
+    seen: set[tuple[int, str]] = set()
+    for match in _FUNCTION_TAG.finditer(text):
+        raw_name = match.group(1)
+        # Accept Read/read_file etc.; map to snake_case registry names.
+        name = _normalize_function_name(raw_name)
+        if not name:
+            continue
+        window_end = text.find("</function>", match.end())
+        window_end = len(text) if window_end == -1 else min(window_end + 11, len(text))
+        window = text[match.end() : window_end]
+        arguments: dict[str, Any] = {}
+        for param in _PARAMETER_TAG.finditer(window):
+            key = param.group(1)
+            value = param.group(2)
+            # Strip exactly one leading/trailing newline the template adds.
+            value = re.sub(r"^\r?\n", "", value)
+            value = re.sub(r"\r?\n\s*$", "", value)
+            arguments[key] = value
+        if not arguments:
+            continue
+        key_pair = (match.start(), name)
+        if key_pair in seen:
+            continue
+        seen.add(key_pair)
+        end = window_end if "</function>" in window else match.end()
+        calls.append(
+            ToolCall(
+                name=name,
+                arguments=arguments,
+                raw=text[match.start() : end],
+                start=match.start(),
+                end=end,
+            )
+        )
+    calls.sort(key=lambda item: item.start)
+    return calls
+
+
+def _normalize_function_name(raw_name: str) -> str | None:
+    known = {
+        "read_file", "write_file", "edit_file", "edit_symbol", "rename_symbol",
+        "search_code", "codebase_lookup", "ask_epistemic", "declare_apis",
+        "run_terminal_command", "measure", "run_tests", "list_dir",
+        "glob_files", "delete_file",
+    }
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", raw_name).replace("-", "_").lower()
+    for candidate in (raw_name.replace("-", "_").lower(), snake):
+        if candidate in known:
+            return candidate
+    # Anthropic-style tool names some models fall back to.
+    aliases = {
+        "read": "read_file",
+        "write": "write_file",
+        "edit": "edit_file",
+        "bash": "run_terminal_command",
+        "glob": "glob_files",
+        "grep": "search_code",
+        "ls": "list_dir",
+    }
+    mapped = aliases.get(snake) or aliases.get(raw_name.replace("-", "_").lower())
+    if mapped in known:
+        return mapped
+    return None
+
+
+def _parse_loose_prefix_calls(text: str) -> list[ToolCall]:
+    """Recover `write_file : {"path": ...}` without a <tool_call= wrapper."""
+    calls: list[ToolCall] = []
+    seen: set[tuple[int, str]] = set()
+    for match in _LOOSE_TOOL_PREFIX.finditer(text):
+        name = match.group(1).replace("-", "_").lower()
+        json_start = match.end() - 1
+        json_text, json_end = _extract_json_object(text, json_start)
+        if json_text is None:
+            continue
+        arguments = _parse_arguments_json(json_text)
+        if arguments is None:
+            continue
+        if name == "write_file":
+            fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
+            if fenced is not None and fence_complete:
+                arguments["content"] = fenced
+                json_end = fence_end
+            elif fenced is not None and not fence_complete:
+                continue
+        if name == "write_file" and not str(arguments.get("content") or ""):
+            continue
+        key = (match.start(), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        end = _find_closing_bracket(text, json_end)
+        calls.append(
+            ToolCall(
+                name=name,
+                arguments=arguments,
+                raw=text[match.start() : end],
+                start=match.start(),
+                end=end,
+            )
+        )
+    calls.sort(key=lambda item: item.start)
+    return calls
+
+
+def _parse_json_name_calls(text: str) -> list[ToolCall]:
+    """Recover {"name": "read_file", "arguments": {...}} blobs."""
+    calls: list[ToolCall] = []
+    seen: set[tuple[int, str]] = set()
+    for match in _JSON_NAME_CALL.finditer(text):
+        raw_name = match.group(1).replace("-", "_").lower()
+        name = _normalize_function_name(raw_name) or raw_name
+        json_start = match.start()
+        json_text, json_end = _extract_json_object(text, json_start)
+        if json_text is None:
+            continue
+        parsed = _parse_arguments_json(json_text)
+        if parsed is None:
+            continue
+        arguments = parsed.get("arguments") if isinstance(parsed.get("arguments"), dict) else parsed
+        if not isinstance(arguments, dict):
+            continue
+        if name == "edit_file" and "content" in arguments and "old_string" not in arguments:
+            name = "write_file"
+            arguments = {"path": arguments.get("path", ""), "content": arguments.get("content", "")}
+        if name == "write_file" and not str(arguments.get("content") or ""):
+            fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
+            if fenced is not None and fence_complete:
+                arguments["content"] = fenced
+                json_end = fence_end
+        key = (match.start(), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        calls.append(
+            ToolCall(
+                name=name,
+                arguments=arguments,
+                raw=text[match.start() : json_end],
+                start=match.start(),
+                end=json_end,
+            )
+        )
+    calls.sort(key=lambda item: item.start)
+    return calls
+
+
+def _parse_embedded_calls(text: str) -> list[ToolCall]:
     calls: list[ToolCall] = []
     seen: set[tuple[int, str]] = set()
     for pattern in (_OPEN_TAG, _XML_TAG, _INFORMAL_TAG):

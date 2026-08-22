@@ -123,6 +123,12 @@ Happy-path tests passed, but the implementation uses threads/locks/async. You MU
 # _handle_run_tests_results.no_tests
 No test_*.py files found. Write tests covering the new behavior (including ThreadPoolExecutor stress tests if the code is concurrent). The runner executes them automatically after the next write.
 
+# tests_before_run
+BLOCKED by the runner. No test_*.py file exists in the workspace yet, so run_tests has nothing to collect. FIRST tool MUST be write_file with a test_*.py file (complete file, one TestCase is enough), then the runner executes it automatically.
+
+# no_tests_collected
+pytest exited 5 for {{targets}}: the file(s) exist but contain NO tests (empty, wrong names, or reverted). Running them again can never pass. NEXT tool MUST be write_file rewriting the test file with real test functions (def test_* methods in a TestCase class), or write the implementation the tests import.
+
 # _handle_run_tests_results.failed_persistent
 Tests still {{hint}} after {{attempts}}+ tries. Do NOT finish. NEXT tool MUST edit the implementation (or tests if the assertion is wrong). The runner keeps re-testing until pytest passes or the iteration limit is hit.{{detail}}
 
@@ -148,6 +154,27 @@ Installed {{pkgs}} ({{command}}). Do NOT thrash other files. NEXT tool MUST be r
 Pytest passed but running {{script}} crashed at runtime (the runner executes `python script.py` after tests):
 {{detail}}
 Fix the runtime path — often edge cases in main()/render loops that unit tests never hit. Add a test for the failing case if possible.
+
+# runtime_no_entry
+Goal needs a runnable console/CLI script but no `if __name__ == '__main__'` entry was found. NEXT: write_file or edit_file to add main(), argparse subcommands, and wire parse_args(). read_file the current file first — do not claim done while functions are stubs.
+
+# blocked_shell_read
+BLOCKED: do not use `type`/`cat`/`Get-Content` to read source files. NEXT tool MUST be read_file path="{{path}}" — it returns the FULL file. Judge completeness from ## Implementation status (functions, main, subcommands), never from byte size.
+
+# impl_incomplete
+Implementation is NOT finished — the runner will reject finish until these are fixed:
+{{gaps}}
+NEXT: read_file the file, then edit_file / write_file the COMPLETE module (all handlers + main block). Do not summarize or stop while stub functions or `#` placeholders remain.
+
+# goal_deliverables_missing
+Goal requires these files on disk but they do not exist yet: {{files}}
+NEXT: write_file each missing path with complete content (not a stub). For reports (.txt/.csv), write the computed result. For test_*.py goals, include real def test_* functions, then run_tests.
+
+# file_missing_write
+BLOCKED: `{{path}}` does not exist yet — read_file/edit_file cannot open it. NEXT tool MUST be write_file path="{{path}}" with the COMPLETE new content. Do not call read_file on this path again.
+
+# file_missing_read_input
+BLOCKED: `{{path}}` does not exist yet. Read existing inputs first: NEXT tool MUST be read_file path="{{next_path}}". After all inputs are read, write_file the missing output.
 
 # _note_repo_impact
 Repo map (read these before further edits):

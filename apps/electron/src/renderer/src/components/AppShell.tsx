@@ -3,7 +3,7 @@ import styles from "../styles/shell.module.css";
 import { Composer } from "./Composer";
 import { DiffModal } from "./DiffModal";
 import { IconPlus } from "./Icons";
-import { SettingsModal } from "./SettingsModal";
+import { SettingsPage } from "./SettingsPage";
 import { Sidebar } from "./Sidebar";
 import { Transcript } from "./Transcript";
 
@@ -38,7 +38,7 @@ export function AppShell(): JSX.Element {
       {store.diff ? (
         <DiffModal path={store.diff.path} diff={store.diff.diff} onClose={() => store.setDiff(null)} />
       ) : null}
-      {store.settingsOpen ? <SettingsModal onClose={() => store.setSettingsOpen(false)} /> : null}
+      {store.settingsOpen ? <SettingsPage onClose={() => store.setSettingsOpen(false)} /> : null}
     </div>
   );
 }

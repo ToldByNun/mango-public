@@ -25,6 +25,26 @@ def test_duplicate_registration_raises() -> None:
         registry.register("x", lambda: None)
 
 
+def test_argument_aliases_applied_on_execution(tmp_path) -> None:
+    from mango_tools.tool_executor import run_tool_call
+    from mango_tools.types import ToolCall
+
+    target = tmp_path / "note.txt"
+    target.write_text("hello", encoding="utf-8")
+
+    registry = create_default_registry(enable_delete=True)
+    call = ToolCall(
+        name="read_file",
+        arguments={"file_path": str(target)},  # Anthropic-style name, not "path"
+        raw="",
+        start=0,
+        end=0,
+    )
+    result = run_tool_call(call, registry, context={})
+    assert result.success, result.error
+    assert result.output["content"] == "hello"
+
+
 def test_builtin_tools_registered() -> None:
     registry = create_default_registry(enable_delete=True)
     names = registry.list_tools()

@@ -1,0 +1,163 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.panel {
+  width: min(560px, 94vw);
+  max-height: 90vh;
+  background: var(--panel, #1a1a1a);
+  border: 1px solid var(--border, #333);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #333);
+}
+
+.header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.close {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 22px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #333);
+}
+
+.tab,
+.tabActive {
+  flex: 1;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+
+.tabActive {
+  background: var(--accent-dim, rgba(255, 120, 40, 0.2));
+  color: var(--accent, #ff7828);
+}
+
+.body {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.section label,
+.configPath {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #999);
+}
+
+.section input,
+.section select,
+.configPath input {
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #444);
+  background: var(--input-bg, #111);
+  color: inherit;
+}
+
+.hint {
+  font-size: 13px;
+  margin: 0;
+  color: var(--muted, #aaa);
+}
+
+.presets {
+  display: flex;
+  gap: 8px;
+}
+
+.presets button {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #444);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.error {
+  color: var(--danger, #f44);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border, #333);
+}
+
+.ghost,
+.primary {
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+}
+
+.ghost {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border, #444);
+}
+
+.primary {
+  background: var(--accent, #ff7828);
+  color: #111;
+}
+
+.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

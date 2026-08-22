@@ -57,6 +57,33 @@ def test_empty_model_path_raises(tmp_path: Path) -> None:
         load_config(config_file)
 
 
+def test_save_config_round_trip(tmp_path: Path) -> None:
+    from mango_runtime.config import load_config_file, save_config
+    from mango_runtime.types import HardwareConfig, InferenceConfig, ModelConfig, RuntimeConfig
+
+    config_path = tmp_path / "runtime" / "config.yaml"
+    original = RuntimeConfig(
+        model=ModelConfig(path=str(tmp_path / "model.gguf"), n_ctx=8192, n_batch=256),
+        hardware=HardwareConfig(n_gpu_layers=-1, n_threads=8),
+        inference=InferenceConfig(max_tokens=512, temperature=0.2, top_p=0.9),
+    )
+    save_config(config_path, original)
+    loaded = load_config_file(config_path, require_model=False)
+    assert loaded.model.path == original.model.path
+    assert loaded.model.n_ctx == 8192
+    assert loaded.hardware.n_gpu_layers == -1
+    assert loaded.inference.temperature == 0.2
+
+
+def test_load_config_file_allows_empty_model_path(tmp_path: Path) -> None:
+    from mango_runtime.config import load_config_file
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"model": {"path": ""}}), encoding="utf-8")
+    config = load_config_file(config_file, require_model=False)
+    assert config.model.path == ""
+
+
 def test_gguf_loader_rejects_missing_file(tmp_path: Path) -> None:
     from mango_runtime.types import ModelConfig, RuntimeConfig
 

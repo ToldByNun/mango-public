@@ -64,6 +64,12 @@ class Orchestrator:
     def run(self, task: str) -> AgentResult:
         return self.agent.run(task)
 
+    def close(self) -> None:
+        """Release codeintel sqlite handle etc. so temp workspaces can be deleted."""
+        close = getattr(self.agent, "close", None)
+        if callable(close):
+            close()
+
 
 def create_orchestrator(
     workspace: str | Path,

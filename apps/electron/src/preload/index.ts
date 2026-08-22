@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld("mango", {
     settings: (): Promise<Record<string, unknown>> => ipcRenderer.invoke("sidecar:settings"),
     setModelPath: (path: string): Promise<Record<string, unknown>> =>
       ipcRenderer.invoke("sidecar:set-model-path", path),
+    updateSettings: (settings: Record<string, unknown>): Promise<Record<string, unknown>> =>
+      ipcRenderer.invoke("sidecar:update-settings", settings),
     selectModel: (path: string): Promise<Record<string, unknown>> =>
       ipcRenderer.invoke("sidecar:select-model", path),
   },

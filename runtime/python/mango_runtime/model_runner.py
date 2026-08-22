@@ -5,13 +5,21 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from llama_cpp import Llama
 
 from mango_runtime.config import load_config
-from mango_runtime.cuda_env import ensure_cuda_on_path, has_cuda_backend, list_ggml_backends
+from mango_runtime.gpu_env import (
+    apply_backend_env,
+    detect_gpu_backend,
+    gpu_install_hint,
+    has_gpu_backend,
+    list_ggml_backends,
+    prepare_gpu_environment,
+)
 from mango_runtime.gguf_loader import GGUFLoader
 from mango_runtime.types import CompletionResult, InferenceConfig, RuntimeConfig
 
@@ -73,6 +81,63 @@ _GEMMA4_STOPS = ("<turn|>", "<|turn>user", "<|turn>system", "<eos>")
 # If the backend produces no token for this long mid-generation, the CUDA context
 # or the pipe is wedged; aborting beats hanging the whole GUI forever.
 TOKEN_GAP_TIMEOUT_S = 180.0
+
+
+def _thought_looks_like_code_dump(text: str) -> bool:
+    sample = text[-1200:] if len(text) > 1200 else text
+    if "```" in sample:
+        return True
+    lower = sample.lower()
+    if "<write_file" in lower or "<tool_call" in lower:
+        return True
+    if "</invoke>" in lower or "</function>" in lower:
+        return True
+    if "<!doctype" in lower or "<html" in lower:
+        return True
+    if "function(" in sample or "const canvas" in sample or "addEventListener" in sample:
+        return True
+    if sample.count("\n") >= 8 and (
+        "def " in sample or "class " in sample or "import " in sample
+    ):
+        return True
+    return False
+
+
+def thought_should_stop(partial: str, *, force_grammar: bool) -> bool:
+    """Decide whether the free-text thought phase should end early.
+
+    When a tool call is mandatory this cuts the phase as soon as a call is
+    parseable, the model dumps code/HTML into chat (burning budget without
+    reaching the constrained tail), or its <think>…</think> block closed —
+    after </think> Mango-1 only rambles; the grammar tail must take over.
+    """
+    if not force_grammar:
+        return False
+    try:
+        from mango_tools.tool_parser import parse_tool_calls
+
+        if parse_tool_calls(partial):
+            return True
+    except Exception:
+        pass
+    low = partial.lower()
+    if "</invoke>" in low or "</function>" in low:
+        return True
+    # Informal write started but never closed — don't burn the whole thought budget.
+    if "<write_file" in low and len(partial) > 2500:
+        return True
+    if len(partial) < 80:
+        return False
+    # Still emitting an informal/canonical call — wait for JSON to finish.
+    if "<write_file" in low or "<tool_call" in low:
+        return False
+    # Mango-1 wraps reasoning in <think>…</think>. Once closed, reasoning
+    # is over: cut here so the constrained tail appends the tool call
+    # instead of letting the model ramble on in chat, which reads as
+    # "no tool call" and starves the loop (gauntlet G4/G5).
+    if "</think>" in low:
+        return True
+    return _thought_looks_like_code_dump(partial)
 
 
 def split_completion_budget(
@@ -158,28 +223,30 @@ class ModelRunner:
     def load(self) -> None:
         if self._llama is not None:
             return
-        ensure_cuda_on_path()
+        backend = prepare_gpu_environment()
         backends = list_ggml_backends()
         n_gpu_layers = self._config.hardware.n_gpu_layers
-        if n_gpu_layers != 0 and not has_cuda_backend():
-            raise RuntimeError(
-                "n_gpu_layers is set for GPU offload, but llama-cpp-python has no CUDA backend. "
-                "Reinstall with CUDA: set CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=120' "
-                "and FORCE_CMAKE=1, then pip install --force-reinstall --no-cache-dir llama-cpp-python. "
-                f"Registered backends: {backends or ['(none)']}"
+        if n_gpu_layers != 0 and not has_gpu_backend():
+            print(
+                f"[mango] no GPU backend ({backends or ['(none)']}); running CPU-only. "
+                f"{gpu_install_hint()}",
+                file=sys.stderr,
+                flush=True,
             )
+            n_gpu_layers = 0
+        elif backend:
+            print(f"[mango] gpu backend={backend}", file=sys.stderr, flush=True)
         kwargs = self._loader.llama_kwargs()
+        kwargs["n_gpu_layers"] = n_gpu_layers
         n_threads = kwargs.pop("n_threads", None)
         if n_threads is not None:
             kwargs["n_threads"] = n_threads
-        _disable_cuda_graphs()
-        # Reduce CUDA allocator fragmentation
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        os.environ.setdefault("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "0")
+        apply_backend_env(backend)
         print(
             f"[mango] loading {self._loader.model_path.name} "
             f"(n_ctx={kwargs.get('n_ctx')} n_batch={kwargs.get('n_batch')} "
-            f"n_ubatch={kwargs.get('n_ubatch')} flash_attn={kwargs.get('flash_attn')}) ...",
+            f"n_ubatch={kwargs.get('n_ubatch')} flash_attn={kwargs.get('flash_attn')} "
+            f"n_gpu_layers={kwargs.get('n_gpu_layers')}) ...",
             file=sys.stderr,
             flush=True,
         )
@@ -383,25 +450,6 @@ class ModelRunner:
         thought_seen = 0
         thought_buf = ""
 
-        def _thought_looks_like_code_dump(text: str) -> bool:
-            sample = text[-1200:] if len(text) > 1200 else text
-            if "```" in sample:
-                return True
-            lower = sample.lower()
-            if "<write_file" in lower or "<tool_call" in lower:
-                return True
-            if "</invoke>" in lower or "</function>" in lower:
-                return True
-            if "<!doctype" in lower or "<html" in lower:
-                return True
-            if "function(" in sample or "const canvas" in sample or "addEventListener" in sample:
-                return True
-            if sample.count("\n") >= 8 and (
-                "def " in sample or "class " in sample or "import " in sample
-            ):
-                return True
-            return False
-
         def _thought_token(delta: str) -> None:
             nonlocal thought_seen, thought_buf
             thought_seen += 1
@@ -411,30 +459,7 @@ class ModelRunner:
             if on_token is not None:
                 on_token(delta)
 
-        def _thought_should_stop(partial: str) -> bool:
-            # When a tool call is mandatory, cut thought early if the model dumps code/HTML
-            # into the unconstrained phase (burns budget and never reaches a clean tool call).
-            if not force_grammar:
-                return False
-            try:
-                from mango_tools.tool_parser import parse_tool_calls
-
-                if parse_tool_calls(partial):
-                    return True
-            except Exception:
-                pass
-            low = partial.lower()
-            if "</invoke>" in low or "</function>" in low:
-                return True
-            # Informal write started but never closed — don't burn the whole thought budget.
-            if "<write_file" in low and len(partial) > 2500:
-                return True
-            if len(partial) < 80:
-                return False
-            # Still emitting an informal/canonical call — wait for JSON to finish.
-            if "<write_file" in low or "<tool_call" in low:
-                return False
-            return _thought_looks_like_code_dump(partial)
+        _thought_should_stop = partial(thought_should_stop, force_grammar=force_grammar)
 
         thought_text, thought_choice, thought_usage, thought_timing = self._stream_completion(
             llama,
@@ -506,6 +531,15 @@ class ModelRunner:
                 prefill_s=float(thought_timing.get("prefill_s", 0.0)),
                 decode_s=float(thought_timing.get("decode_s", 0.0)),
                 reset_cache=reset_cache,
+            )
+        if force_grammar and not fired:
+            # A tool call is mandatory this turn. Never hand back free chat: the
+            # grammar tail appends the trigger so constrained decoding emits a
+            # parseable call even when the model never wrote it itself.
+            print(
+                "[mango] tool trigger missing under force_grammar; appending constrained tail",
+                file=sys.stderr,
+                flush=True,
             )
 
         continuation = prompt + thought_text

@@ -124,6 +124,9 @@ $example = Join-Path $Root "runtime\config.example.yaml"
 $configSrc = if (Test-Path -LiteralPath $example) { $example } else { Join-Path $Root "runtime\config.yaml" }
 $configDst = Join-Path $RuntimeOut "runtime\config.yaml"
 Copy-Item -LiteralPath $configSrc -Destination $configDst -Force
+if (Test-Path -LiteralPath $example) {
+    Copy-Item -LiteralPath $example -Destination (Join-Path $RuntimeOut "runtime\config.example.yaml") -Force
+}
 $cfgText = Get-Content -LiteralPath $configDst -Raw
 $cfgText = [regex]::Replace($cfgText, "(?m)^(\s*path:\s*).*$", '${1}""')
 Set-Content -Path $configDst -Value $cfgText -Encoding utf8
@@ -149,7 +152,12 @@ if (-not $SkipSidecar) {
     Write-Host "  pip install llama-cpp-python (CPU wheel index) ..."
     & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $cpuIndex --prefer-binary
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "CPU wheel index failed; trying CUDA wheel index (needs NVIDIA drivers on target) ..."
+        Write-Host "CPU wheel index failed; trying Vulkan wheel (AMD/Intel/NVIDIA) ..."
+        $vulkanIndex = "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
+        & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $vulkanIndex --prefer-binary
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Vulkan wheel index failed; trying CUDA wheel index (needs NVIDIA drivers on target) ..."
         $cudaIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
         & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $cudaIndex --prefer-binary
         if ($LASTEXITCODE -ne 0) {

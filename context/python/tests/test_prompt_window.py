@@ -70,9 +70,12 @@ def test_idle_retry_prompt_is_compact_and_demands_a_tool_call() -> None:
     assert "Do not finish yet" in compact or "Do not restate the goal" in compact
     assert "Your previous reply had no tool call" in compact
     assert "You are Mango." not in compact
-    assert "### [1] write_file" not in compact
+    # The latest tool result is now intentionally included so the model can act
+    # on real evidence (traceback / file body) instead of restating the plan.
+    assert "## Latest tool result" in compact
+    assert "wrote y.py" in compact
     assert len(compact) < len(full)
-    assert len(compact) < 1_200
+    assert len(compact) < 2_400
 
 
 def test_build_prompt_collection_error_asks_to_repair_module() -> None:

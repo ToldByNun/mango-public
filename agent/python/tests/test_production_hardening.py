@@ -190,3 +190,24 @@ def test_watchdog_passes_healthy_stream() -> None:
     runner._llama = FakeLlama()
     text, choice, usage, _timing = runner._stream_completion(FakeLlama(), "p", {}, None)
     assert text == "abc"
+
+
+def test_thought_should_stop_after_closed_think_block() -> None:
+    """Mango-1 closes its reasoning early; the tool tail must fire then."""
+    from mango_runtime.model_runner import thought_should_stop
+
+    open_think = "<think>Plan: read file, then patch it. Still deciding..."
+    closed_think = "<think>Plan: read main.py, then fix item key.</think>"
+    assert not thought_should_stop(open_think + " " * 80, force_grammar=True), (
+        "open think block must keep streaming"
+    )
+    assert thought_should_stop(closed_think + " padding to satisfy min length", force_grammar=True), (
+        "closed think block must stop the thought phase"
+    )
+    assert not thought_should_stop(open_think, force_grammar=False), (
+        "without forced grammar the thought phase is never cut"
+    )
+    call = closed_think + '\n<tool_call=read_file : {"path": "main.py"}>'
+    assert thought_should_stop(call, force_grammar=True), (
+        "a parseable tool call must stop the phase immediately"
+    )

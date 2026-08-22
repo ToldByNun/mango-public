@@ -1,7 +1,7 @@
 # Copy to config.yaml and adjust as needed.
 
 model:
-  path: 'C:\Users\mikaj\.lmstudio\models\Unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q2_K_XL.gguf'
+  path: 'C:\Users\mikaj\.lmstudio\models\ToldByNun\mango-1.0-iq2-xs\mango-1.0-Q2_K_L.gguf'
   n_ctx: 16384
   n_batch: 2048
   n_ubatch: 512   # decode micro-batch; prefill still uses n_batch
@@ -15,5 +15,8 @@ inference:
   temperature: 0.1
   top_p: 0.95
   stop: []
-  repeat_penalty: 1.12   # 1.0 = off; low temperature + off = the model repeats one sentence
+  # 1.12 starved the small Mango-1 model mid-thought (it legitimately repeats
+  # identifiers while planning tool calls); 1.05 keeps loops breakable without
+  # punishing normal reasoning.
+  repeat_penalty: 1.05
   repeat_last_n: 256

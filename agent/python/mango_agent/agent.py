@@ -41,6 +41,13 @@ from mango_agent.experiment import (
     hypothesis_from_thought,
     restore_snapshots,
 )
+from mango_agent.impl_completeness import (
+    find_impl_gaps,
+    goal_wants_runnable_script,
+    required_features,
+    summarize_impl_status,
+)
+from mango_agent.work_plan import build_work_plan
 from mango_agent.prompt import compose_agent_system_prompt, feedback, render_system_prompt
 from mango_agent.thinking import thinking_preset, verify_hint_for
 from mango_agent.checkpoints import (
@@ -214,6 +221,19 @@ _CONCURRENCY_TEST = re.compile(
 )
 _FENCE_RE = re.compile(r"```[\w+-]*\n.*?```", re.DOTALL)
 _GOAL_WANTS_TESTS = re.compile(r"(?i)test_|pytest|\btests?\b|\bteste")
+# Explicit request to author tests — only this keeps agent-created test files
+# alive after the run ("schreibe tests", "write tests", "erstelle test_*.py").
+_GOAL_WANTS_TESTS_WRITTEN = re.compile(
+    r"(?i)\b(?:schreib\w*|erstell\w*|erzeug\w*|write|create|generate|add)\b"
+    r"(?:\s+\w+){0,3}?\s+\btest\w*"
+)
+# pytest exits 5 when the collected targets contain no tests — the classic
+# "run_tests before the test file was written" trap that loops forever.
+_PYTEST_NO_TESTS_EXIT = 5
+# Shell shortcuts that read source — force read_file so the model sees full content.
+_SHELL_READ_CMD = re.compile(
+    r"(?i)^\s*(?:type|cat|more|head|tail|Get-Content|gc)\s+[\"']?([^\s|&;\"']+)"
+)
 _GOAL_WANTS_FILE_IO = re.compile(
     r"(?i)\b(read|edit|replace|write|create|modify)\b.*\bfile\b|\bread the file\b|\bedit the file\b"
 )
@@ -227,7 +247,9 @@ _GOAL_IMPLIES_EDIT = re.compile(
 _EXPLORE_TOOLS = frozenset({"search_code", "read_file", "codebase_lookup", "declare_apis", "ask_epistemic"})
 _MIN_SECONDS_FOR_REASONING = 0.5
 _RENAME_GOAL = re.compile(
-    r"\brename\s+([A-Za-z_][A-Za-z0-9_]*)\s+to\s+([A-Za-z_][A-Za-z0-9_]*)",
+    r"\brename\s+(?:the\s+)?(?:class\s+|function\s+|method\s+|symbol\s+)?[\"'`]*"
+    r"([A-Za-z_][A-Za-z0-9_]*)[\"'`]*\s+(?:to|into)\s+[\"'`]*"
+    r"([A-Za-z_][A-Za-z0-9_]*)[\"'`]*",
     re.IGNORECASE,
 )
 _DEF_OR_CLASS = re.compile(
@@ -349,6 +371,7 @@ class Agent:
         self._ledger = VerificationLedger()
         self._pending_symbol_lookups: list[str] = []
         self._pending_goal_files: list[str] = []
+        self._goal_deliverable_files: list[str] = []
         self._pending_impl_files: list[str] = []
         self._ingested_workspace_tests = False
         self._rename_pair: tuple[str, str] | None = None
@@ -382,6 +405,12 @@ class Agent:
         self._thought_seq = 0
         self._task_wants_tests = False
         self._ran_tests_ok = False
+        # Absolute paths of test files this run created via a mutating tool.
+        # Scratch tests are deleted at run end unless the goal explicitly asks
+        # for tests ("schreibe tests") so the workspace stays clean.
+        self._agent_created_test_paths: list[str] = []
+        self._impl_gaps: list[str] = []
+        self._shell_read_counts: dict[str, int] = {}
         self._goal_wants_file_io = False
         self._large_markup_goal = False
         self._run_tests_failures = 0
@@ -389,6 +418,8 @@ class Agent:
         self._stress_nudges = 0
         self._prefer_write_file = False
         self._prefer_read_file = False
+        self._forced_read_path = ""
+        self._missing_attempted_paths: set[str] = set()
         self._last_tool_truncated = False
         self._fix_hint_path = ""
         self._edit_fail_counts: dict[str, int] = {}
@@ -758,10 +789,8 @@ class Agent:
         self._codeintel = None
 
     def close(self) -> None:
+        """Release codeintel sqlite handle etc. so temp workspaces can be deleted."""
         self.close_index()
-        unload = getattr(self._model, "unload", None)
-        if callable(unload):
-            unload()
 
     def run(
         self,
@@ -806,6 +835,7 @@ class Agent:
         targets = extract_goal_targets(task)
         self._pending_symbol_lookups = list(targets.symbols)
         self._pending_goal_files = list(targets.files)
+        self._goal_deliverable_files = list(targets.files)
         self._goal_wants_file_io = bool(_GOAL_WANTS_FILE_IO.search(task or ""))
         self._large_markup_goal = bool(_GOAL_LARGE_MARKUP.search(task or ""))
         if self._require_tools:
@@ -837,12 +867,26 @@ class Agent:
             if self._task_wants_tests_override is not None
             else bool(_GOAL_WANTS_TESTS.search(task or ""))
         )
+        # Explicit "user wants tests kept" signal: "schreibe/erstelle Tests",
+        # "write tests", or a test file named in the goal. When set, agent-created
+        # test files are kept after the run instead of being cleaned up.
+        self._keep_agent_tests = bool(
+            _GOAL_WANTS_TESTS_WRITTEN.search(task or "")
+        ) or any(
+            _looks_like_test_path(rel)
+            for rel in (extract_goal_targets(task or "").files if task else ())
+        )
+        self._agent_created_test_paths = []
+        self._impl_gaps = []
+        self._shell_read_counts = {}
         self._ran_tests_ok = False
         self._run_tests_failures = 0
         self._runtime_smoke_failures = 0
         self._stress_nudges = 0
         self._prefer_write_file = False
         self._prefer_read_file = False
+        self._forced_read_path = ""
+        self._missing_attempted_paths = set()
         self._last_tool_truncated = False
         self._fix_hint_path = ""
         self._write_tool_max_tokens = _WRITE_TOOL_MAX_TOKENS
@@ -884,6 +928,7 @@ class Agent:
         self._user_continue_stall = False
         self._last_read_dir = ""
         self._last_checkpoint_id = ""
+        self._agent_created_test_paths = []
         if self._plan_apis_enabled():
             if _is_follow_up_goal(task):
                 self._apis_declared_once = True
@@ -896,6 +941,8 @@ class Agent:
             self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
             # Cap constrained write so GBNF short-content rule can finish (skeleton only).
             self._write_tool_max_tokens = 768
+        engine.set_work_plan(build_work_plan(task))
+        self._seed_impl_status(engine)
         steps: list[AgentStep] = []
         final_answer = ""
         idle_retry = False
@@ -1309,6 +1356,23 @@ class Agent:
                     + (" (truncated/invalid JSON)" if truncated else "")
                     + (f" raw={preview!r}" if preview else "")
                 )
+                self._refresh_impl_completeness(engine)
+                if self._finish_allowed():
+                    steps.append(
+                        self._record_step(
+                            engine,
+                            iteration,
+                            prompt=prompt,
+                            model_output=model_output,
+                            reasoning_need=cot.last_need.value,
+                            reasoning_summary=summary,
+                        )
+                    )
+                    return self._complete(
+                        steps=steps,
+                        iterations=iteration,
+                        draft=model_output,
+                    )
                 if self._note_stall(model_output, engine):
                     self._trace(
                         f"iter {iteration} stalled: same answer x{self._stall_repeats + 1}"
@@ -1505,17 +1569,46 @@ class Agent:
                         )
                     )
                     continue
+                self._refresh_impl_completeness(engine)
+                missing_deliverables = self._missing_goal_deliverables()
+                if missing_deliverables:
+                    engine.set_verification_feedback(
+                        feedback(
+                            "goal_deliverables_missing",
+                            files=", ".join(missing_deliverables[:8]),
+                        )
+                    )
+                    continue
+                if self._impl_gaps:
+                    engine.set_verification_feedback(
+                        feedback(
+                            "impl_incomplete",
+                            gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                        )
+                    )
+                    continue
                 # Don't finish on prose that admits more work is left.
-                if self._require_tools and unfinished and self._idle_tool_retries < _IDLE_TOOL_RETRIES:
+                if (
+                    self._require_tools
+                    and unfinished
+                    and not self._finish_allowed()
+                    and self._idle_tool_retries < _IDLE_TOOL_RETRIES
+                ):
                     self._idle_tool_retries += 1
                     engine.set_verification_feedback(feedback("continue_work"))
                     continue
                 # Never draft-give-up while tests failed / truncated write still pending.
-                if self._require_tools and not self._ran_tests_ok and (
-                    self._run_tests_failures > 0
-                    or self._last_tool_truncated
-                    or unfinished
-                    or self._tests_still_required()
+                if self._require_tools and (
+                    self._impl_gaps
+                    or (
+                        not self._ran_tests_ok
+                        and (
+                            self._run_tests_failures > 0
+                            or self._last_tool_truncated
+                            or unfinished
+                            or self._tests_still_required()
+                        )
+                    )
                 ):
                     engine.set_verification_feedback(
                         feedback("tests_still_red")
@@ -1600,6 +1693,12 @@ class Agent:
                         },
                     )
             tool_results = self._execute_tool_calls(tool_calls)
+            auto_reads = self._auto_read_after_blocked_edit(tool_results)
+            if auto_reads:
+                tool_results = [*tool_results, *auto_reads]
+            auto_rename = self._auto_rename_if_ready(iteration, tool_results)
+            if auto_rename is not None:
+                tool_results = [*tool_results, auto_rename]
             if self._cancelled():
                 return self._result(
                     final_answer=final_answer,
@@ -1613,8 +1712,21 @@ class Agent:
             self._note_tool_result_metrics(tool_results)
             self._note_review_reads(engine, tool_results)
             self._note_read_files(tool_results)
+            self._sync_impl_status_from_reads(engine, tool_results)
             if any(result.success and result.tool_name == "read_file" for result in tool_results):
-                self._prefer_read_file = False
+                for result in tool_results:
+                    if not result.success or result.tool_name != "read_file":
+                        continue
+                    output = result.output if isinstance(result.output, dict) else {}
+                    path = str(output.get("absolute_path") or output.get("path") or "")
+                    if not path:
+                        continue
+                    abs_path = self._abs_impl_path(path)
+                    if self._forced_read_path and abs_path == self._forced_read_path:
+                        self._prefer_read_file = False
+                        self._forced_read_path = ""
+                    elif not self._forced_read_path:
+                        self._prefer_read_file = False
             for result in tool_results:
                 if result.success:
                     self._trace(f"iter {iteration} {result.tool_name} ok {_compact_result(result)}")
@@ -1663,6 +1775,7 @@ class Agent:
             )
             if not syntax_bad:
                 self._handle_run_tests_results(tool_results, engine)
+            self._refresh_impl_completeness(engine)
             auto_results = [] if syntax_bad else self._auto_run_tests_if_needed(tool_results, iteration)
             if auto_results:
                 tool_results = [*tool_results, *auto_results]
@@ -1791,6 +1904,12 @@ class Agent:
     def _finish_allowed(self) -> bool:
         if self._syntax_broken:
             return False
+        if self._rename_still_needed():
+            return False
+        if self._impl_gaps:
+            return False
+        if self._missing_goal_deliverables():
+            return False
         if self._tests_still_required():
             return False
         if self._design_review_still_required() or self._review_hold > 0:
@@ -1832,6 +1951,16 @@ class Agent:
                 err = feedback("no_impl_change")
             else:
                 err = feedback("tests_still_red")
+            if self._impl_gaps:
+                err = feedback(
+                    "impl_incomplete",
+                    gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                )
+            elif self._missing_goal_deliverables():
+                err = feedback(
+                    "goal_deliverables_missing",
+                    files=", ".join(self._missing_goal_deliverables()[:8]),
+                )
             return self._result(
                 final_answer=answer,
                 steps=steps,
@@ -1949,6 +2078,7 @@ class Agent:
         error: str | None = None,
         verification_report: str | None = None,
     ) -> AgentResult:
+        self._cleanup_agent_tests()
         if self._run_id:
             self._close_thought_stream()
         result = AgentResult(
@@ -2209,11 +2339,22 @@ class Agent:
     def _needs_tool(self) -> bool:
         if self._syntax_broken:
             return True
+        if self._rename_still_needed():
+            return True
+        if self._impl_gaps:
+            return True
+        if self._missing_goal_deliverables():
+            return True
         if self._last_tool_truncated:
             return True
         if self._plan_gate_phase() is not None:
             return True
         if self._verification_enabled() and self._last_verification_ok is not True:
+            return True
+        # Work is never done just because one action succeeded: keep the grammar
+        # armed until tests pass / verification clears, otherwise small models
+        # drift into endless chat after their first tool call (gauntlet G4/G5).
+        if self._require_tools and not self._finish_allowed():
             return True
         if not self._require_tools:
             # Some unit-test / interactive tasks expect immediate filesystem interaction
@@ -2243,6 +2384,58 @@ class Agent:
                 return floor
             return max(int(configured), floor)
         return configured
+
+    def _research_inputs_unread(self) -> list[str]:
+        """Existing csv/txt inputs named in the goal that have not been read yet."""
+        root = self._verification_root
+        if root is None or not self._task:
+            return []
+        unread: list[str] = []
+        for rel in extract_goal_targets(self._task).files:
+            rel_norm = str(rel).replace("\\", "/")
+            if Path(rel_norm).suffix.lower() not in {".csv", ".txt"}:
+                continue
+            if not (Path(root) / rel_norm).is_file():
+                continue
+            abs_path = str((Path(root) / rel_norm).resolve())
+            if abs_path not in self._files_read:
+                unread.append(rel_norm)
+        return unread
+
+    def _forced_tool_name(self) -> str | None:
+        """When set, GBNF may emit only this tool — stops edit/read ping-pong on small models."""
+        enabled = set(self._enabled_registry_names())
+        # Missing-file redirect beats research-read lock: once the model tried to
+        # touch a non-existent deliverable and inputs are done, force write_file.
+        if (
+            self._prefer_write_file
+            and self._missing_attempted_paths
+            and not self._research_inputs_unread()
+            and "write_file" in enabled
+        ):
+            return "write_file"
+        if self._research_inputs_unread() and "read_file" in enabled:
+            return "read_file"
+        if self._prefer_write_file and self._missing_attempted_paths and "write_file" in enabled:
+            return "write_file"
+        if self._prefer_read_file and "read_file" in enabled:
+            return "read_file"
+        if (
+            self._rename_pair
+            and self._located_once
+            and not self._acted_once
+            and self._rename_still_needed()
+            and "rename_symbol" in enabled
+        ):
+            return "rename_symbol"
+        if self._inspect_before_edit() and not self._inspected_once and not self._rename_pair:
+            if not self._located_once:
+                for name in ("codebase_lookup", "search_code", "read_file"):
+                    if name in enabled:
+                        return name
+            elif "read_file" in enabled:
+                return "read_file"
+        return None
 
     def _action_grammar(self, tool_names: list[str] | None = None) -> str | None:
         if not self._use_tool_grammar:
@@ -2372,11 +2565,72 @@ class Agent:
                 ]
         preferred = self._preferred_action_tools(names)
         self._last_preferred_tools = preferred
+        names = self._apply_grammar_filters(names)
         # Prefer-order is for prompt readability only; llama.cpp does not weight GBNF alts.
         if preferred:
             head = [name for name in preferred if name in names]
             tail = [name for name in names if name not in head]
             return head + tail
+        return names
+
+    def _apply_grammar_filters(self, names: list[str]) -> list[str]:
+        """Hard-remove tools from GBNF when the runner knows they will fail or waste turns."""
+        forced = self._forced_tool_name()
+        if forced and forced in names:
+            return [forced]
+        if self._research_inputs_unread():
+            if "read_file" in self._enabled_registry_names():
+                names = ["read_file"]
+            else:
+                names = [name for name in names if name == "read_file"]
+        missing_deliverables = self._missing_goal_deliverables()
+        if missing_deliverables:
+            names = [name for name in names if name in {"read_file", "write_file", "edit_file"}]
+            if any(not _looks_like_test_path(path) for path in missing_deliverables):
+                names = [name for name in ("write_file", "read_file") if name in names]
+            elif "write_file" in names:
+                names = ["write_file", *[name for name in names if name != "write_file"]]
+            if not self._task_wants_tests:
+                names = [name for name in names if name != "run_tests"]
+        if self._rename_still_needed() and not self._acted_once:
+            names = [
+                name
+                for name in names
+                if name
+                in {
+                    "rename_symbol",
+                    "read_file",
+                    "edit_file",
+                    "search_code",
+                    "codebase_lookup",
+                }
+            ]
+        if self._inspect_before_edit() and not self._inspected_once:
+            inspect_names = [name for name in names if name in _EXPLORE_TOOLS]
+            if self._located_once and "read_file" in inspect_names:
+                inspect_names = ["read_file", *[name for name in inspect_names if name != "read_file"]]
+            elif not self._located_once:
+                for preferred in ("search_code", "codebase_lookup"):
+                    if preferred in inspect_names:
+                        inspect_names = [
+                            preferred,
+                            *[name for name in inspect_names if name != preferred],
+                        ]
+                        break
+            if inspect_names:
+                names = inspect_names
+        if self._grounded_edits_enabled() or self._require_tools:
+            names = [name for name in names if name != "run_terminal_command"]
+        if self._prefer_read_file and "read_file" in names:
+            if self._rename_pair and "rename_symbol" in names:
+                names = ["read_file", "rename_symbol"]
+            else:
+                names = ["read_file"]
+        elif self._rename_pair and "rename_symbol" in names and not self._acted_once:
+            names = ["rename_symbol", *[name for name in names if name != "rename_symbol"]]
+            names = [name for name in names if name != "run_terminal_command"]
+        if self._impl_gaps and self._plan_gate_phase() is None:
+            names = [name for name in names if name != "run_terminal_command"]
         return names
 
     def _action_tool_names_legacy(self) -> list[str]:
@@ -2392,6 +2646,10 @@ class Agent:
             names = ["rename_symbol", *[name for name in names if name != "rename_symbol"]]
         if self._require_tools and self._task_wants_tests and not self._ran_tests_ok:
             names = [name for name in names if name != "run_terminal_command"]
+        if self._impl_gaps and self._plan_gate_phase() is None:
+            names = [name for name in names if name != "run_terminal_command"]
+            if "write_file" in names:
+                names = ["write_file", *[name for name in names if name != "write_file"]]
         if self._tests_still_required() and self._plan_gate_phase() is None:
             # Keep read_file available — without it the model cannot fix assertion failures
             # (edit_file needs a verbatim old_string from the file).
@@ -2493,6 +2751,13 @@ class Agent:
             call = getattr(result, "call", None)
             arguments = getattr(call, "arguments", None) if call is not None else None
             path = arguments.get("path") if isinstance(arguments, dict) else None
+            if path and ("file not found" in err_l or "does not exist" in err_l):
+                abs_missing = self._abs_impl_path(str(path))
+                self._missing_attempted_paths.add(abs_missing)
+                if not self._research_inputs_unread():
+                    self._prefer_write_file = True
+                    self._prefer_read_file = False
+                    lines.append(feedback("file_missing_write", path=self._display_path(abs_missing)))
             if (
                 path
                 and "old_string not found" not in err_l
@@ -2578,6 +2843,15 @@ class Agent:
         )
 
     def _grounding_block_reason(self, call: ToolCall) -> str | None:
+        blocked = self._test_discipline_block(call)
+        if blocked:
+            return blocked
+        blocked = self._shell_discipline_block(call)
+        if blocked:
+            return blocked
+        blocked = self._missing_file_block(call)
+        if blocked:
+            return blocked
         if call.name not in _CODE_MUTATING_TOOLS:
             return None
         if not self._grounded_edits_enabled():
@@ -2592,10 +2866,180 @@ class Agent:
         abs_path = self._abs_impl_path(path)
         file_exists = Path(abs_path).is_file()
         if call.name == "edit_file" and file_exists and abs_path not in self._files_read:
+            self._prefer_read_file = True
+            self._forced_read_path = abs_path
             return feedback("blocked_edit_not_read", path=self._display_path(abs_path))
         if call.name == "write_file" and file_exists and abs_path not in self._files_read:
+            self._prefer_read_file = True
+            self._forced_read_path = abs_path
             return feedback("blocked_edit_not_read", path=self._display_path(abs_path))
         return None
+
+    def _missing_file_block(self, call: ToolCall) -> str | None:
+        """Redirect read/edit/delete on non-existent paths — stop the File-not-found loop."""
+        if call.name not in {"read_file", "edit_file", "edit_symbol", "delete_file"}:
+            return None
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return None
+        abs_path = self._abs_impl_path(path)
+        if Path(abs_path).is_file():
+            return None
+        display = self._display_path(abs_path)
+        self._missing_attempted_paths.add(abs_path)
+        unread = self._research_inputs_unread()
+        if unread and call.name == "read_file":
+            next_rel = unread[0]
+            self._prefer_read_file = True
+            self._forced_read_path = self._abs_impl_path(next_rel)
+            return feedback(
+                "file_missing_read_input",
+                path=display,
+                next_path=next_rel,
+            )
+        self._prefer_write_file = True
+        self._prefer_read_file = False
+        self._forced_read_path = ""
+        return feedback("file_missing_write", path=display)
+
+    def _test_discipline_block(self, call: ToolCall) -> str | None:
+        """Block run_tests while no test file exists in the workspace.
+
+        Running pytest with nothing to collect exits 5 ("no tests ran") and was
+        the loop trap: the model retried forever because no feedback told it to
+        write tests first. The runner now enforces the order — write, then test.
+        """
+        if call.name != "run_tests":
+            return None
+        if not self._require_tools:
+            return None
+        if self._discover_test_files():
+            return None
+        return feedback("tests_before_run")
+
+    def _shell_discipline_block(self, call: ToolCall) -> str | None:
+        """Block type/cat shell reads — read_file returns the full source."""
+        if call.name != "run_terminal_command" or not self._require_tools:
+            return None
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        command = str(arguments.get("command") or "")
+        path = _shell_read_target(command)
+        if not path:
+            return None
+        self._prefer_read_file = True
+        display = self._display_path(self._abs_impl_path(path))
+        return feedback("blocked_shell_read", path=display)
+
+    def _auto_read_after_blocked_edit(self, tool_results: list[ToolResult]) -> list[ToolResult]:
+        """Runner reads the file when the model tried edit_file without read_file first.
+
+        Also: when read_file/edit targets a path that does not exist yet and research
+        inputs are still unread, auto-read the next real input so we do not spin on
+        File-not-found for a deliverable the model should write_file later.
+        """
+        extra: list[ToolResult] = []
+        for result in tool_results:
+            if result.success or not result.metadata.get("blocked"):
+                continue
+            err = str(result.error or "").lower()
+            call = getattr(result, "call", None)
+            if call is None:
+                continue
+            args = call.arguments if isinstance(call.arguments, dict) else {}
+            path = str(args.get("path") or "").strip()
+
+            if "does not exist" in err or "file_missing" in err:
+                unread = self._research_inputs_unread()
+                if unread:
+                    next_rel = unread[0]
+                    abs_next = self._abs_impl_path(next_rel)
+                    if abs_next in self._files_read:
+                        continue
+                    read_call = ToolCall(
+                        name="read_file",
+                        arguments={"path": next_rel},
+                        raw="",
+                        start=0,
+                        end=0,
+                    )
+                    reads = run_tool_calls(
+                        [read_call], self._registry, context=self._tool_context()
+                    )
+                    for read in reads:
+                        if read.success:
+                            self._trace(
+                                f"iter {self._current_iteration} auto read_file {next_rel} "
+                                "(missing-file redirect → unread input)"
+                            )
+                    extra.extend(reads)
+                continue
+
+            if "read_file first" not in err and "not read" not in err:
+                continue
+            if call.name not in _CODE_MUTATING_TOOLS:
+                continue
+            if not path:
+                continue
+            abs_path = self._abs_impl_path(path)
+            if abs_path in self._files_read:
+                continue
+            read_call = ToolCall(
+                name="read_file",
+                arguments={"path": path},
+                raw="",
+                start=0,
+                end=0,
+            )
+            reads = run_tool_calls([read_call], self._registry, context=self._tool_context())
+            for read in reads:
+                if read.success:
+                    self._trace(
+                        f"iter {self._current_iteration} auto read_file {path} (edit blocked — unread)"
+                    )
+            extra.extend(reads)
+        return extra
+
+    def _auto_rename_if_ready(
+        self, iteration: int, tool_results: list[ToolResult]
+    ) -> ToolResult | None:
+        """Apply rename_symbol when the goal names old/new and lookup already ran."""
+        if not self._rename_pair or self._acted_once:
+            return None
+        if not self._rename_still_needed():
+            return None
+        if not self._registry.has("rename_symbol"):
+            return None
+        located_now = any(
+            result.success and result.tool_name in ("codebase_lookup", "search_code")
+            for result in tool_results
+        )
+        if not located_now and not self._located_once:
+            return None
+        old, new = self._rename_pair
+        try:
+            tool = self._registry.get("rename_symbol")
+            output = tool.handler(
+                old_name=old,
+                new_name=new,
+                path=".",
+                _context=self._tool_context(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._trace(f"iter {iteration} auto rename_symbol FAIL {exc}")
+            return ToolResult(
+                success=False,
+                tool_name="rename_symbol",
+                error=str(exc),
+                metadata={"auto": True},
+            )
+        self._trace(f"iter {iteration} auto rename_symbol {old} -> {new}")
+        return ToolResult(
+            success=True,
+            tool_name="rename_symbol",
+            output=output,
+            metadata={"auto": True},
+        )
 
     def _note_read_files(self, tool_results: list[ToolResult]) -> None:
         for result in tool_results:
@@ -2624,6 +3068,19 @@ class Agent:
             arguments = getattr(call, "arguments", None) if call is not None else None
             if not raw and isinstance(arguments, dict):
                 raw = str(arguments.get("path") or "")
+            if not raw:
+                continue
+            abs_path = self._abs_impl_path(raw)
+            if abs_path in self._missing_attempted_paths:
+                self._missing_attempted_paths.discard(abs_path)
+                if not self._missing_attempted_paths:
+                    # Created the missing file — stop forcing write_file.
+                    pass
+            if _looks_like_test_path(abs_path) and Path(abs_path).is_file():
+                # Track scratch tests so they can be removed at run end when the
+                # user never asked for tests (see _cleanup_agent_tests).
+                if abs_path not in self._agent_created_test_paths:
+                    self._agent_created_test_paths.append(abs_path)
             if raw and not _looks_like_test_path(raw):
                 self._impl_mutated_once = True
 
@@ -2702,30 +3159,43 @@ class Agent:
                 )
             return results
         if self._inspect_before_edit() and not self._inspected_once:
-            allowed = [call for call in tool_calls if call.name not in _CODE_MUTATING_TOOLS]
-            blocked = [call for call in tool_calls if call.name in _CODE_MUTATING_TOOLS]
             results: list[ToolResult] = []
+            allowed: list[ToolCall] = []
+            for call in tool_calls:
+                if call.name in _CODE_MUTATING_TOOLS:
+                    self._trace(
+                        f"iter {self._current_iteration} blocked premature edit="
+                        f"{[call.name]}"
+                    )
+                    results.append(
+                        ToolResult(
+                            success=False,
+                            tool_name=call.name,
+                            error=(
+                                feedback("blocked_edit_read")
+                                if self._located_once
+                                else feedback("blocked_edit_search")
+                            ),
+                            call=call,
+                            metadata={"blocked": True},
+                        )
+                    )
+                    continue
+                reason = self._grounding_block_reason(call)
+                if reason:
+                    results.append(
+                        ToolResult(
+                            success=False,
+                            tool_name=call.name,
+                            error=reason,
+                            call=call,
+                            metadata={"blocked": True},
+                        )
+                    )
+                else:
+                    allowed.append(call)
             if allowed:
                 results.extend(self._run_tools_with_checkpoints(allowed, tool_ctx))
-            if blocked:
-                self._trace(
-                    f"iter {self._current_iteration} blocked premature edit="
-                    f"{[call.name for call in blocked]}"
-                )
-                results.extend(
-                    ToolResult(
-                        success=False,
-                        tool_name=call.name,
-                        error=(
-                            feedback("blocked_edit_read")
-                            if self._located_once
-                            else feedback("blocked_edit_search")
-                        ),
-                        call=call,
-                        metadata={"blocked": True},
-                    )
-                    for call in blocked
-                )
             return results
         grounded_allowed: list[ToolCall] = []
         grounded_blocked: list[ToolResult] = []
@@ -2788,6 +3258,48 @@ class Agent:
         return restore_last_mutation(
             session_id=self._run_id or "default", workspace=self._checkpoint_workspace
         )
+
+    def _cleanup_agent_tests(self) -> list[str]:
+        """Delete scratch test files this run created.
+
+        The user asked for this contract: unless the goal explicitly says to
+        write tests ("schreibe tests"), no agent-authored test files may be
+        left behind when the run ends.
+        """
+        if self._keep_agent_tests:
+            return []
+        removed: list[str] = []
+        for abs_path in self._agent_created_test_paths:
+            path = Path(abs_path)
+            try:
+                if not _looks_like_test_path(str(path)):
+                    continue
+                if not self._workspace_contains(path):
+                    continue
+                path.unlink(missing_ok=True)
+                removed.append(abs_path)
+                self._emit(
+                    agent_events.FILE,
+                    {
+                        "action": "deleted",
+                        "path": self._display_path(abs_path),
+                        "absolute_path": abs_path,
+                    },
+                )
+            except OSError:
+                continue
+        return removed
+
+    def _workspace_contains(self, path: Path) -> bool:
+        roots: list[Path] = []
+        if self._verification_root is not None:
+            roots.append(Path(self._verification_root))
+        if self._declared_workspace is not None:
+            roots.append(Path(self._declared_workspace))
+        if not roots:
+            return False
+        resolved = path.resolve()
+        return any(resolved.is_relative_to(root.resolve()) for root in roots)
 
     def _inspect_result_is_useful(self, result: ToolResult) -> bool:
         if not result.success:
@@ -2941,6 +3453,15 @@ class Agent:
             if not targets:
                 engine.set_verification_feedback(feedback("no_tests"))
                 continue
+            exit_code = result.output.get("exit_code")
+            if exit_code == _PYTEST_NO_TESTS_EXIT:
+                # pytest collected nothing: the target files exist but hold no
+                # tests (or were reverted). Re-running can never succeed — the
+                # only way out of the loop is to WRITE the tests first.
+                self._ran_tests_ok = False
+                names = ", ".join(Path(str(t)).name for t in targets)
+                engine.set_verification_feedback(feedback("no_tests_collected", targets=names))
+                continue
             self._run_tests_failures += 1
             timed_out = bool(result.output.get("timed_out"))
             detail = str(result.output.get("stderr") or result.output.get("stdout") or "").strip()
@@ -2994,6 +3515,10 @@ class Agent:
         ctx = {**self._tool_context(), "prefer_scripts": prefer[:8]}
         smoke = run_runtime_smoke(_context=ctx)
         if smoke.get("skipped"):
+            if goal_wants_runnable_script(self._task or ""):
+                self._ran_tests_ok = False
+                engine.set_verification_feedback(feedback("runtime_no_entry"))
+                return False
             return True
         if bool(smoke.get("ok")):
             return True
@@ -3351,6 +3876,11 @@ class Agent:
             self._ran_tests_ok = False
             self._trace(f"iter {iteration} skip experiment revert; missing deps={missing_deps}")
             return False
+        if self._test_only_mutation(tool_results) and tests_ok is False and not syntax_bad:
+            # TDD red phase: only test files changed — keep them so the model can fix
+            # assertions instead of reverting into exit-5 "no tests ran" loops.
+            self._trace(f"iter {iteration} skip experiment revert; test-only mutation")
+            return False
         before, after, command_changed = (None, None, False)
         if not syntax_bad:
             before, after, command_changed = self._collect_perf_pair(
@@ -3390,9 +3920,24 @@ class Agent:
     def _restore_experiment_files(self, snapshots: dict[str, str]) -> list[str]:
         restored: list[str] = []
         for abs_path, previous in snapshots.items():
-            if not previous.strip():
-                continue
             path = Path(abs_path)
+            if not previous.strip():
+                # New file this turn — revert means delete it, not leave a broken stub.
+                try:
+                    if path.is_file():
+                        path.unlink(missing_ok=True)
+                        restored.append(abs_path)
+                        self._emit(
+                            agent_events.FILE,
+                            {
+                                "action": "deleted",
+                                "path": self._display_path(abs_path),
+                                "absolute_path": abs_path,
+                            },
+                        )
+                except OSError:
+                    pass
+                continue
             try:
                 current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
             except OSError:
@@ -3412,6 +3957,12 @@ class Agent:
                 },
             )
         return restored
+
+    def _test_only_mutation(self, tool_results: list[ToolResult]) -> bool:
+        paths = self._mutated_python_paths(tool_results)
+        if not paths:
+            return False
+        return all(_looks_like_test_path(path) for path in paths)
 
     def _emit_experiment(self, verdict: Any) -> None:
         self._emit(
@@ -3932,6 +4483,71 @@ class Agent:
     def _syntax_errors(self, paths: list[str] | None = None) -> list[str]:
         return collect_python_syntax_errors(paths if paths is not None else self._impl_python_files())
 
+    def _refresh_impl_completeness(self, engine: ContextEngine) -> None:
+        """Re-scan impl modules; block finish while CLI/stub gaps remain."""
+        task = self._task or ""
+        if not self._require_tools:
+            self._impl_gaps = []
+            return
+        if not goal_wants_runnable_script(task) and not required_features(task):
+            self._impl_gaps = []
+            return
+        primary = self._primary_impl_path()
+        if primary:
+            self._update_impl_status_from_path(engine, primary)
+        gaps = list(self._impl_gaps)
+        if gaps:
+            engine.set_verification_feedback(
+                feedback(
+                    "impl_incomplete",
+                    gaps="\n".join(f"- {gap}" for gap in gaps[:8]),
+                )
+            )
+
+    def _primary_impl_path(self) -> str:
+        files = [p for p in self._impl_python_files() if not _looks_like_test_path(p)]
+        if not files:
+            return ""
+        if self._fix_hint_path:
+            hint = self._abs_impl_path(self._fix_hint_path)
+            if hint in files:
+                return hint
+        return files[0]
+
+    def _seed_impl_status(self, engine: ContextEngine) -> None:
+        primary = self._primary_impl_path()
+        if primary:
+            self._update_impl_status_from_path(engine, primary)
+
+    def _update_impl_status_from_path(self, engine: ContextEngine, abs_path: str) -> None:
+        task = self._task or ""
+        if not goal_wants_runnable_script(task) and not required_features(task):
+            return
+        try:
+            source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        display = self._display_path(abs_path)
+        engine.set_impl_status(summarize_impl_status(source, task, path=display))
+        self._impl_gaps = [
+            f"{display}: {gap}" for gap in find_impl_gaps(source, task)
+        ]
+
+    def _sync_impl_status_from_reads(
+        self, engine: ContextEngine, tool_results: list[ToolResult]
+    ) -> None:
+        for result in tool_results:
+            if not result.success or result.tool_name != "read_file":
+                continue
+            output = result.output if isinstance(result.output, dict) else {}
+            raw = str(output.get("absolute_path") or output.get("path") or "")
+            call = getattr(result, "call", None)
+            if not raw and call is not None and isinstance(call.arguments, dict):
+                raw = str(call.arguments.get("path") or "")
+            if not raw or _looks_like_test_path(raw):
+                continue
+            self._update_impl_status_from_path(engine, self._abs_impl_path(raw))
+
     def _mutated_python_paths(self, tool_results: list[ToolResult]) -> list[str]:
         found: list[str] = []
         seen: set[str] = set()
@@ -4365,6 +4981,18 @@ class Agent:
                     payload["id"] = tool_id
                 self._emit(agent_events.TOOL, payload)
 
+    def _missing_goal_deliverables(self) -> list[str]:
+        """Files named in the goal that are not on disk yet."""
+        root = self._verification_root
+        if root is None or not self._goal_deliverable_files:
+            return []
+        missing: list[str] = []
+        for rel in self._goal_deliverable_files:
+            rel_norm = str(rel).replace("\\", "/")
+            if not (Path(root) / rel_norm).is_file():
+                missing.append(rel_norm)
+        return missing
+
     def _rename_still_needed(self) -> bool:
         if not self._rename_pair:
             return False
@@ -4728,6 +5356,26 @@ def _compact_lookup(data: dict[str, Any]) -> str:
         else None,
     }
     return json.dumps(slim, ensure_ascii=False)
+
+
+def _shell_read_target(command: str) -> str | None:
+    cmd = (command or "").strip()
+    if not re.search(r"(?i)\b(type|cat|more|head|tail|Get-Content|gc)\b", cmd):
+        return None
+    for match in re.finditer(
+        r'(["\'])?([^\s|&;`"\']+\.(?:py|txt|json|md|yaml|yml|toml))\1?',
+        cmd,
+        re.IGNORECASE,
+    ):
+        return match.group(2)
+    # Fallback: first token after type/cat (Windows paths may use backslashes).
+    match = _SHELL_READ_CMD.match(cmd)
+    if not match:
+        return None
+    path = match.group(1).strip("\"'")
+    if path.lower().endswith((".py", ".txt", ".json", ".md", ".yaml", ".yml", ".toml")):
+        return path
+    return None
 
 
 def _parse_libraries(raw: str) -> list[str]:

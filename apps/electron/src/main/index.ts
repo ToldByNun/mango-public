@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from "electron";
 import { join } from "node:path";
 import { gitBranch } from "./git";
-import { findRepoRoot, runtimeConfigPath } from "./paths";
+import { findRepoRoot, ensureUserRuntimeConfig, runtimeConfigPath } from "./paths";
 import { listGgufModels } from "./models";
 import { loadSessions, saveSessions } from "./sessions";
 import { speechActive, speechStart, speechStop } from "./speech";
@@ -12,6 +12,7 @@ import { checkForUpdatesManual, initAutoUpdater } from "./updater";
 import type { AgentEvent, Session } from "../shared/events";
 
 const repoRoot = findRepoRoot();
+const runtimeConfig = ensureUserRuntimeConfig(repoRoot);
 let mainWindow: BrowserWindow | null = null;
 let sidecar: Sidecar | null = null;
 let sessions: Session[] = [];
@@ -42,7 +43,7 @@ async function restartSidecarIfStale(): Promise<void> {
 async function ensureSidecar(): Promise<Sidecar> {
   await restartSidecarIfStale();
   if (sidecar?.running) return sidecar;
-  sidecar = new Sidecar(repoRoot, workspace || repoRoot);
+  sidecar = new Sidecar(repoRoot, workspace || repoRoot, runtimeConfig);
   sidecar.setEventHandler((event: AgentEvent) => {
     send("agent:event", event);
   });
@@ -120,6 +121,14 @@ function registerIpc(): void {
   ipcMain.handle("sidecar:settings", async () => {
     const child = await ensureSidecar();
     return child.request("get_settings", {});
+  });
+  ipcMain.handle("sidecar:update-settings", async (_event, settings: Record<string, unknown>) => {
+    const child = await ensureSidecar();
+    const result = await child.request("update_settings", settings);
+    if (settings.reload_model) {
+      modelLoaded = false;
+    }
+    return result;
   });
   ipcMain.handle("sidecar:set-model-path", async (_event, modelPath: string) => {
     const child = await ensureSidecar();

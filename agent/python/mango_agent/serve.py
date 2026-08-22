@@ -15,7 +15,9 @@ from typing import Any, TextIO
 from mango_agent.agent_context import AgentLimits
 from mango_agent.thinking import thinking_preset
 from mango_agent.orchestrator import Orchestrator
-from mango_runtime.config import load_config, resolve_config_path
+from mango_runtime.config import load_config, load_config_file, resolve_config_path, save_config
+from mango_runtime.gpu_env import detect_gpu_backend, list_ggml_backends
+from mango_runtime.types import HardwareConfig, InferenceConfig, ModelConfig, RuntimeConfig
 
 
 class ServeError(Exception):
@@ -96,6 +98,8 @@ class AgentServer:
             return self._get_settings()
         if method == "set_model_path":
             return self._set_model_path(str(params.get("path") or ""))
+        if method == "update_settings":
+            return self._update_settings(params)
         if method == "run":
             return self._start_run(params)
         if method == "generate_title":
@@ -139,15 +143,26 @@ class AgentServer:
             "n_ctx": config.model.n_ctx,
         }
 
+    def _read_config(self) -> RuntimeConfig:
+        return load_config_file(self._config_path, require_model=False)
+
     def _get_settings(self) -> dict[str, Any]:
-        config = load_config(self._config_path)
-        name = Path(config.model.path).stem.replace("-", " ")
+        config = self._read_config()
+        path = config.model.path.strip()
+        name = Path(path).stem.replace("-", " ") if path else ""
         return {
-            "model_path": config.model.path,
+            "model_path": path,
             "model_name": name or "Local model",
             "temperature": config.inference.temperature,
             "top_p": config.inference.top_p,
+            "max_tokens": config.inference.max_tokens,
             "n_ctx": config.model.n_ctx,
+            "n_batch": config.model.n_batch,
+            "n_gpu_layers": config.hardware.n_gpu_layers,
+            "n_threads": config.hardware.n_threads,
+            "gpu_backend": detect_gpu_backend(),
+            "registered_backends": list_ggml_backends(),
+            "config_path": str(self._config_path),
         }
 
     def _set_model_path(self, model_path: str) -> dict[str, Any]:
@@ -156,17 +171,19 @@ class AgentServer:
         path = Path(model_path).expanduser()
         if not path.is_file():
             raise ServeError(f"model file not found: {model_path}")
-        text = self._config_path.read_text(encoding="utf-8")
-        escaped = "'" + str(path).replace("'", "''") + "'"
-        updated, count = re.subn(
-            r"(path:\s*)(\"[^\"]*\"|'[^']*')",
-            lambda m, replacement=escaped: m.group(1) + replacement,
-            text,
-            count=1,
+        config = self._read_config()
+        config = RuntimeConfig(
+            model=ModelConfig(
+                path=str(path),
+                n_ctx=config.model.n_ctx,
+                n_batch=config.model.n_batch,
+                n_ubatch=config.model.n_ubatch,
+            ),
+            hardware=config.hardware,
+            inference=config.inference,
         )
-        if count == 0:
-            raise ServeError("could not find model.path in config.yaml")
-        self._config_path.write_text(updated, encoding="utf-8")
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        save_config(self._config_path, config)
         with self._runner_lock:
             runner = self._runner
             self._runner = None
@@ -175,6 +192,76 @@ class AgentServer:
             if callable(unload):
                 unload(timeout_s=4.0)
         return {"model_path": str(path)}
+
+    def _update_settings(self, params: dict[str, Any]) -> dict[str, Any]:
+        config = self._read_config()
+        model = config.model
+        hardware = config.hardware
+        inference = config.inference
+        if "temperature" in params:
+            inference = InferenceConfig(
+                max_tokens=inference.max_tokens,
+                temperature=float(params["temperature"]),
+                top_p=inference.top_p,
+                stop=inference.stop,
+                repeat_penalty=inference.repeat_penalty,
+                repeat_last_n=inference.repeat_last_n,
+            )
+        if "top_p" in params:
+            inference = InferenceConfig(
+                max_tokens=inference.max_tokens,
+                temperature=inference.temperature,
+                top_p=float(params["top_p"]),
+                stop=inference.stop,
+                repeat_penalty=inference.repeat_penalty,
+                repeat_last_n=inference.repeat_last_n,
+            )
+        if "max_tokens" in params:
+            inference = InferenceConfig(
+                max_tokens=max(64, min(8192, int(params["max_tokens"]))),
+                temperature=inference.temperature,
+                top_p=inference.top_p,
+                stop=inference.stop,
+                repeat_penalty=inference.repeat_penalty,
+                repeat_last_n=inference.repeat_last_n,
+            )
+        if "n_ctx" in params:
+            model = ModelConfig(
+                path=model.path,
+                n_ctx=max(2048, min(131072, int(params["n_ctx"]))),
+                n_batch=model.n_batch,
+                n_ubatch=model.n_ubatch,
+            )
+        if "n_batch" in params:
+            model = ModelConfig(
+                path=model.path,
+                n_ctx=model.n_ctx,
+                n_batch=max(64, min(8192, int(params["n_batch"]))),
+                n_ubatch=model.n_ubatch,
+            )
+        if "n_gpu_layers" in params:
+            hardware = HardwareConfig(
+                n_gpu_layers=int(params["n_gpu_layers"]),
+                n_threads=hardware.n_threads,
+            )
+        if "n_threads" in params:
+            hardware = HardwareConfig(
+                n_gpu_layers=hardware.n_gpu_layers,
+                n_threads=max(0, int(params["n_threads"])),
+            )
+        updated = RuntimeConfig(model=model, hardware=hardware, inference=inference)
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        save_config(self._config_path, updated)
+        reload_model = bool(params.get("reload_model"))
+        if reload_model:
+            with self._runner_lock:
+                runner = self._runner
+                self._runner = None
+            if runner is not None:
+                unload = getattr(runner, "unload", None)
+                if callable(unload):
+                    unload(timeout_s=4.0)
+        return self._get_settings()
 
     def _fallback_title(self, goal: str) -> str:
         line = " ".join(goal.split()).strip()

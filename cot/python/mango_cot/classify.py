@@ -24,7 +24,7 @@ COMPLEX_KEYWORDS = (
 
 _NUMBERED_STEP = re.compile(r"(?m)^\s*\d+[\.\)]\s+\S")
 _GOAL_FILE = re.compile(
-    r"(?i)\b(?:[\w.-]+[/\\])*[\w.-]+\.(?:py|ts|tsx|js|jsx|rs|go|java|rb|cs|kt|swift)\b"
+    r"(?i)\b(?:[\w.-]+[/\\])*[\w.-]+\.(?:py|ts|tsx|js|jsx|rs|go|java|rb|cs|kt|swift|txt|csv|md|json|yaml|yml)\b"
 )
 _GOAL_FUNC_CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _GOAL_NAMED = re.compile(

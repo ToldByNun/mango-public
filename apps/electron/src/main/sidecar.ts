@@ -1,6 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { promptsDir, pythonExecutable, runtimeConfigPath } from "./paths";
+import { findRepoRoot, ensureUserRuntimeConfig, runtimeConfigPath, promptsDir, pythonExecutable } from "./paths";
 import type { AgentEvent } from "../shared/events";
 
 type Pending = {
@@ -22,6 +22,7 @@ export class Sidecar {
   constructor(
     private repoRoot: string,
     private workspace: string,
+    private configPath: string,
   ) {}
 
   setEventHandler(handler: ((event: AgentEvent) => void) | null): void {
@@ -35,22 +36,26 @@ export class Sidecar {
   async start(): Promise<void> {
     if (this.running) return;
     const python = pythonExecutable(this.repoRoot);
-    const config = runtimeConfigPath(this.repoRoot);
+    const config = this.configPath;
     this.stderrTail = "";
+    const env: Record<string, string> = {
+      ...process.env,
+      PYTHONUNBUFFERED: "1",
+      PYTHONNOUSERSITE: "1",
+      MANGO_PROMPTS_DIR: promptsDir(this.repoRoot),
+      MANGO_RUNTIME_CONFIG: config,
+    };
+    if (process.env.MANGO_GPU_BACKEND === "cuda" || process.env.MANGO_FORCE_CUDA_ENV === "1") {
+      env.GGML_CUDA_DISABLE_GRAPHS = "1";
+      env.GGML_CUDA_ENABLE_GRAPHS = "0";
+    }
     this.child = spawn(
       python,
       ["-u", "-m", "mango_agent.serve", "--config", config],
       {
         cwd: this.repoRoot,
         windowsHide: true,
-        env: {
-          ...process.env,
-          PYTHONUNBUFFERED: "1",
-          PYTHONNOUSERSITE: "1",
-          GGML_CUDA_DISABLE_GRAPHS: "1",
-          GGML_CUDA_ENABLE_GRAPHS: "0",
-          MANGO_PROMPTS_DIR: promptsDir(this.repoRoot),
-        },
+        env,
         stdio: ["pipe", "pipe", "pipe"],
       },
     );

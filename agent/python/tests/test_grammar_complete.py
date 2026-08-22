@@ -40,7 +40,9 @@ def test_complete_mode_keeps_read_file_after_pytest_fail(monkeypatch) -> None:
     assert "write_file" in names
     assert "run_tests" in names
     available = set(agent._enabled_registry_names())
-    assert missing_core_tools(names, available=available) == []
+    missing = missing_core_tools(names, available=available)
+    # Shell reads are blocked in favor of read_file on small models.
+    assert [tool for tool in missing if tool != "run_terminal_command"] == []
 
 
 def test_complete_mode_keeps_read_and_write_after_edit_fail(monkeypatch) -> None:
@@ -55,9 +57,28 @@ def test_complete_mode_keeps_read_and_write_after_edit_fail(monkeypatch) -> None
     agent._apis_declared_once = True
     agent._epistemic_once = True
     names = agent._action_tool_names()
-    assert "read_file" in names
-    assert "write_file" in names
+    assert names == ["read_file"]
     assert agent._last_preferred_tools[0] in {"read_file", "write_file", "edit_file"}
+
+
+def test_forced_single_tool_rename_after_locate(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MANGO_TOOL_FILTER_MODE", "complete")
+    agent = _agent(verification_root=tmp_path)
+    (tmp_path / "shapes.py").write_text("class Circle:\n    pass\n", encoding="utf-8")
+    agent._rename_pair = ("Circle", "Disk")
+    agent._located_once = True
+    agent._acted_once = False
+    names = agent._action_tool_names()
+    assert names == ["rename_symbol"]
+
+
+def test_forced_single_tool_read_when_edit_blocked(monkeypatch) -> None:
+    monkeypatch.setenv("MANGO_TOOL_FILTER_MODE", "complete")
+    agent = _agent()
+    agent._prefer_read_file = True
+    agent._acted_once = True
+    names = agent._action_tool_names()
+    assert names == ["read_file"]
 
 
 def test_complete_mode_design_review_prefers_read_but_keeps_edit(monkeypatch) -> None:

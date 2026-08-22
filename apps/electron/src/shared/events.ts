@@ -110,8 +110,14 @@ export type AppSettings = {
   modelPath: string;
   temperature: number;
   topP: number;
+  maxTokens: number;
   nCtx: number;
+  nGpuLayers: number;
+  nThreads: number;
   modelName: string;
+  gpuBackend?: string;
+  registeredBackends?: string[];
+  configPath?: string;
 };
 
 export type SidecarStatus = {

@@ -100,6 +100,12 @@ def _render(
 
     sections.append(f"## Goal\n{state.goal.strip()}")
 
+    if state.work_plan.strip():
+        sections.append("## Work plan\n" + state.work_plan.strip())
+
+    if state.impl_status.strip():
+        sections.append("## Implementation status\n" + state.impl_status.strip())
+
     memory_text = ""
     if getattr(state, "memory", None) is not None and not state.memory.is_empty():
         memory_text = state.memory.render(max_chars=state.budget.memory_max_chars)
@@ -156,7 +162,12 @@ def _render(
 
 
 def build_idle_retry_prompt(context_state: ContextState) -> str:
-    """Tiny follow-up after a no-tool reply — keep Goal short to avoid thought re-planning."""
+    """Follow-up after a no-tool reply.
+
+    Keeps the goal plus the most recent tool result so the model still knows
+    what the last command produced (a traceback, a file body). Dropping those
+    makes small models restate the plan forever instead of acting on evidence.
+    """
     sections: list[str] = [
         "Your previous reply had no tool call. Do not give a final answer.",
     ]
@@ -168,12 +179,20 @@ def build_idle_retry_prompt(context_state: ContextState) -> str:
         if len(first) > 160:
             first = first[:157].rstrip() + "…"
         sections.append(f"## Goal\n{first}")
+    if context_state.work_plan.strip():
+        sections.append("## Work plan\n" + context_state.work_plan.strip())
+    if context_state.impl_status.strip():
+        sections.append("## Implementation status\n" + context_state.impl_status.strip())
     if getattr(context_state, "memory", None) is not None and not context_state.memory.is_empty():
         memory_text = context_state.memory.render(max_chars=min(400, context_state.budget.memory_max_chars))
         if memory_text:
             sections.append("## Memory\n" + memory_text)
     if context_state.verification_feedback.strip():
         sections.append("## Verification\n" + context_state.verification_feedback.strip())
+    recent = [entry for entry in context_state.tool_results[-2:] if entry.body.strip()]
+    if recent:
+        blocks = [_format_result(entry) for entry in recent]
+        sections.append("## Latest tool result\n" + "\n\n".join(blocks))
     if context_state.relevant_files:
         files = "\n".join(f"- {path}" for path in context_state.relevant_files[-8:])
         sections.append(f"## Relevant files\n{files}")

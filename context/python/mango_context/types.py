@@ -68,6 +68,8 @@ class ContextState:
     tool_instruction: str = ""
     available_tools: list[ToolSpec] = field(default_factory=list)
     reasoning_summary: str = ""
+    work_plan: str = ""
+    impl_status: str = ""
     verification_feedback: str = ""
     verification_failed_tests: list[str] = field(default_factory=list)
     verification_impl_paths: list[str] = field(default_factory=list)

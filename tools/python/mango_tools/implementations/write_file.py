@@ -65,6 +65,7 @@ def write_file(
         bytes_written=len(content.encode(encoding)),
         created=True,
     )
+    result["line_count"] = len(content.splitlines())
     syntax_error = python_syntax_error(file_path, source=content)
     if syntax_error:
         result["syntax_error"] = syntax_error
