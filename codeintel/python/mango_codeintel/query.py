@@ -10,7 +10,9 @@ from mango_codeintel.types import FileHit, GitSnapshot, RefHit, SymbolHit
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _REF_HINTS = ("call", "called", "aufruf", "aufgerufen", "used", "usage", "reference", "referenz")
-_DEF_HINTS = ("defin", "definition", "where is", "wo ist", "signature", "signatur")
+# Word-ish phrases only — bare "defin" matches "definitions" in NL questions and
+# forces definition mode with no symbol → empty result (agent lookup loops).
+_DEF_HINTS = ("where is", "wo ist", "wo wird", "signature of", "signatur von", "defined in")
 _IMPACT_HINTS = ("impact", "abhängig", "affects", "depends", "dependency", "repo map", "who imports")
 _TEST_FILE = re.compile(r"(?:^|/)tests?(?:/|$)|(?:^|/)test_[^/]+\.py$|_test\.py$")
 
@@ -103,10 +105,28 @@ class CodeQuery:
             if mode == "auto" and _wants_references(lowered):
                 result["kind"] = "references"
             result["references"] = [hit.to_dict() for hit in refs]
-        if mode == "files" or (mode == "auto" and not symbol):
+        # Always fall back to file search when no symbol matched — otherwise
+        # definition/references mode returns success with empty lists and the
+        # agent loops on the same NL query.
+        need_files = (
+            mode == "files"
+            or not symbol
+            or (mode == "auto" and "files" not in result)
+            or (
+                mode in {"definition", "references"}
+                and not (result.get("definitions") or result.get("references"))
+            )
+        )
+        if need_files:
             result["files"] = [hit.to_dict() for hit in self.get_relevant_files(query)]
-        if mode == "auto" and symbol and "files" not in result:
-            result["files"] = [hit.to_dict() for hit in self.get_relevant_files(query)]
+            if not symbol and mode in {"definition", "references"} and result["files"]:
+                result["kind"] = "files"
+                result["note"] = (
+                    f"no indexed symbol for this query; fell back to file search "
+                    f"({len(result['files'])} hits)"
+                )
+            elif not symbol and not result["files"]:
+                result["note"] = "no symbol or file hits — try search_code / list_dir / glob_files"
         path_hint = _pick_path(query) if (mode == "impact" and not symbol) else None
         if mode == "impact" or symbol or path_hint:
             if mode == "impact":

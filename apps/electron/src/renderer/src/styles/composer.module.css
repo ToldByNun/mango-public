@@ -130,6 +130,7 @@
 }
 
 .inputWrap {
+  position: relative;
   min-height: 32px;
   padding: 5px 0 1px;
 }
@@ -462,4 +463,150 @@
 
 button.metaItem:hover {
   color: var(--text-secondary);
+}
+
+/* Discord-style slash command popup + active indicator */
+.slashPopup {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  z-index: 40;
+  overflow: hidden;
+}
+
+.slashPopupHeader {
+  padding: 8px 12px 6px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-family: var(--font-ui);
+}
+
+.slashList {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 4px;
+}
+
+.slashRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 8px 12px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+
+.slashRow:hover,
+.slashRowActive {
+  background: var(--surface-3);
+}
+
+.slashIcon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-default);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.slashBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.slashName {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  color: var(--accent);
+  font-family: var(--font-ui);
+}
+
+.slashDesc {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-tertiary);
+  font-family: var(--font-ui);
+}
+
+.slashSource {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-ui);
+}
+
+.slashTip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  margin: 0 0 4px;
+  padding: 1px 0;
+  max-width: 100%;
+}
+
+.slashTipLabel {
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+}
+
+.slashTipHint {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-family: var(--font-ui);
+}
+
+.inputStack {
+  position: relative;
+  min-height: 22px;
+}
+
+.inputHighlight {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  font-family: inherit;
+  color: var(--text-primary);
+}
+
+.slashInInput {
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+}
+
+.inputOverHighlight {
+  color: transparent;
+  caret-color: var(--text-primary);
+}
+
+.inputOverHighlight::placeholder {
+  color: transparent;
 }

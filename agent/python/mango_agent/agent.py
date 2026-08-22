@@ -74,9 +74,22 @@ _CODE_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "edit_symbol", "ren
 _WORK_TOOLS = _CODE_MUTATING_TOOLS | {"run_tests", "run_terminal_command"}
 _RESEARCH_TOOLS = frozenset({"web_research", "doc_lookup", "package_source_lookup"})
 _ACTING_TOOLS = _WORK_TOOLS | _RESEARCH_TOOLS
-_INSPECT_TOOLS = frozenset({"search_code", "read_file", "codebase_lookup", "ask_epistemic"})
-_PLAN_READONLY = frozenset({"read_file", "search_code", "codebase_lookup"})
-_PLAN_ALLOWED = _PLAN_READONLY | {"declare_apis", "ask_epistemic"}
+_INSPECT_TOOLS = frozenset(
+    {"search_code", "read_file", "codebase_lookup", "ask_epistemic", "research_codebase"}
+)
+# Read-only research surface for /plan and /ask (must match registered tool names).
+_PLAN_READONLY = frozenset(
+    {
+        "read_file",
+        "search_code",
+        "codebase_lookup",
+        "list_dir",
+        "glob_files",
+    }
+)
+_PLAN_ALLOWED = _PLAN_READONLY | {"declare_apis", "ask_epistemic", "research_codebase"}
+_PLAN_RECOVERY_CORE = _PLAN_ALLOWED
+_PROTOCOL_MODES = frozenset({"ask", "plan", "debug", "refactor", "agent", "work", "epistemic_codebase"})
 _TEST_ONLY_LIBS = frozenset(
     {
         "unittest",
@@ -305,8 +318,12 @@ class Agent:
         disabled_tools: frozenset[str] | set[str] | None = None,
         research_targets: list[tuple[str, str]] | None = None,
         thinking_level: str | None = None,
+        plan_mode: bool = False,
+        agent_mode: str = "",
     ) -> None:
         self._model = model_runner
+        self._plan_mode = plan_mode
+        self._agent_mode = str(agent_mode or "").strip().lower()
         self._limits = _merge_limits(
             limits,
             max_iterations=max_iterations,
@@ -317,7 +334,15 @@ class Agent:
             max_epistemic_iterations=max_epistemic_iterations,
         )
         self._deadline: float | None = None
-        self._disabled_tools = frozenset(disabled_tools or ())
+        blocked = set(disabled_tools or ())
+        if plan_mode:
+            # Read-only research: no code mutations, shell, measures, or tests.
+            blocked |= set(_CODE_MUTATING_TOOLS) | {
+                "run_terminal_command",
+                "measure",
+                "run_tests",
+            }
+        self._disabled_tools = frozenset(blocked)
         if tool_registry is None:
             self._registry = create_default_registry()
             self._epistemic: EpistemicEngine | None = register_ask_epistemic(
@@ -327,6 +352,18 @@ class Agent:
                 max_iterations=self._limits.max_epistemic_iterations,
                 get_deadline=lambda: self._deadline,
             )
+            try:
+                from mango_epistemic.codebase_research import register_research_codebase
+
+                register_research_codebase(
+                    self._registry,
+                    self._model,
+                    get_workspace=lambda: self._declared_workspace or self._verification_root,
+                    get_deadline=lambda: self._deadline,
+                    max_iterations=max(6, int(self._limits.max_epistemic_iterations or 8)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mango] research_codebase unavailable: {exc}", file=sys.stderr, flush=True)
             if "codebase_lookup" in self._disabled_tools:
                 self._codeintel = None
             else:
@@ -337,6 +374,10 @@ class Agent:
             self._epistemic = None
             self._codeintel = None
         self._thinking = thinking_preset(thinking_level)
+        # Protocol modes need chained CoT (thought_1..n → thought_final) even if UI left thinking off.
+        if self._agent_mode in _PROTOCOL_MODES and self._agent_mode != "epistemic_codebase":
+            if self._thinking.chain_steps < 2:
+                self._thinking = thinking_preset("think")
         self._system_prompt = system_prompt or compose_agent_system_prompt(self._thinking.level)
         self._use_tool_grammar = use_tool_grammar
         self._max_tokens = max_tokens
@@ -612,6 +653,11 @@ class Agent:
         return all(lib.lower() in blob for lib in needed)
 
     def _note_plan_progress(self, engine: ContextEngine, tool_results: list[ToolResult]) -> None:
+        if self._plan_mode:
+            # Plan runs: any successful (read-only) tool counts as acted; no API gates.
+            if any(result.success for result in tool_results):
+                self._acted_once = True
+            return
         if not self._plan_apis_enabled():
             return
         for result in tool_results:
@@ -958,7 +1004,60 @@ class Agent:
             engine.set_verification_feedback(feedback("cli_skeleton_first"))
             self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
             self._write_tool_max_tokens = _CLI_SKELETON_WRITE_MAX_TOKENS
-        engine.set_work_plan(build_work_plan(task))
+        if self._agent_mode == "ask":
+            engine.set_work_plan(
+                "ASK protocol:\n"
+                "1. Summarize what the user wants (one line)\n"
+                "2. For each topic area → research_codebase (local) and/or ask_epistemic (third-party)\n"
+                "3. Final in-depth answer tailored to the question — no file mutations, no run_tests"
+            )
+        elif self._agent_mode == "plan":
+            engine.set_work_plan(
+                "PLAN protocol:\n"
+                "1. Summarize the user's vision (goal, not solution)\n"
+                "2. If blocked: prepare several Qs with options, send ONE, wait for reply; else list assumptions\n"
+                "3. research_codebase for inventory when a workspace exists\n"
+                "4. CoT options → CoT plan shaping → emit structured plan (no mutations)"
+            )
+        elif self._agent_mode == "debug":
+            engine.set_work_plan(
+                "DEBUG protocol:\n"
+                "1. Observed vs expected (+ repro / stack if any)\n"
+                "2. research_codebase around failure + call chain\n"
+                "3. CoT: ranked hypotheses\n"
+                "4. Loop: verify hypothesis → fix if confirmed → regression test\n"
+                "5. Final: root cause, change, prevention"
+            )
+        elif self._agent_mode == "refactor":
+            engine.set_work_plan(
+                "REFACTOR protocol:\n"
+                "1. What + why (readability/perf/structure/duplication/testability)\n"
+                "2. research_codebase including callers/dependents + API contracts\n"
+                "3. CoT strategy (risk-ordered)\n"
+                "4. Loop: refactor slice → run existing tests (behavior unchanged)\n"
+                "5. Final before/after API summary"
+            )
+        elif self._plan_mode:
+            engine.set_work_plan(
+                "Research plan (read-only):\n"
+                "1. research_codebase / list_dir / glob_files / search_code / codebase_lookup\n"
+                "2. read_file concrete sources\n"
+                "3. ask_epistemic only for third-party APIs\n"
+                "4. Answer in chat — never mutate or run_tests"
+            )
+        elif self._agent_mode in {"agent", "work"}:
+            engine.set_work_plan(
+                "AGENT protocol:\n"
+                "1. Summarize task\n"
+                "2. Define APIs/interfaces\n"
+                "3. research_codebase (+ ask_epistemic after declare_apis for third-party)\n"
+                "4. CoT implementation order\n"
+                "5. Loop: implement slice → test when testable → next slice\n"
+                "6. Final in-depth summary (files, APIs, verification, open points)\n"
+                + build_work_plan(task)
+            )
+        else:
+            engine.set_work_plan(build_work_plan(task))
         self._seed_impl_status(engine)
         steps: list[AgentStep] = []
         final_answer = ""
@@ -1957,6 +2056,9 @@ class Agent:
         return self._remaining_seconds() <= 0
 
     def _finish_allowed(self) -> bool:
+        if self._plan_mode:
+            # Plan runs deliver a markdown plan in the chat: no impl gates apply.
+            return self._acted_once or not self._require_tools
         if self._syntax_broken:
             return False
         if self._rename_still_needed():
@@ -2392,6 +2494,9 @@ class Agent:
         self._stall_repeats = 0
 
     def _needs_tool(self) -> bool:
+        if self._plan_mode:
+            # One successful read/lookup is enough; then the plan markdown may finish.
+            return not self._acted_once
         if self._syntax_broken:
             return True
         if self._rename_still_needed():
@@ -2534,7 +2639,8 @@ class Agent:
         """Grammar completeness: never drop recovery-core tools that exist in the registry."""
         enabled = set(self._enabled_registry_names())
         have = set(names)
-        for name in sorted(RECOVERY_CORE_TOOLS):
+        core = _PLAN_RECOVERY_CORE if self._plan_mode else RECOVERY_CORE_TOOLS
+        for name in sorted(core):
             if name in enabled and name not in have:
                 names.append(name)
                 have.add(name)
@@ -2550,20 +2656,49 @@ class Agent:
                 if name in available and name not in preferred:
                     preferred.append(name)
 
+        if self._plan_mode:
+            if not self._acted_once:
+                _add(
+                    "research_codebase",
+                    "search_code",
+                    "codebase_lookup",
+                    "list_dir",
+                    "glob_files",
+                    "read_file",
+                )
+            else:
+                _add(
+                    "research_codebase",
+                    "read_file",
+                    "search_code",
+                    "codebase_lookup",
+                    "ask_epistemic",
+                )
+            return preferred[:5]
+
         phase = self._plan_gate_phase()
         if phase == "declare":
-            _add("declare_apis", "ask_epistemic", "read_file", "search_code")
+            _add("declare_apis", "ask_epistemic", "research_codebase", "read_file", "search_code")
         elif phase == "epistemic":
-            _add("ask_epistemic", "read_file", "search_code")
+            _add("ask_epistemic", "research_codebase", "read_file", "search_code")
+        elif self._agent_mode in {"agent", "work", "debug", "refactor"} and not self._acted_once:
+            _add(
+                "research_codebase",
+                "declare_apis",
+                "ask_epistemic",
+                "search_code",
+                "codebase_lookup",
+                "read_file",
+            )
         elif self._research_still_required():
             _add("doc_lookup", "package_source_lookup", "web_research")
         elif self._design_review_still_required():
             _add("read_file")
         elif self._inspect_before_edit() and not self._inspected_once:
             if self._located_once:
-                _add("read_file", "search_code", "codebase_lookup")
+                _add("read_file", "research_codebase", "search_code", "codebase_lookup")
             else:
-                _add("search_code", "codebase_lookup", "read_file")
+                _add("research_codebase", "search_code", "codebase_lookup", "read_file")
         elif self._tests_still_required() and phase is None:
             if self._prefer_read_file:
                 _add("read_file", "edit_file", "write_file", "run_tests")
@@ -2616,6 +2751,18 @@ class Agent:
     def _action_tool_names_complete(self) -> list[str]:
         """GBNF completeness mode: recovery-core always present; preference via prompt only."""
         names = self._enabled_registry_names()
+        if self._plan_mode:
+            # Hard allowlist — never reintroduce write/edit/run_tests via recovery-core.
+            names = [name for name in names if name in _PLAN_ALLOWED]
+            names = self._ensure_recovery_core(names)
+            names = [name for name in names if name in _PLAN_ALLOWED]
+            preferred = self._preferred_action_tools(names)
+            self._last_preferred_tools = preferred
+            if preferred:
+                head = [name for name in preferred if name in names]
+                tail = [name for name in names if name not in head]
+                return head + tail
+            return names
         excluded = self._profile_excluded_optional()
         if excluded:
             names = [name for name in names if name not in excluded or name in RECOVERY_CORE_TOOLS]
@@ -2771,10 +2918,21 @@ class Agent:
         if phase == "declare" and "declare_apis" in names:
             names = [
                 "declare_apis",
-                *[name for name in names if name == "ask_epistemic" or name in _PLAN_READONLY],
+                *[
+                    name
+                    for name in names
+                    if name in {"ask_epistemic", "research_codebase"} or name in _PLAN_READONLY
+                ],
             ]
         elif phase == "epistemic" and "ask_epistemic" in names:
-            names = ["ask_epistemic", *[name for name in names if name in _PLAN_READONLY]]
+            ordered = ["ask_epistemic", "research_codebase"]
+            ordered.extend(name for name in names if name in _PLAN_READONLY)
+            seen: set[str] = set()
+            names = []
+            for name in ordered:
+                if name not in seen and name in set(self._enabled_registry_names()):
+                    seen.add(name)
+                    names.append(name)
         if (
             self._plan_apis_enabled()
             and self._epistemic_once
@@ -3730,6 +3888,8 @@ class Agent:
         tool_results: list[ToolResult],
         iteration: int,
     ) -> list[ToolResult]:
+        if self._plan_mode:
+            return []
         if not self._require_tools:
             return []
         if any(result.tool_name == "run_tests" for result in tool_results):
@@ -4437,6 +4597,7 @@ class Agent:
                 "edit_symbol",
                 "rename_symbol",
                 "search_code",
+                "codebase_lookup",
             }:
                 continue
             output = getattr(result, "output", None)
@@ -4450,6 +4611,16 @@ class Agent:
                         continue
                     found_paths.append(match_path)
                     if len(found_paths) >= 2:
+                        break
+            elif name == "codebase_lookup" and isinstance(output, dict):
+                for item in list(output.get("definitions") or []) + list(output.get("files") or []):
+                    if not isinstance(item, dict) or not item.get("path"):
+                        continue
+                    match_path = str(item["path"])
+                    if _looks_like_test_path(match_path):
+                        continue
+                    found_paths.append(match_path)
+                    if len(found_paths) >= 3:
                         break
             elif isinstance(output, dict):
                 if output.get("path"):
@@ -4833,6 +5004,8 @@ class Agent:
             if err:
                 parts.append(err[:400])
             return "\n".join(parts)[:1_500]
+        if result.tool_name == "codebase_lookup":
+            return _format_codebase_lookup_body(output)[:1_500]
         if result.tool_name in {"ask_epistemic", "package_source_lookup", "doc_lookup"}:
             details = str(output.get("details") or "").strip()
             signature = str(output.get("signature") or "").strip()
@@ -5420,6 +5593,48 @@ def _compact_result(result: ToolResult) -> str:
         if replacements is not None:
             return f"replacements={replacements}"
     return ""
+
+
+def _format_codebase_lookup_body(output: dict[str, Any]) -> str:
+    """Human-readable chip body — without this the UI only shows 'pass'."""
+    lines: list[str] = []
+    note = str(output.get("note") or "").strip()
+    if note:
+        lines.append(note)
+    symbol = output.get("symbol")
+    kind = output.get("kind")
+    if symbol or kind:
+        lines.append(f"symbol={symbol or '-'}  kind={kind or '-'}")
+    defs = output.get("definitions") or []
+    if isinstance(defs, list) and defs:
+        lines.append(f"definitions ({len(defs)}):")
+        for item in defs[:6]:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path") or "?"
+            name = item.get("name") or item.get("qualname") or ""
+            sig = str(item.get("signature") or "").strip()
+            bit = f"  {path} :: {name}"
+            if sig:
+                bit = f"{bit}  {sig[:80]}"
+            lines.append(bit)
+    files = output.get("files") or []
+    if isinstance(files, list) and files:
+        lines.append(f"files ({len(files)}):")
+        for item in files[:8]:
+            if isinstance(item, dict) and item.get("path"):
+                score = item.get("score")
+                suffix = f"  ({score})" if score is not None else ""
+                lines.append(f"  {item['path']}{suffix}")
+    refs = output.get("references") or []
+    if isinstance(refs, list) and refs:
+        lines.append(f"references ({len(refs)}):")
+        for item in refs[:6]:
+            if isinstance(item, dict) and item.get("path"):
+                lines.append(f"  {item['path']}:{item.get('line', '?')}")
+    if not lines:
+        return "no hits"
+    return "\n".join(lines)
 
 
 def _compact_lookup(data: dict[str, Any]) -> str:

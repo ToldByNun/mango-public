@@ -136,7 +136,12 @@ class AgentServer:
                 runner = ModelRunner(str(self._config_path))
                 runner.load()
                 self._runner = runner
+                freshly_loaded = True
+            else:
+                freshly_loaded = False
         config = load_config(self._config_path)
+        if freshly_loaded:
+            self.emit("model.loaded", {"model_path": config.model.path})
         return {
             "status": "loaded",
             "model_path": config.model.path,
@@ -294,6 +299,7 @@ class AgentServer:
                 thought_max_tokens = max(32, min(4096, int(thought_raw)))
             except (TypeError, ValueError):
                 thought_max_tokens = None
+        mode = str(params.get("mode") or "")
         if not goal.strip():
             self._busy = False
             raise ServeError("goal is empty")
@@ -301,10 +307,19 @@ class AgentServer:
             # Keep request acknowledgement and model execution independent.
             # A deterministic title is instant and avoids a second, serial model
             # completion before the agent thread has even started.
-            self.emit("agent.title", {"title": self._fallback_title(goal)})
+            title = self._fallback_title(goal)
+            mode_prefix = {
+                "plan": "[Plan]",
+                "ask": "[Ask]",
+                "debug": "[Debug]",
+                "refactor": "[Refactor]",
+            }.get(mode, "")
+            if mode_prefix and not title.startswith(mode_prefix):
+                title = f"{mode_prefix} {title}"
+            self.emit("agent.title", {"title": title})
         thread = threading.Thread(
             target=self._run,
-            args=(str(workspace), goal, thinking_level, thought_max_tokens),
+            args=(str(workspace), goal, thinking_level, thought_max_tokens, mode),
             daemon=True,
             name="agent-run",
         )
@@ -318,6 +333,7 @@ class AgentServer:
         goal: str,
         thinking_level: str = "off",
         thought_max_tokens: int | None = None,
+        mode: str = "",
     ) -> None:
         try:
             if self._runner is None:
@@ -328,29 +344,129 @@ class AgentServer:
             )
             print(
                 f"[mango] agent loop workspace={workspace} thinking={preset.level} "
-                f"thought_max_tokens={effective_thought}",
+                f"thought_max_tokens={effective_thought} mode={mode or 'code'}",
                 file=sys.stderr,
                 flush=True,
             )
-            orch = Orchestrator(
-                self._runner,
-                workspace=workspace,
-                limits=AgentLimits(
-                    max_iterations=20,
-                    max_runtime_seconds=900,
-                    max_prompt_chars=24_000,
-                    max_reasoning_cycles=preset.max_reasoning_cycles,
-                    max_epistemic_iterations=8,
-                ),
-                max_tokens=4096,
-                on_event=self._on_agent_event,
-                require_tools=True,
-                plan_apis_first=True,
-                task_wants_tests=True,
-                thought_max_tokens=effective_thought,
-                tool_max_tokens=3072,
-                thinking_level=preset.level,
-            )
+            from mango_agent.prompt import load_system_prompt
+
+            if mode == "plan":
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=12,
+                        max_runtime_seconds=600,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=8,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    system_prompt=load_system_prompt("plan"),
+                    require_tools=True,
+                    plan_mode=True,
+                    plan_apis_first=False,
+                    task_wants_tests=False,
+                    disabled_tools=frozenset({"declare_apis"}),
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=3072,
+                    thinking_level=preset.level,
+                    agent_mode="plan",
+                )
+            elif mode == "ask":
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=14,
+                        max_runtime_seconds=600,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=8,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    system_prompt=load_system_prompt("ask"),
+                    require_tools=True,
+                    plan_mode=True,
+                    plan_apis_first=False,
+                    task_wants_tests=False,
+                    disabled_tools=frozenset({"declare_apis"}),
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=3072,
+                    thinking_level=preset.level,
+                    agent_mode="ask",
+                )
+            elif mode == "refactor":
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=16,
+                        max_runtime_seconds=600,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=6,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    system_prompt=load_system_prompt("refactor"),
+                    require_tools=True,
+                    plan_apis_first=False,
+                    task_wants_tests=False,
+                    disabled_tools=frozenset(
+                        {"write_file", "delete_file", "run_terminal_command", "measure"}
+                    ),
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=3072,
+                    thinking_level=preset.level,
+                    agent_mode="refactor",
+                )
+            elif mode == "debug":
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=20,
+                        max_runtime_seconds=900,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=8,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    system_prompt=load_system_prompt("debug"),
+                    require_tools=True,
+                    plan_apis_first=True,
+                    task_wants_tests=True,
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=3072,
+                    thinking_level=preset.level,
+                    agent_mode="debug",
+                )
+            else:
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=20,
+                        max_runtime_seconds=900,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=8,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    require_tools=True,
+                    plan_apis_first=True,
+                    # None = detect from goal. Forcing True made every Q&A run try pytest.
+                    task_wants_tests=None,
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=3072,
+                    thinking_level=preset.level,
+                    agent_mode="agent",
+                )
             self._current_agent = orch.agent
             result = orch.run(goal)
             self.emit(
@@ -381,6 +497,23 @@ class AgentServer:
                         consumed.add(path.name)
             self._current_agent = None
             self._run_thread = None
+            # Free VRAM after every prompt (finish or cancel). Keeping a large GGUF
+            # resident between turns has been crashing Windows hosts; reload on
+            # the next run is cheaper than an OS-level GPU hang.
+            try:
+                print(
+                    "[mango] run ended — unloading model to free VRAM",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._unload_runner(timeout_s=4.0)
+                self.emit("model.unloaded", {})
+            except Exception as unload_exc:  # noqa: BLE001
+                print(
+                    f"[mango] unload after run failed: {unload_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self._busy = False
 
     def _on_agent_event(self, message: dict[str, Any]) -> None:
@@ -394,7 +527,45 @@ class AgentServer:
         agent = self._current_agent
         if agent is not None:
             agent.cancel()
+        # If the run is stuck inside CUDA decode, finally never runs and VRAM stays
+        # pinned — that has been crashing Windows. After a short grace period, drop
+        # the llama handle without waiting for a CUDA free (same strategy as exit).
+        threading.Thread(
+            target=self._cancel_unload_watchdog,
+            name="mango-cancel-unload",
+            daemon=True,
+        ).start()
         return {"status": "cancelling"}
+
+    def _cancel_unload_watchdog(self) -> None:
+        self._join_run(12.0)
+        if not self._busy:
+            return
+        print(
+            "[mango] cancel watchdog — run still busy; abandoning model handle",
+            file=sys.stderr,
+            flush=True,
+        )
+        with self._runner_lock:
+            runner = self._runner
+            self._runner = None
+        if runner is None:
+            return
+        llama = getattr(runner, "_llama", None)
+        if llama is not None:
+            try:
+                llama._closed = True
+                llama.close = lambda *args, **kwargs: None  # type: ignore[method-assign]
+            except Exception:
+                pass
+            try:
+                runner._llama = None
+            except Exception:
+                pass
+        try:
+            self.emit("model.unloaded", {"forced": True})
+        except Exception:
+            pass
 
     def _continue_stall(self) -> dict[str, Any]:
         agent = self._current_agent

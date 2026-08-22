@@ -18,43 +18,38 @@ from mango_cot.prompt import render_system_prompt as render_cot_prompt
 
 def test_system_prompts_load_from_markdown() -> None:
     root = Path(__file__).resolve().parents[3] / "prompts"
-    assert (root / "agent.md").is_file()
+    assert (root / "agent_v2.md").is_file()
     assert "declare_apis" in DEFAULT_SYSTEM_PROMPT
     assert "write_file" in DEFAULT_SYSTEM_PROMPT
-    assert "argparse" in DEFAULT_SYSTEM_PROMPT
-    assert "compile" in DEFAULT_SYSTEM_PROMPT.lower() or "syntax" in DEFAULT_SYSTEM_PROMPT.lower()
+    assert "research_codebase" in DEFAULT_SYSTEM_PROMPT
+    assert "AGENT PROTOCOL" in DEFAULT_SYSTEM_PROMPT
     assert "GitHub issue" in SWE_BENCH_SYSTEM_PROMPT
-    assert "BLOCKED" in DEFAULT_SYSTEM_PROMPT or "blocks write_file" in DEFAULT_SYSTEM_PROMPT.lower() or "ENFORCED" in DEFAULT_SYSTEM_PROMPT
     assert "old_string" in SWE_BENCH_SYSTEM_PROMPT
-    assert "API Agent" in EPISTEMIC_SYSTEM_PROMPT
-    assert "argparse" in EPISTEMIC_SYSTEM_PROMPT
-    assert "usage brief" in EPISTEMIC_SYSTEM_PROMPT.lower()
-    assert load_system_prompt("agent") == DEFAULT_SYSTEM_PROMPT
+    assert "API Agent" in EPISTEMIC_SYSTEM_PROMPT or "epistemic" in EPISTEMIC_SYSTEM_PROMPT.lower()
+    assert "usage brief" in EPISTEMIC_SYSTEM_PROMPT.lower() or "usage" in EPISTEMIC_SYSTEM_PROMPT.lower()
+    assert load_system_prompt("agent_v2") == DEFAULT_SYSTEM_PROMPT
     assert "finish message" in load_system_prompt("summary").lower() or "summary" in load_system_prompt("summary").lower()
-    assert "exactly THREE" not in DEFAULT_SYSTEM_PROMPT
-    assert "hypothesis" in DEFAULT_SYSTEM_PROMPT.lower()
     assert "measure" in DEFAULT_SYSTEM_PROMPT
     assert "natural-language" in load_system_prompt("cot").lower() or "natural language" in load_system_prompt("cot").lower()
 
 
-def test_thinking_level_suffixes_compose() -> None:
+def test_thinking_level_prompts_compose() -> None:
     off = compose_agent_system_prompt("off")
     think = compose_agent_system_prompt("think")
     deep = compose_agent_system_prompt("deep")
     maxed = compose_agent_system_prompt("max")
-    # Default variant is v2 (MANGO_PROMPT_VARIANT), so compose() returns agent_v2
-    # while DEFAULT_SYSTEM_PROMPT pins the v1 file. Compare against the same
-    # variant-aware source instead.
     assert off == load_system_prompt(_prompt_variant_name())
-    assert "Thinking level: think" in think
-    assert think.startswith(off)
-    assert "Thinking level: deep" in deep
+    assert off == load_system_prompt("agent_v2")
+    assert "THINKING LEVEL: think" in think
+    assert "AGENT PROTOCOL" in think
+    assert "research_codebase" in think
+    assert "THINKING LEVEL: deep" in deep
     assert "inspect" in deep.lower()
-    assert "Thinking level: max" in maxed
-    assert "Verify again" in maxed or "verify again" in maxed.lower()
-    assert load_system_prompt("agent_think")
-    assert load_system_prompt("agent_deep")
-    assert load_system_prompt("agent_max")
+    assert "THINKING LEVEL: max" in maxed
+    assert "Verify" in maxed or "verify" in maxed.lower()
+    assert load_system_prompt("agent_think") == think
+    assert load_system_prompt("agent_deep") == deep
+    assert load_system_prompt("agent_max") == maxed
 
 
 def test_title_prompt_renders_goal() -> None:

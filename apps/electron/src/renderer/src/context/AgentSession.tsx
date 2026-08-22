@@ -1,7 +1,22 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { AgentEvent, Session, TranscriptBlock } from "@shared/events";
 import { applyAgentEvent, composeAgentGoal, createSession, newId } from "../lib/session";
+import { parseSlashGoal } from "../lib/slashCommands";
 import { loadThoughtMaxTokens } from "../lib/thoughtTokens";
+
+function looksLikeQuestionOnly(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  const asksChange =
+    /\b(fix|implement|add|create|write|edit|refactor|debug|rename|delete|remove|baue|schreib|implementier|reparier|ändere|aendere)\b/i.test(
+      t,
+    );
+  if (asksChange) return false;
+  if (/^(what|who|where|when|why|how|which|welche[rs]?|was|wie|warum|wieso|wo|wer|erkl[äa]r)\b/i.test(t)) {
+    return true;
+  }
+  return /\?\s*$/.test(t);
+}
 
 type MangoApi = typeof window.mango;
 
@@ -237,6 +252,33 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
 
   const send = useCallback(
     async (goal: string, attachments: string[], thinkingLevel: string = "off"): Promise<boolean> => {
+      const parsed = parseSlashGoal(goal);
+      if (parsed.kind === "clear") {
+        let sessionId = activeId;
+        let list = sessions;
+        if (!sessionId) {
+          const session = createSession(workspace);
+          list = [session, ...sessions];
+          persist(list);
+          setActiveId(session.id);
+          sessionId = session.id;
+        }
+        const cleared = list.map((item) =>
+          item.id === sessionId
+            ? {
+                ...item,
+                messages: [],
+                status: "idle" as const,
+                updatedAt: Date.now(),
+              }
+            : item,
+        );
+        persist(cleared);
+        setTokens(0);
+        setSidecarError(null);
+        return true;
+      }
+
       let activeWorkspace = workspace;
       if (!activeWorkspace) {
         const picked = await api().workspace.pick();
@@ -246,10 +288,28 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
         setBranch(await api().workspace.branch().catch(() => "no git"));
       }
 
+      const mode =
+        parsed.kind === "mode"
+          ? parsed.mode
+          : looksLikeQuestionOnly(parsed.cleanGoal)
+            ? "ask"
+            : "";
+      const cleanGoal = parsed.cleanGoal;
+      if (!cleanGoal) return false;
+
       let sessionId = activeId;
       let list = sessions;
       if (!sessionId) {
         const session = createSession(activeWorkspace);
+        if (mode === "plan") {
+          session.title = "[Plan] New agent";
+        } else if (mode === "ask") {
+          session.title = "[Ask] New agent";
+        } else if (mode === "debug") {
+          session.title = "[Debug] New agent";
+        } else if (mode === "refactor") {
+          session.title = "[Refactor] New agent";
+        }
         list = [session, ...sessions];
         persist(list);
         setActiveId(session.id);
@@ -258,24 +318,44 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
       const existing = list.find((item) => item.id === sessionId);
       const generateTitle = (existing?.messages.length ?? 0) === 0;
       const userText =
-        attachments.length > 0 ? `Files: ${attachments.join(", ")}\n\n${goal}` : goal;
+        attachments.length > 0 ? `Files: ${attachments.join(", ")}\n\n${cleanGoal}` : cleanGoal;
       const priorUsers = (existing?.messages ?? [])
         .filter((item) => item.kind === "user")
         .map((item) => item.text);
       const lastFinal = [...(existing?.messages ?? [])]
         .reverse()
         .find((item) => item.kind === "final" && item.text.trim());
-      const runGoal = composeAgentGoal(
-        priorUsers,
-        userText,
-        lastFinal && lastFinal.kind === "final" ? lastFinal.text : "",
-      );
+      // Mode prompts must not inherit the "Then edit. Then run_tests..." follow-up suffix.
+      const skipCompose = mode === "plan" || mode === "ask" || mode === "refactor" || mode === "debug";
+      const runGoal = skipCompose
+        ? userText
+        : composeAgentGoal(
+            priorUsers,
+            userText,
+            lastFinal && lastFinal.kind === "final" ? lastFinal.text : "",
+          );
+      const displayText =
+        parsed.kind === "mode"
+          ? parsed.display
+          : mode === "ask"
+            ? `/ask ${userText}`
+            : userText;
       const userBlock: TranscriptBlock = {
         id: newId(),
         kind: "user",
-        text: userText,
+        text: displayText,
         createdAt: Date.now(),
       };
+      const modeTitlePrefix =
+        mode === "plan"
+          ? "[Plan]"
+          : mode === "ask"
+            ? "[Ask]"
+            : mode === "debug"
+              ? "[Debug]"
+              : mode === "refactor"
+                ? "[Refactor]"
+                : "";
       const next = list.map((item) =>
         item.id === sessionId
           ? {
@@ -284,6 +364,11 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
               status: "running" as const,
               updatedAt: Date.now(),
               messages: [...item.messages, userBlock],
+              ...(generateTitle && modeTitlePrefix
+                ? {
+                    title: `${modeTitlePrefix} ${cleanGoal.length <= 36 ? cleanGoal : `${cleanGoal.slice(0, 35)}…`}`,
+                  }
+                : {}),
             }
           : item,
       );
@@ -298,6 +383,7 @@ export function AgentProvider({ children }: { children: ReactNode }): JSX.Elemen
         generateTitle,
         thinkingLevel,
         loadThoughtMaxTokens(),
+        mode || undefined,
       );
       void runPromise
         .then(async (result) => {

@@ -29,7 +29,8 @@ _PARAMETER_TAG = re.compile(
 # Models often invent `<write_file | {...}>` instead of `<tool_call=write_file : {...}>`.
 _TOOL_NAMES = (
     "write_file|edit_file|read_file|edit_symbol|rename_symbol|search_code|"
-    "codebase_lookup|ask_epistemic|declare_apis|run_terminal_command|measure|run_tests"
+    "codebase_lookup|ask_epistemic|research_codebase|declare_apis|run_terminal_command|measure|run_tests|"
+    "list_dir|glob_files|delete_file"
 )
 _INFORMAL_TAG = re.compile(
     rf"<\s*({_TOOL_NAMES})\s*[|:]\s*",
@@ -105,7 +106,7 @@ def _parse_function_tag_calls(text: str) -> list[ToolCall]:
 def _normalize_function_name(raw_name: str) -> str | None:
     known = {
         "read_file", "write_file", "edit_file", "edit_symbol", "rename_symbol",
-        "search_code", "codebase_lookup", "ask_epistemic", "declare_apis",
+        "search_code", "codebase_lookup", "ask_epistemic", "research_codebase", "declare_apis",
         "run_terminal_command", "measure", "run_tests", "list_dir",
         "glob_files", "delete_file",
     }

@@ -45,6 +45,11 @@ async function ensureSidecar(): Promise<Sidecar> {
   if (sidecar?.running) return sidecar;
   sidecar = new Sidecar(repoRoot, workspace || repoRoot, runtimeConfig);
   sidecar.setEventHandler((event: AgentEvent) => {
+    if (event.event === "model.unloaded") {
+      modelLoaded = false;
+    } else if (event.event === "model.loaded") {
+      modelLoaded = true;
+    }
     send("agent:event", event);
   });
   await sidecar.start();
@@ -159,6 +164,7 @@ function registerIpc(): void {
         generateTitle?: boolean;
         thinkingLevel?: string;
         thoughtMaxTokens?: number | null;
+        mode?: string;
       },
     ) => {
     const child = await ensureSidecar();
@@ -169,6 +175,7 @@ function registerIpc(): void {
       typeof thoughtRaw === "number" && Number.isFinite(thoughtRaw)
         ? Math.max(32, Math.min(4096, Math.round(thoughtRaw)))
         : undefined;
+    const mode = String(payload.mode || "").trim();
     const result = await child.request("run", {
       session_id: payload.sessionId,
       goal: payload.goal,
@@ -176,6 +183,7 @@ function registerIpc(): void {
       generate_title: Boolean(payload.generateTitle),
       thinking_level: String(payload.thinkingLevel || "off"),
       ...(thoughtMaxTokens != null ? { thought_max_tokens: thoughtMaxTokens } : {}),
+      ...(mode ? { mode } : {}),
     });
     modelLoaded = true;
     const used = typeof result.workspace === "string" && result.workspace ? String(result.workspace) : ws;

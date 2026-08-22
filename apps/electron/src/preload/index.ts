@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld("mango", {
       generateTitle?: boolean,
       thinkingLevel?: string,
       thoughtMaxTokens?: number | null,
+      mode?: string,
     ): Promise<Record<string, unknown>> =>
       ipcRenderer.invoke("agent:run", {
         sessionId,
@@ -45,6 +46,7 @@ contextBridge.exposeInMainWorld("mango", {
         generateTitle,
         thinkingLevel,
         thoughtMaxTokens,
+        mode,
       }),
     cancel: (sessionId: string): Promise<Record<string, unknown>> =>
       ipcRenderer.invoke("agent:cancel", sessionId),

@@ -139,7 +139,8 @@ def _prompt_candidates(filename: str, *, start: Path) -> list[Path]:
     return unique
 
 
-_LEVEL_SUFFIX = {
+# Full prompts (agent_v2 template + thinking guidance), not short appendices.
+_LEVEL_PROMPT = {
     "think": "agent_think",
     "deep": "agent_deep",
     "max": "agent_max",
@@ -147,29 +148,21 @@ _LEVEL_SUFFIX = {
 
 
 def compose_agent_system_prompt(level: str | None = None, *, start: Path | None = None) -> str:
-    """Base agent prompt (variant-aware) plus an optional thinking-level suffix."""
-    base_name = _prompt_variant_name()
-    base = load_system_prompt(base_name, start=start)
-    name = _LEVEL_SUFFIX.get(str(level or "off").strip().lower(), "")
-    if not name:
-        return base
-    extra = load_system_prompt(name, start=start)
-    return f"{base}\n\n{extra}".strip()
+    """Agent system prompt for the GUI thinking picker.
+
+    off  → agent_v2 (protocol base)
+    think/deep/max → full prompts cloned from agent_v2 with level-specific CoT guidance
+    """
+    key = str(level or "off").strip().lower()
+    name = _LEVEL_PROMPT.get(key) or _prompt_variant_name()
+    return load_system_prompt(name, start=start)
 
 
 def _prompt_variant_name() -> str:
-    """Select agent.md (v1) or agent_v2.md via MANGO_PROMPT_VARIANT / flags."""
-    try:
-        from mango_agent.flags import prompt_variant
-
-        variant = prompt_variant()
-    except Exception:
-        variant = os.environ.get("MANGO_PROMPT_VARIANT", "v2").strip().lower() or "v2"
-    if variant in {"v2", "ab_test"}:
-        return "agent_v2"
-    return "agent"
+    """Canonical agent body is agent_v2 (v1 agent.md removed)."""
+    return "agent_v2"
 
 
-DEFAULT_SYSTEM_PROMPT = load_system_prompt("agent")
+DEFAULT_SYSTEM_PROMPT = load_system_prompt("agent_v2")
 SWE_BENCH_SYSTEM_PROMPT = load_system_prompt("swebench")
 EPISTEMIC_SYSTEM_PROMPT = load_system_prompt("epistemic")

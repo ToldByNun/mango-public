@@ -32,8 +32,10 @@ export function composeAgentGoal(
     "",
     "Read the current implementation and existing tests first.",
     "ask_epistemic must look up concrete symbols (package + symbol), not a whole module.",
-    "Then edit. Then run_tests. Do not finish until tests pass.",
-    "When tests pass, write a real finish summary: what changed, why, test result.",
+    "Then edit only if this follow-up asks for a code change.",
+    "If this follow-up is only a question, research and answer — do NOT edit and do NOT run_tests.",
+    "If this follow-up asks for a code change: edit, then run_tests when tests apply. Do not finish while required tests fail.",
+    "When done, write a real finish summary: what changed (or what you found), why, test result if any.",
   );
   return parts.join("\n");
 }

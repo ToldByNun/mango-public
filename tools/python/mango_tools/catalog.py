@@ -79,6 +79,11 @@ CATALOG: dict[str, dict[str, Any]] = {
         "aliases": (),
         "title": "Asking epistemic",
     },
+    "research_codebase": {
+        "required": ("question",),
+        "aliases": ("research_topic", "codebase_research"),
+        "title": "Researching codebase",
+    },
     "codebase_lookup": {
         "required": ("query",),
         "aliases": (),

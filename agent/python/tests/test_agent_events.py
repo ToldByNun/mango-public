@@ -78,6 +78,8 @@ def test_serve_health_and_run_jsonl(tmp_path: Path) -> None:
     dumped = out.getvalue()
     assert "agent.started" in dumped
     assert "agent.stopped" in dumped
+    assert "model.unloaded" in dumped
+    assert server._runner is None
 
 
 def test_serve_title_is_immediate_and_does_not_use_model(tmp_path: Path) -> None:

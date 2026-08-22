@@ -9,7 +9,14 @@ import {
   THINKING_OPTIONS,
   type ThinkingLevel,
 } from "../lib/thinkingLevel";
-import { ContextRing, IconArrowUp, IconGitBranch, IconMic, IconMonitor, IconPlus, IconStop, IconThink, IconUndo } from "./Icons";
+import {
+  activeSlashCommand,
+  filterSlashCommands,
+  matchSlashQuery,
+  slashInputHighlight,
+  type SlashCommand,
+} from "../lib/slashCommands";
+import { ContextRing, IconArrowUp, IconGitBranch, IconMic, IconMonitor, IconPlan, IconPlus, IconStop, IconThink, IconUndo } from "./Icons";
 import { ModelPicker } from "./ModelPicker";
 
 export function Composer(): JSX.Element {
@@ -35,8 +42,16 @@ export function Composer(): JSX.Element {
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>(() => loadThinkingLevel());
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
   const running = active?.status === "running";
+
+  const slashQuery = matchSlashQuery(text);
+  const slashMatches = slashQuery !== null && !slashDismissed ? filterSlashCommands(slashQuery) : [];
+  const showSlashMenu = slashMatches.length > 0;
+  const activeCmd = activeSlashCommand(text);
+  const inputHighlight = slashInputHighlight(text);
 
   const attachFiles = async (): Promise<void> => {
     const picked = await window.mango.files.pick();
@@ -99,7 +114,61 @@ export function Composer(): JSX.Element {
     el.style.height = `${Math.min(140, el.scrollHeight)}px`;
   }, [text]);
 
+  useEffect(() => {
+    setSlashIndex(0);
+    setSlashDismissed(false);
+  }, [slashQuery]);
+
+  useEffect(() => {
+    if (slashIndex >= slashMatches.length) setSlashIndex(Math.max(0, slashMatches.length - 1));
+  }, [slashIndex, slashMatches.length]);
+
+  const applySlashCommand = (cmd: SlashCommand): void => {
+    setSlashDismissed(true);
+    if (!cmd.takesArg) {
+      void (async () => {
+        const started = await send(cmd.trigger, files, thinkingLevel);
+        if (started) {
+          setText("");
+          setFiles([]);
+        }
+      })();
+      return;
+    }
+    setText(`${cmd.trigger} `);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      const pos = el.value.length;
+      el.setSelectionRange(pos, pos);
+    });
+  };
+
   const onKey = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
+    if (showSlashMenu) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashIndex((i) => (i + 1) % slashMatches.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashIndex((i) => (i - 1 + slashMatches.length) % slashMatches.length);
+        return;
+      }
+      if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+        event.preventDefault();
+        const cmd = slashMatches[slashIndex] ?? slashMatches[0];
+        if (cmd) applySlashCommand(cmd);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSlashDismissed(true);
+        return;
+      }
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit();
@@ -114,6 +183,7 @@ export function Composer(): JSX.Element {
     if (started) {
       setText("");
       setFiles([]);
+      setSlashDismissed(false);
     }
   };
 
@@ -144,16 +214,64 @@ export function Composer(): JSX.Element {
           </div>
         ) : null}
         <div className={styles.inputWrap}>
-          <textarea
-            ref={ref}
-            className={styles.input}
-            value={text}
-            disabled={running}
-            placeholder="Ask Mango to build, fix, or explain…"
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={onKey}
-            rows={1}
-          />
+          {showSlashMenu ? (
+            <div className={styles.slashPopup} role="listbox" aria-label="Slash commands">
+              <div className={styles.slashPopupHeader}>
+                Commands matching {slashQuery}
+              </div>
+              <ul className={styles.slashList}>
+                {slashMatches.map((cmd, i) => (
+                  <li key={cmd.id}>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={i === slashIndex}
+                      className={`${styles.slashRow} ${i === slashIndex ? styles.slashRowActive : ""}`}
+                      onMouseEnter={() => setSlashIndex(i)}
+                      onClick={() => applySlashCommand(cmd)}
+                    >
+                      <span className={styles.slashIcon} aria-hidden>
+                        <IconPlan size={14} />
+                      </span>
+                      <span className={styles.slashBody}>
+                        <span className={styles.slashName}>{cmd.trigger}</span>
+                        <span className={styles.slashDesc}>{cmd.description}</span>
+                      </span>
+                      <span className={styles.slashSource}>{cmd.source}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {activeCmd?.takesArg && activeCmd.paramHint ? (
+            <div className={styles.slashTip} aria-label={`${activeCmd.trigger} parameter`}>
+              <span className={styles.slashTipLabel}>{activeCmd.paramLabel}</span>
+              <span className={styles.slashTipHint}>{activeCmd.paramHint}</span>
+            </div>
+          ) : null}
+          <div className={styles.inputStack}>
+            {inputHighlight ? (
+              <div className={styles.inputHighlight} aria-hidden>
+                <span className={styles.slashInInput}>{inputHighlight.prefix}</span>
+                <span>{inputHighlight.rest}</span>
+              </div>
+            ) : null}
+            <textarea
+              ref={ref}
+              className={`${styles.input} ${inputHighlight ? styles.inputOverHighlight : ""}`}
+              value={text}
+              disabled={running}
+              placeholder={
+                activeCmd?.paramHint
+                  ? `${activeCmd.paramHint}…`
+                  : "Ask Mango to build, fix, or explain…  Type / for commands"
+              }
+              onChange={(event) => setText(event.target.value)}
+              onKeyDown={onKey}
+              rows={1}
+            />
+          </div>
         </div>
         <div className={styles.toolbar}>
           <div className={styles.toolbarLeft}>

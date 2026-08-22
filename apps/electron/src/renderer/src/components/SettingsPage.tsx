@@ -51,10 +51,11 @@ export function SettingsPage({ onClose }: { onClose: () => void }): JSX.Element 
 
   useEffect(() => {
     void (async () => {
-      setState((s) => ({ ...s, configPath: await window.mango.app.configPath() }));
+      const configPath = await window.mango.app.configPath();
       const stored = loadThoughtMaxTokens();
       setState((s) => ({
         ...s,
+        configPath,
         thoughtMaxTokens: stored == null ? "" : String(stored),
         thinkingLevel: loadThinkingLevel(),
       }));
@@ -73,7 +74,7 @@ export function SettingsPage({ onClose }: { onClose: () => void }): JSX.Element 
           nThreads: String(settings.n_threads ?? "0"),
           gpuBackend: String(settings.gpu_backend ?? "cpu"),
           registeredBackends: (settings.registered_backends as string[] | undefined)?.join(", ") ?? "",
-          configPath: String(settings.config_path ?? s.configPath),
+          configPath: String(settings.config_path ?? configPath),
         }));
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));

@@ -35,6 +35,7 @@ export type MangoBridge = {
       generateTitle?: boolean,
       thinkingLevel?: string,
       thoughtMaxTokens?: number | null,
+      mode?: string,
     ) => Promise<Record<string, unknown>>;
     cancel: (sessionId: string) => Promise<Record<string, unknown>>;
     continueStall: (sessionId: string) => Promise<Record<string, unknown>>;

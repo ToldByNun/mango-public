@@ -60,7 +60,7 @@ Sidecar metadata: `datasets/catalog/index.jsonl` (not in training JSONL).
 
 ## Prompts (single source of truth)
 
-- Agent: `prompts/agent.md`
+- Agent: `prompts/agent_v2.md`
 - Security audit: `prompts/security_review.md`
 - CoT: embedded template (see v1 `chunks/cot.jsonl`)
 - Epistemic: `prompts/epistemic.md`

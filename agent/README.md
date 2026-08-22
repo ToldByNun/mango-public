@@ -20,7 +20,7 @@ Task
 
 `codebase_lookup` finds symbols/files instead of blindly reading. `ask_epistemic` spawns an isolated sub-agent (own context, shared model) for API questions.
 
-System prompts live in [`prompts/`](../prompts/) (`agent.md`, `swebench.md`, `epistemic.md`, `title.md`, `cot.md`). Edit the markdown; the agent loads them at startup.
+System prompts live in [`prompts/`](../prompts/) (`agent_v2.md`, `agent_think.md` / `agent_deep.md` / `agent_max.md`, `ask.md`, `plan.md`, …). Edit the markdown; the agent loads them at startup.
 
 ## Limits (all levels)
 

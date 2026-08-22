@@ -11,6 +11,8 @@ export declare const AGENT_EVENTS: readonly [
   "agent.final",
   "agent.stopped",
   "agent.error",
+  "model.loaded",
+  "model.unloaded",
 ];
 export type AgentEventName = (typeof AGENT_EVENTS)[number];
 export type AgentEvent = {

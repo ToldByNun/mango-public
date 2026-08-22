@@ -1379,7 +1379,7 @@ def test_thinking_level_sets_thought_budget_and_prompt() -> None:
     agent.run("Say hi.")
     assert runner.thought_max_tokens
     assert runner.thought_max_tokens[0] == 384
-    assert "Thinking level: deep" in agent._system_prompt
+    assert "THINKING LEVEL: deep" in agent._system_prompt
 
 
 def test_write_file_turn_uses_large_tool_budget(tmp_path: Path) -> None:
@@ -1670,4 +1670,110 @@ def test_grounded_rejects_fuzzy_edit_without_read(tmp_path: Path) -> None:
     )
     assert blocked
 
+
+def test_plan_mode_blocks_writes_and_finishes(tmp_path: Path) -> None:
+    """Plan mode: write_file is disabled; after a read, markdown plan may finish."""
+    from mango_tools import create_default_registry
+
+    src = tmp_path / "app.py"
+    src.write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+    read_call = f'<tool_call=read_file : {json.dumps({"path": str(src)})}>'
+    write_call = (
+        f'<tool_call=write_file : {json.dumps({"path": str(tmp_path / "hacked.py"), "content": "x = 1"})}>'
+    )
+    plan_md = (
+        "# Plan: Add a farewell helper\n\n"
+        "## Ablauf\n"
+        "1. Read app.py\n"
+        "2. Add farewell()\n\n"
+        "## Details\n"
+        "- `app.py`: add farewell next to greet\n\n"
+        "## Todo-Liste\n"
+        "- [ ] Implement farewell\n"
+        "- [ ] Call it from main\n"
+    )
+    runner = FakeModelRunner(
+        [
+            f"Inspect existing API.\n{write_call}",  # dropped: write disabled
+            f"Reading the module.\n{read_call}",
+            plan_md,
+        ]
+    )
+    agent = Agent(
+        runner,
+        max_iterations=6,
+        require_tools=True,
+        plan_mode=True,
+        task_wants_tests=False,
+        plan_apis_first=False,
+        verification_root=tmp_path,
+        codeintel_root=tmp_path,
+        tool_registry=create_default_registry(),
+    )
+    result = agent.run("Plan how to add farewell() to app.py")
+    assert result.stop_reason == StopReason.COMPLETED
+    assert "Todo-Liste" in (result.final_answer or "")
+    assert not (tmp_path / "hacked.py").exists()
+    assert "write_file" in agent._disabled_tools
+    assert "read_file" not in agent._disabled_tools
+
+
+def test_plan_mode_requires_one_tool_before_finish(tmp_path: Path) -> None:
+    """Prose-only first turn must not complete in plan mode until a tool ran."""
+    from mango_tools import create_default_registry
+
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    read_call = f'<tool_call=read_file : {json.dumps({"path": str(src)})}>'
+    runner = FakeModelRunner(
+        [
+            "# Plan: premature\n\n## Ablauf\n1. Skip research\n\n## Details\n- none\n\n## Todo-Liste\n- [ ] guess\n",
+            f"Now I inspect.\n{read_call}",
+            "# Plan: grounded\n\n## Ablauf\n1. Read mod.py\n2. Document x\n\n"
+            "## Details\n- `mod.py`: keep x\n\n## Todo-Liste\n- [ ] leave as-is\n",
+        ]
+    )
+    agent = Agent(
+        runner,
+        max_iterations=6,
+        require_tools=True,
+        plan_mode=True,
+        task_wants_tests=False,
+        plan_apis_first=False,
+        verification_root=tmp_path,
+        codeintel_root=tmp_path,
+        tool_registry=create_default_registry(),
+    )
+    result = agent.run("Plan a change to mod.py")
+    assert result.stop_reason == StopReason.COMPLETED
+    assert "grounded" in (result.final_answer or "")
+    assert any(
+        result.success and result.tool_name == "read_file"
+        for step in result.steps
+        for result in step.tool_results
+    )
+
+
+def test_ask_mode_prefers_research_codebase_and_blocks_mutations() -> None:
+    """Ask protocol: research_codebase preferred; writes/tests/declare_apis out of GBNF."""
+    runner = FakeModelRunner(["done"])
+    agent = Agent(
+        runner,
+        max_iterations=1,
+        require_tools=True,
+        plan_mode=True,
+        agent_mode="ask",
+        task_wants_tests=False,
+        plan_apis_first=False,
+        enable_declare_apis=False,
+        disabled_tools=frozenset({"declare_apis"}),
+    )
+    assert agent.tool_registry.has("research_codebase")
+    names = agent._action_tool_names()
+    assert names[0] == "research_codebase"
+    assert "write_file" not in names
+    assert "run_tests" not in names
+    assert "declare_apis" not in names
+    assert "research_codebase" in names
+    assert "ask_epistemic" in names
 

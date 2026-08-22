@@ -14,7 +14,7 @@ def load_prompt(name: str) -> str:
 
 
 def agent_system() -> str:
-    return load_prompt("agent.md")
+    return load_prompt("agent_v2.md")
 
 
 def security_system() -> str:

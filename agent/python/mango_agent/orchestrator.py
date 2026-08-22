@@ -35,6 +35,8 @@ class Orchestrator:
         verbose: bool = False,
         disabled_tools: frozenset[str] | set[str] | None = None,
         thinking_level: str | None = None,
+        plan_mode: bool = False,
+        agent_mode: str = "",
     ) -> None:
         self.workspace = WorkspaceConfig(root=Path(workspace))
         self.limits = limits or AgentLimits()
@@ -59,6 +61,8 @@ class Orchestrator:
             verbose=verbose,
             disabled_tools=disabled_tools,
             thinking_level=thinking_level,
+            plan_mode=plan_mode,
+            agent_mode=agent_mode,
         )
 
     def run(self, task: str) -> AgentResult:

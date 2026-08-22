@@ -39,6 +39,7 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "search_code": ("pattern",),
     "codebase_lookup": ("query",),
     "ask_epistemic": ("question",),
+    "research_codebase": ("question",),
     "declare_apis": ("libraries",),
     "run_terminal_command": ("command",),
     "measure": ("command",),

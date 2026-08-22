@@ -12,6 +12,8 @@ export const AGENT_EVENTS = [
   "agent.final",
   "agent.stopped",
   "agent.error",
+  "model.loaded",
+  "model.unloaded",
 ] as const;
 
 export type AgentEventName = (typeof AGENT_EVENTS)[number];
