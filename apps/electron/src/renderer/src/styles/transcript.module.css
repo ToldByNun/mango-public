@@ -358,6 +358,10 @@
   color: var(--text-primary);
 }
 
+.userSlash {
+  font-weight: 600;
+}
+
 .thought {
   color: var(--text-tertiary);
   font-size: 11px;

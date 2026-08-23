@@ -51,6 +51,12 @@ This goal needs a large HTML/CSS/JS page. Do NOT plan the whole file in thought 
 # stalled
 You have now written the same answer several times without calling a tool, so nothing changed. Stop restating the plan. Emit ONE tool call in the canonical format on your very next line, e.g. <tool_call=read_file : {"path": "the file you need"}>. If you truly cannot act, call run_tests.
 
+# action_loop
+You are repeating the same action ({{action}}) and making no progress. Do NOT call that tool again with the same arguments. NEXT you MUST make a real change with edit_file or write_file (different old_string/new_string than before). If edit_file keeps failing, call write_file with the FULL corrected file contents.
+
+# action_loop_blocked
+BLOCKED by the runner: you already did {{action}} with no progress. Do not repeat it. NEXT tool MUST be write_file (full corrected file) or a different edit_file with a NEW old_string copied verbatim from the file.
+
 # run.emit_tool
 Do not finish yet. Emit a tool call now (read_file, search_code, or edit_file).
 
@@ -65,6 +71,11 @@ Still missing API lookups: {{needed}}. Do not write the brief yet. NEXT tool MUS
 
 # research_summarize
 Lookups complete. Do not call more tools. Write the usage brief now (imports, real calls, pitfalls).
+
+# lookup_empty
+codebase_lookup returned no symbol/file hits for that query.
+NEXT: research_codebase with a focused topic, or search_code / list_dir / glob_files / read_file.
+Do not finish yet. Do not claim you already answered from empty lookup results.
 
 # run.no_edit_truncated
 No successful edit yet. Your tool JSON was truncated; use edit_file with a short old_string.
@@ -89,6 +100,9 @@ API research done. Use the usage brief (imports and real calls). NEXT you may wr
 
 # _note_plan_progress.epistemic_retry
 ask_epistemic must return a usage brief for {{needed}}. unittest/pytest do not count. Then write_file — do not ask again.
+
+# _note_plan_progress.epistemic_give_up
+ask_epistemic failed twice for {{needed}}. Gate cleared. NEXT tool MUST be write_file using known APIs (stdlib urllib if requests missing). Do not call ask_epistemic again.
 
 # _note_plan_progress.install_failed
 Could not install {{pkgs}}. Command: {{command}}. Fix the package name or install manually, then ask_epistemic again.
@@ -133,7 +147,13 @@ No test_*.py files found. Write tests covering the new behavior (including Threa
 BLOCKED by the runner. No test_*.py file exists in the workspace yet, so run_tests has nothing to collect. FIRST tool MUST be write_file with a test_*.py file (complete file, one TestCase is enough), then the runner executes it automatically.
 
 # no_tests_collected
-pytest exited 5 for {{targets}}: the file(s) exist but contain NO tests (empty, wrong names, or reverted). Running them again can never pass. NEXT tool MUST be write_file rewriting the test file with real test functions (def test_* methods in a TestCase class), or write the implementation the tests import.
+pytest exited 5 for {{targets}}: the file(s) exist but contain NO tests (empty, truncated, or reverted). Running them again can never pass. The runner has LOCKED out run_tests and edit_file. NEXT tool MUST be write_file with the COMPLETE test file (full imports + TestCase with def test_* methods — never a partial edit). Then pytest runs automatically.
+
+# test_collection_broken
+pytest could not COLLECT {{targets}} (exit 2) — the file has a syntax error or import failure, usually a truncated write. Editing blind will not fix it. The runner has LOCKED out run_tests and edit_file. NEXT tool MUST be write_file rewriting the COMPLETE test file from scratch (all imports, full TestCase class, every def test_ method closed).{{detail}}
+
+# truncated_write_detected
+The previous write to {{path}} produced an INVALID or TRUNCATED file (syntax error, or ends mid-write with a dangling `#` / unfinished line). Do not edit — rewrite the ENTIRE file with write_file now: complete imports, full function bodies, real HTTP/send logic, entry point at the end.
 
 # _handle_run_tests_results.failed_persistent
 Tests still {{hint}} after {{attempts}}+ tries. Do NOT finish. NEXT tool MUST edit the implementation (or tests if the assertion is wrong). The runner keeps re-testing until pytest passes or the iteration limit is hit.{{detail}}
@@ -159,18 +179,87 @@ Installed {{pkgs}} ({{command}}). Do NOT thrash other files. NEXT tool MUST be r
 # runtime_failed
 Pytest passed but running {{script}} crashed at runtime (the runner executes `python script.py` after tests):
 {{detail}}
-Fix the runtime path — often edge cases in main()/render loops that unit tests never hit. Add a test for the failing case if possible.
+Fix the runtime path — real Tracebacks / crashes only. Missing CLI args / argparse usage text is NOT a crash. Add a test for the failing case if possible.
 
 # runtime_no_entry
-Goal needs a runnable console/CLI script but no `if __name__ == '__main__'` entry was found. NEXT: write_file or edit_file to add main(), argparse subcommands, and wire parse_args(). read_file the current file first — do not claim done while functions are stubs.
+Goal needs a runnable console/CLI entry point but none was found (see ## Implementation status).
+Pytest may already be green — do NOT rewrite the whole file with write_file (that truncates and loops).
+NEXT: edit_file to APPEND only the missing entry point (call main). Keep existing functions intact.
+
+# tests_already_green
+BLOCKED: pytest already passed this run. Do NOT call run_tests again.
+If ## Implementation status still lists gaps, edit_file to fix ONLY those gaps.
+Otherwise finish with a short summary — further run_tests calls are blocked.
 
 # blocked_shell_read
-BLOCKED: do not use `type`/`cat`/`Get-Content` to read source files. NEXT tool MUST be read_file path="{{path}}" — it returns the FULL file. Judge completeness from ## Implementation status (functions, main, subcommands), never from byte size.
+BLOCKED: do not use `type`/`cat`/`Get-Content` to read source files. NEXT tool MUST be read_file path="{{path}}" — it returns the FULL file. Judge completeness from ## Implementation status (functions, entry point, subcommands), never from byte size.
 
 # impl_incomplete
 Implementation is NOT finished — the runner will reject finish until these are fixed:
 {{gaps}}
-NEXT: read_file the current file, then edit_file to ADD only the missing pieces (do NOT rewrite the whole file in one write_file — that truncates). Keep each edit small.
+Trust ## Implementation status on this turn (not earlier thoughts). NEXT: insert_lines path="{{path}}" line={{line}} with a REAL block of missing logic (8+ lines: handler body / HTTP call / send / entry). Use the fence form:
+<tool_call=insert_lines : {"path": "{{path}}", "line": {{line}}>
+```
+...code...
+```
+Do NOT use edit_file for ±3-line tweaks. Do NOT rewrite the whole file with write_file.
+
+# impl_logic_missing
+Implementation is a SKELETON — core behavior is still missing:
+{{gaps}}
+Do NOT nibble with edit_file (±3 lines) — the runner BLOCKS and reverts those. NEXT tool MUST be insert_lines path="{{path}}" line={{line}} with ALL missing logic in ONE fenced insert (HTTP/API + send/reply + bot.run/entry — at least ~8 lines). Example:
+<tool_call=insert_lines : {"path": "{{path}}", "line": {{line}}>
+```
+    async with aiohttp...
+    await message.channel.send(...)
+bot.run(TOKEN)
+```
+Then the runner re-checks gaps.
+
+# nibble_edit_blocked
+BLOCKED: tiny edit/insert reverted — core gaps are still open:
+{{gaps}}
+edit_file ±3 lines will never finish this. NEXT tool MUST be insert_lines path="{{path}}" line={{line}} with a LARGE fenced block covering the gaps above (HTTP + send/reply + entry). Do not read the file again first unless you have never seen it.
+
+# coding_complete
+PHASE=CODE_COMPLETE | NEXT=write_file path="{{path}}" (COMPLETE file: imports + handlers + HTTP/send + entry). Fence the body. Do not plan in thought — emit the tool call.
+
+# coding_extend
+PHASE=CODE_EXTEND | NEXT=insert_lines path="{{path}}" line={{line}} | OPEN:
+{{gaps}}
+ONE fenced block (≥8 lines) that closes those gaps. No edit_file. No read_file first.
+
+# coding_repair
+PHASE=CODE_REPAIR | NEXT=write_file path="{{path}}" COMPLETE corrected file (fence). Syntax is broken — never insert_lines/edit_file on a broken file.
+
+# gap_not_closed
+BLOCKED: mutation kept the SAME gaps open — reverted:
+{{gaps}}
+NEXT: insert_lines path="{{path}}" line={{line}} with a LARGER fenced block that actually closes ≥1 gap above.
+
+# gap_not_closed_rewrite
+BLOCKED twice with no gap closed — escalate to full rewrite.
+{{gaps}}
+NEXT tool MUST be write_file path="{{path}}" with the COMPLETE corrected file (fence). No more tiny inserts.
+
+# hollow_skeleton_blocked
+BLOCKED: hollow skeleton kept on disk ({{min_lines}}+ lines of real logic required for this bot/API goal). Still missing:
+{{gaps}}
+NEXT: insert_lines path="{{path}}" with ALL missing logic in ONE fenced block (HTTP + send/reply + entry). Do not delete/rewrite the skeleton — extend it.
+
+# impl_complete
+These items are now done — do NOT re-apply the same fixes:
+{{resolved}}
+Trust ## Implementation status. NEXT: finish if the goal is met, or run a quick smoke/test — not another identical edit of closed work.
+
+# goal_met_stop
+GOAL ALREADY MET — do not edit more. Gaps are empty and required checks passed.
+Do NOT call write_file/edit_file/edit_symbol again. NEXT: finish with a short summary of what was delivered (files + tests). Further edits will be blocked.
+
+# work_already_done
+BLOCKED loop: your thought re-asserts work that is already closed:
+{{resolved}}
+Do NOT edit/checkpoint those again. Trust ## Implementation status. NEXT: finish if the goal is met, or tackle only items still listed as open — never redo closed work.
 
 # goal_deliverables_missing
 Goal requires these files on disk but they do not exist yet: {{files}}
@@ -211,11 +300,11 @@ rename_symbol({{old}} -> {{new}}) failed: {{exc}}. Call rename_symbol; do not ad
 Tests passed but the rename is incomplete: {{old}} is still referenced. {{hint}}. Do not add a second function with the new name.
 
 # _fallback_summary
-I updated {{files}}.
-{{draft}}
-{{tests}}
+{{opening}}
 
-A later follow-up should read these files and the existing tests before editing again.
+{{body}}
+
+{{closing}}
 
 # _abort_report
 Stopped after {{failed}} failed verification attempt(s) (max {{max}}).

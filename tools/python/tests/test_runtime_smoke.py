@@ -62,3 +62,37 @@ def test_runtime_smoke_allows_long_running_without_traceback(tmp_path: Path) -> 
     result = run_runtime_smoke(_context={"workspace": str(tmp_path)}, timeout=1)
     assert result["ok"] is True
     assert result["results"][0]["timed_out"] is True
+
+
+def test_runtime_smoke_allows_argparse_usage_exit(tmp_path: Path) -> None:
+    """CLI tools that require a path must not fail smoke when run with no args."""
+    script = tmp_path / "wordstats.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import argparse
+            from collections import Counter
+
+            def count_words(text):
+                return Counter(text.lower().split())
+
+            def main(argv=None):
+                p = argparse.ArgumentParser()
+                p.add_argument("path")
+                args = p.parse_args(argv)
+                with open(args.path, encoding="utf-8") as f:
+                    for w, c in count_words(f.read()).most_common(10):
+                        print(f"{w}: {c}")
+                return 0
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_runtime_smoke(_context={"workspace": str(tmp_path)})
+    assert result["ok"] is True
+    assert result["skipped"] is False
+    assert result["results"][0]["exit_code"] != 0

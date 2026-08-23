@@ -1,6 +1,6 @@
 # Mango CLI
 
-Textual terminal UI for Mango — same agent loop as the Electron app, mango-orange theme.
+Terminal UI for Mango — same agent loop as the Electron app, structured closer to **Aider** / **Claude Code**.
 
 ## Setup
 
@@ -10,13 +10,12 @@ From the **repo root**:
 .\install.cmd
 ```
 
-Then **close all terminals** (including Cursor) and open a fresh one.
+Then close all terminals and open a fresh one.
 
-Manual install:
+Manual:
 
 ```powershell
-pip install -e ..\..\cli\python
-python -m mango_cli.path_setup
+pip install -e .\cli\python
 ```
 
 ## Run
@@ -26,13 +25,6 @@ cd C:\path\to\your\project
 mango
 ```
 
-First run creates `<project>/.mango/config.yaml` (seeded from the Mango install config when possible). Edit `model.path` there if needed.
-
-Options:
-
-- `-w / --workspace` — project folder (default: cwd)
-- `-c / --config` — explicit YAML path
-
 With an initial goal:
 
 ```powershell
@@ -41,19 +33,55 @@ mango "Add a cyberpunk clock script with tests"
 
 Options:
 
-- `-w / --workspace` — project folder (default: cwd)
-- `-c / --config` — path to `runtime/config.yaml`
+| Flag | Meaning |
+|------|---------|
+| `-w / --workspace` | Project folder (default: cwd) |
+| `-c / --config` | YAML path (default: `<workspace>/.mango/config.yaml`) |
+
+First run creates `.mango/config.yaml` (seeded from the Mango install when possible). Set `model.path` there.
+
+## Slash commands
+
+| Command | What it does |
+|---------|----------------|
+| `/help` | Commands + keys |
+| `/ask …` | Read-only Q&A over the workspace |
+| `/plan …` | Draft a plan (no file edits) |
+| `/debug …` | Debug a failure |
+| `/refactor …` | Focused rename / cleanup |
+| `/clear` | Clear transcript |
+| `/status` | Workspace / model / mode |
+| `/quit` | Exit |
+
+Each mode uses a distinct accent color in the prompt and transcript (same palette as the GUI).
 
 ## Keys
 
 | Key | Action |
 |-----|--------|
-| Ctrl+Enter | Run goal / follow-up |
-| Esc | Cancel running agent |
-| Ctrl+Q | Quit (Textual default) |
+| `Enter` | Send / run goal |
+| `Shift+Enter` | New line |
+| `Esc` | Cancel running agent |
+| `Ctrl+L` | Clear transcript |
+| `Ctrl+C` | Cancel if running, else quit |
+
+## Layout
+
+```
+mango · ~/project · ask · mango-1.0-Q2_K_L
+╭ mango ────
+  cwd     …
+  hint    /help · /ask · /plan …
+❯ /ask what command types exist?
+  ● list_dir
+  ● read_file
+  ✓ done
+  ── answer ──
+· ready  /ask  completed · 4 iters    ⏎ send  ⇧⏎ newline  esc cancel  /help
+```
 
 ## Notes
 
 - GUI remains the primary surface; CLI is for terminal-only workflows.
-- Uses the same Orchestrator flags as the Electron sidecar (`plan_apis_first`, verification, runtime smoke).
+- Same Orchestrator modes as the Electron sidecar (`ask`, `plan`, `debug`, `refactor`, agent).
 - Restart the CLI after Python agent changes.

@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from mango_agent import Agent
-from mango_agent.agent import _GOAL_WANTS_TESTS_WRITTEN, _PYTEST_NO_TESTS_EXIT
+from mango_agent.agent import (
+    _GOAL_WANTS_TESTS_WRITTEN,
+    _PYTEST_COLLECTION_EXIT,
+    _PYTEST_NO_TESTS_EXIT,
+    _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
+)
 from mango_context import ContextEngine
 from mango_tools import create_default_registry
 from mango_tools.types import ToolCall, ToolResult
@@ -56,6 +61,128 @@ def test_exit_five_feedback_says_write_tests_not_read_impl(tmp_path: Path) -> No
     assert "write_file" in feedback.lower() or "no test" in feedback.lower()
     assert "read_file" not in feedback.lower() or "write_file" in feedback.lower()
     assert agent._run_tests_failures == 0
+    assert str(empty_test.resolve()) in agent._tests_uncollectable
+
+
+def test_exit_five_forces_write_and_blocks_auto_rerun(tmp_path: Path) -> None:
+    (tmp_path / "inventory.py").write_text("def total(): return 0\n", encoding="utf-8")
+    empty_test = tmp_path / "test_inventory.py"
+    empty_test.write_text("# no tests here\n", encoding="utf-8")
+    agent = _agent(tmp_path)
+    engine = ContextEngine(goal="fix inventory with unit tests")
+    result = ToolResult(
+        success=True,
+        tool_name="run_tests",
+        output={
+            "ok": False,
+            "exit_code": _PYTEST_NO_TESTS_EXIT,
+            "targets": [str(empty_test.resolve())],
+            "stdout": "targets: test_inventory.py\nno tests ran in 0.02s\n",
+            "stderr": "",
+        },
+        call=ToolCall(name="run_tests", arguments={}, raw="", start=0, end=0),
+    )
+    agent._handle_run_tests_results([result], engine)
+    assert agent._tests_uncollectable == {str(empty_test.resolve())}
+    assert agent._forced_tool_name() == "write_file"
+    assert agent._auto_run_tests_if_needed([], 1) == []
+    assert not agent._goal_is_met()
+
+    # A successful write clears the lock and re-opens the pytest path.
+    empty_test.write_text("def test_total():\n    assert True\n", encoding="utf-8")
+    write_result = ToolResult(
+        success=True,
+        tool_name="write_file",
+        output={"path": str(empty_test.resolve())},
+        call=ToolCall(
+            name="write_file",
+            arguments={"path": str(empty_test.resolve()), "content": "x"},
+            raw="",
+            start=0,
+            end=0,
+        ),
+    )
+    agent._note_impl_mutations([write_result])
+    assert str(empty_test.resolve()) not in agent._tests_uncollectable
+
+
+def test_collection_error_forces_full_rewrite(tmp_path: Path) -> None:
+    (tmp_path / "inventory.py").write_text("def total(): return 0\n", encoding="utf-8")
+    broken_test = tmp_path / "test_inventory.py"
+    broken_test.write_text("import unittest\nclass T(unittest.TestCase):\n    def test_x(:\n", encoding="utf-8")
+    agent = _agent(tmp_path)
+    engine = ContextEngine(goal="fix inventory with unit tests")
+    result = ToolResult(
+        success=True,
+        tool_name="run_tests",
+        output={
+            "ok": False,
+            "exit_code": _PYTEST_COLLECTION_EXIT,
+            "targets": [str(broken_test.resolve())],
+            "stdout": "",
+            "stderr": 'E SyntaxError: invalid syntax\n',
+        },
+        call=ToolCall(name="run_tests", arguments={}, raw="", start=0, end=0),
+    )
+    agent._handle_run_tests_results([result], engine)
+    feedback = engine.state.verification_feedback or ""
+    assert "write_file" in feedback.lower()
+    assert broken_test.resolve() in {Path(p).resolve() for p in agent._tests_uncollectable}
+    assert agent._forced_tool_name() == "write_file"
+    assert agent._run_tests_failures == 0
+
+
+def test_truncated_write_is_rejected_and_budget_raised(tmp_path: Path) -> None:
+    (tmp_path / "wordstats.py").write_text("x = 1\n", encoding="utf-8")
+    target = tmp_path / "helper.py"
+    agent = _agent(tmp_path)
+    truncated = (
+        "def parse_args(argv):\n"
+        "    if len(argv) != 2:\n"
+        "        print(\"Usage\"\n"  # deliberately unclosed paren → SyntaxError
+    )
+    target.write_text(truncated, encoding="utf-8")
+    write_result = ToolResult(
+        success=True,
+        tool_name="write_file",
+        output={"path": str(target.resolve())},
+        call=ToolCall(name="write_file", arguments={"path": str(target), "content": truncated}, raw="", start=0, end=0),
+    )
+    results = agent._validate_written_files([write_result])
+    assert results[0].success is False
+    assert results[0].metadata.get("truncated") is True
+    assert agent._write_tool_max_tokens >= _TRUNCATED_WRITE_TOOL_MAX_TOKENS
+    assert agent._prefer_write_file is True
+    assert agent._forced_tool_name() == "write_file"
+
+
+def test_valid_write_passes_validation(tmp_path: Path) -> None:
+    (tmp_path / "wordstats.py").write_text("x = 1\n", encoding="utf-8")
+    target = tmp_path / "helper.py"
+    agent = _agent(tmp_path)
+    good = "def add(a, b):\n    return a + b\n"
+    target.write_text(good, encoding="utf-8")
+    write_result = ToolResult(
+        success=True,
+        tool_name="write_file",
+        output={"path": str(target.resolve())},
+        call=ToolCall(name="write_file", arguments={"path": str(target), "content": good}, raw="", start=0, end=0),
+    )
+    results = agent._validate_written_files([write_result])
+    assert results[0].success is True
+
+
+def test_goal_met_latch_blocked_while_tests_red(tmp_path: Path) -> None:
+    (tmp_path / "inventory.py").write_text("def total(): return 5\n", encoding="utf-8")
+    test_path = tmp_path / "test_inventory.py"
+    test_path.write_text("def test_total():\n    assert total() == 5\n", encoding="utf-8")
+    agent = _agent(tmp_path)
+    agent._task_wants_tests = True
+    agent._acted_once = True
+    assert agent._mark_goal_met_if_ready(None) is False
+    assert agent._goal_met is False
+    agent._ran_tests_ok = True
+    assert agent._mark_goal_met_if_ready(None) is True
 
 
 def test_cleanup_deletes_agent_created_tests_by_default(tmp_path: Path) -> None:
@@ -86,6 +213,8 @@ def test_cleanup_keeps_tests_when_goal_asked_for_tests(tmp_path: Path) -> None:
         "Schreibe Tests für inventory.py",
         "write tests for inventory.py",
         "Erstelle test_foo.py",
+        "Include unit tests covering: normal input, empty file, and file-not-found",
+        "Create wordstats.py with unit tests",
     ],
 )
 def test_goal_wants_tests_written_regex(goal: str) -> None:
@@ -249,4 +378,12 @@ def test_cli_goal_caps_write_tokens_and_switches_to_edit_after_gaps(tmp_path: Pa
     agent._prefer_read_file = True
     assert agent._forced_tool_name() == "read_file"
     agent._prefer_read_file = False
-    assert agent._forced_tool_name() == "edit_file"
+    # Prefer edit via tool ordering — do NOT sole-force edit_file (that strips
+    # write_file/run_tests and causes the wordstats thrash).
+    assert agent._forced_tool_name() is None
+    # Once gaps are gone, do not keep forcing read/edit on the closed hole.
+    agent._impl_gaps = []
+    agent._prefer_edit_gaps = False
+    agent._prefer_read_file = False
+    agent._forced_read_path = ""
+    assert agent._forced_tool_name() != "edit_file"

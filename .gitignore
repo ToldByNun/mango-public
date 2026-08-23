@@ -69,3 +69,4 @@ Thumbs.db
 *~
 .cache/
 rename_output.txt
+/agent/python/_patch_extract

@@ -87,6 +87,24 @@ def test_parse_fenced_write_file() -> None:
     assert calls[0].arguments["content"] == "class EventBus:\n    pass\n"
 
 
+def test_parse_fenced_insert_lines() -> None:
+    text = (
+        '<tool_call=insert_lines : {"path": "discord_bot.py", "line": 19}>\n'
+        "```\n"
+        "    resp = requests.post('http://localhost:1234/v1/chat/completions')\n"
+        "    await message.channel.send(resp.json()['choices'][0]['message']['content'])\n"
+        "\n"
+        "bot.run(TOKEN)\n"
+        "```"
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "insert_lines"
+    assert calls[0].arguments["line"] == 19
+    assert "requests.post" in calls[0].arguments["content"]
+    assert "bot.run" in calls[0].arguments["content"]
+
+
 def test_parse_truncated_fence_not_a_write() -> None:
     text = (
         '<tool_call=write_file : {"path": "index.html"}>\n'

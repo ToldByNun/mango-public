@@ -26,6 +26,7 @@ RECOVERY_CORE_TOOLS = frozenset(
         "glob_files",
         "write_file",
         "edit_file",
+        "insert_lines",
         "edit_symbol",
         "delete_file",
         "run_tests",

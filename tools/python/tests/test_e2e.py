@@ -61,8 +61,9 @@ def test_e2e_edit_file_fuzzy_indent(tmp_path: Path) -> None:
     registry = create_default_registry()
     result = run_tool_call(parse_tool_calls(edit_output)[0], registry)
     assert result.success
-    assert result.output.get("fuzzy") is True
-    assert result.output.get("match") == "indent"
+    assert "return 2" in target.read_text(encoding="utf-8")
+    assert result.output.get("match") in {"indent", "whitespace"}
+    assert result.output.get("fuzzy") is not True
     assert target.read_text(encoding="utf-8") == "def f():\n\treturn 2\n"
 
 

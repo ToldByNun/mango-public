@@ -888,6 +888,78 @@ def test_plan_apis_first_requires_every_declared_name(tmp_path: Path) -> None:
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "print(1)\n"
 
 
+def test_epistemic_fails_open_after_two_install_failures(tmp_path: Path) -> None:
+    """Discord-bot thrash: failed ask_epistemic must not soft-lock write_file forever."""
+    from mango_agent.agent import _parse_libraries
+    from mango_tools import create_default_registry
+
+    assert _parse_libraries("discord.py, requests (for LM Studio HTTP API)") == [
+        "discord",
+        "requests",
+    ]
+
+    declare = '<tool_call=declare_apis : {"libraries": "discord.py, requests"}>'
+    ask = '<tool_call=ask_epistemic : {"question": "discord Client and requests get"}>'
+    write = '<tool_call=write_file : {"path": "discord.py", "content": "print(1)\\n"}>'
+
+    def _ask(question: str, _context=None):
+        return {
+            "exists": False,
+            "install_ok": False,
+            "install_command": "pip install requests (for LM Studio HTTP API)",
+            "failed": ["requests (for LM Studio HTTP API)"],
+            "details": "import failed: No module named 'requests (for LM Studio HTTP API)'",
+            "error": "install failed",
+        }
+
+    registry = create_default_registry()
+    registry.register(
+        "ask_epistemic",
+        _ask,
+        description="stub",
+        parameters={"question": {"type": "string"}},
+        required=["question"],
+    )
+    runner = FakeModelRunner([declare, ask, ask, write, "done"])
+    agent = Agent(
+        runner,
+        max_iterations=10,
+        require_tools=True,
+        plan_apis_first=True,
+        task_wants_tests=False,
+        codeintel_root=tmp_path,
+        verification_root=tmp_path,
+        tool_registry=registry,
+        use_tool_grammar=True,
+    )
+    result = agent.run(
+        "Create a Discord bot that posts LM Studio replies using discord.py and requests"
+    )
+    assert agent._epistemic_once is True
+    assert agent._epistemic_failures >= 2
+    assert (tmp_path / "discord.py").is_file()
+    assert result.stop_reason == StopReason.COMPLETED
+
+
+def test_small_cli_does_not_cap_write_tokens_to_skeleton(tmp_path: Path) -> None:
+    from mango_agent.agent import _CLI_SKELETON_WRITE_MAX_TOKENS, _WRITE_TOOL_MAX_TOKENS
+    from mango_tools import create_default_registry
+
+    agent = Agent(
+        FakeModelRunner(["done"]),
+        max_iterations=2,
+        verification_root=tmp_path,
+        require_tools=True,
+        tool_registry=create_default_registry(),
+    )
+    agent.run(
+        "Create a Python CLI tool called wordstats.py that prints word-frequency statistics."
+    )
+    assert agent._cli_goal is True
+    assert agent._write_tool_max_tokens == _WRITE_TOOL_MAX_TOKENS
+    assert agent._write_tool_max_tokens > _CLI_SKELETON_WRITE_MAX_TOKENS
+
+
 def test_plan_apis_skips_epistemic_for_stdlib_csv_cli(tmp_path: Path) -> None:
     from mango_tools import create_default_registry
 
@@ -1472,10 +1544,10 @@ def test_finish_summary_uses_model_text_when_plan_gate_on(tmp_path: Path) -> Non
     )
     read = f'<tool_call=read_file : {json.dumps({"path": "app.py"})}>'
     summary = (
-        "I changed app.py so add() returns a plus b instead of a minus b.\n\n"
+        "Changed app.py so add() returns a plus b instead of a minus b.\n\n"
         "That matches the requested arithmetic.\n\n"
-        "Tests passed.\n\n"
-        "A later follow-up should read app.py and test_app.py before editing."
+        "Verification: tests passed.\n\n"
+        "Re-read app.py and test_app.py before the next edit if you continue."
     )
     runner = FakeModelRunner([read, edit, summary])
     agent = Agent(
@@ -1754,8 +1826,8 @@ def test_plan_mode_requires_one_tool_before_finish(tmp_path: Path) -> None:
     )
 
 
-def test_ask_mode_prefers_research_codebase_and_blocks_mutations() -> None:
-    """Ask protocol: research_codebase preferred; writes/tests/declare_apis out of GBNF."""
+def test_ask_mode_only_file_tools_and_blocks_mutations() -> None:
+    """Ask protocol: list/glob/search/read only; no epistemic and no mutations."""
     runner = FakeModelRunner(["done"])
     agent = Agent(
         runner,
@@ -1770,10 +1842,10 @@ def test_ask_mode_prefers_research_codebase_and_blocks_mutations() -> None:
     )
     assert agent.tool_registry.has("research_codebase")
     names = agent._action_tool_names()
-    assert names[0] == "research_codebase"
+    assert names[0] in {"list_dir", "glob_files", "search_code", "read_file"}
     assert "write_file" not in names
     assert "run_tests" not in names
     assert "declare_apis" not in names
-    assert "research_codebase" in names
-    assert "ask_epistemic" in names
+    assert "research_codebase" not in names
+    assert "ask_epistemic" not in names
 

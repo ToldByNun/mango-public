@@ -15,6 +15,7 @@ import {
   type ThoughtBlock,
   type ToolBlock,
 } from "../lib/turnActivity";
+import { slashInputHighlight } from "../lib/slashCommands";
 import styles from "../styles/transcript.module.css";
 import { IconChevron, IconFile, IconTest, IconTestFail, IconTestPending } from "./Icons";
 
@@ -46,6 +47,19 @@ function renderInlineCode(text: string): ReactNode {
     }
     return <span key={i}>{part}</span>;
   });
+}
+
+function renderUserText(text: string): ReactNode {
+  const highlight = slashInputHighlight(text);
+  if (!highlight) return text;
+  return (
+    <>
+      <span className={styles.userSlash} style={{ color: highlight.color }}>
+        {highlight.prefix}
+      </span>
+      {highlight.rest}
+    </>
+  );
 }
 
 export function Transcript(): JSX.Element {
@@ -105,7 +119,7 @@ export function Transcript(): JSX.Element {
               <div key={turn[0]?.id ?? index} className={styles.turn}>
                 {user && user.kind === "user" ? (
                   <div className={`${styles.entry} ${styles.entry_user}`}>
-                    <div className={styles.user}>{user.text}</div>
+                    <div className={styles.user}>{renderUserText(user.text)}</div>
                   </div>
                 ) : null}
                 <ActivityStream

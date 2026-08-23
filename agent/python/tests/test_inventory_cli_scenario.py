@@ -43,9 +43,8 @@ def save_db(db):
 
 def test_work_plan_lists_inventory_features() -> None:
     plan = build_work_plan(INVENTORY_GOAL)
-    assert "Work plan" in plan
-    assert "read_file" in plan
-    assert "add/create" in plan or "Implement:" in plan
+    assert "write_file" in plan
+    assert "Implement:" in plan
     features = required_features(INVENTORY_GOAL)
     assert any("add" in f for f in features)
     assert any("remove" in f for f in features)

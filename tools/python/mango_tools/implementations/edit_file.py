@@ -26,23 +26,27 @@ def edit_file(
     files_read = {str(item) for item in (context.get("files_read") or ())}
     require_grounded = bool(context.get("require_grounded_edits"))
     abs_path = str(file_path.resolve())
+
     allow_fuzzy = True
-    allow_whitespace = False
+    allow_whitespace = True
+    allow_indent = True
     if require_grounded:
         if abs_path not in files_read:
             allow_fuzzy = False
             allow_whitespace = False
+            allow_indent = False
         else:
-            # After read_file: exact + newlines; optionally whitespace via flag.
-            allow_fuzzy = False
+            allow_whitespace = True
+            allow_indent = True
             try:
                 from mango_agent.flags import edit_match_mode
 
-                allow_whitespace = edit_match_mode() == "grounded_ws"
+                mode = edit_match_mode()
             except Exception:
-                allow_whitespace = str(
-                    (__import__("os").environ.get("MANGO_EDIT_MATCH_MODE") or "")
-                ).lower() == "grounded_ws"
+                mode = str(
+                    (__import__("os").environ.get("MANGO_EDIT_MATCH_MODE") or "grounded_ws")
+                ).lower()
+            allow_fuzzy = mode != "strict_grounded"
 
     content = file_path.read_text(encoding=encoding)
     updated, replacements, match = apply_replace(
@@ -52,6 +56,7 @@ def edit_file(
         replace_all=replace_all,
         allow_fuzzy=allow_fuzzy,
         allow_whitespace=allow_whitespace,
+        allow_indent=allow_indent,
     )
 
     file_path.write_text(updated, encoding=encoding)
@@ -62,7 +67,7 @@ def edit_file(
         bytes_written=len(updated.encode(encoding)),
         match=match,
     )
-    if match not in {"exact", "newlines", "whitespace"}:
+    if match == "fuzzy":
         result["fuzzy"] = True
     syntax_error = python_syntax_error(file_path, source=updated)
     if syntax_error:

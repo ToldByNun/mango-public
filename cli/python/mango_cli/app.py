@@ -10,16 +10,16 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from mango_cli.agent_bridge import AgentBridge
+from mango_cli.commands import SLASH_COLORS, help_text, parse_slash
 from mango_cli.paths import default_workspace, resolve_cli_config
-from mango_cli.widgets import ComposerInput, MangoHeader, MangoStatusBar, TranscriptLog
+from mango_cli.widgets import ComposerInput, MangoHeader, MangoStatusBar, TranscriptLog, short_path
 
 
 class MangoApp(App):
-    """Console-first Mango TUI — same agent loop as the Electron app."""
+    """Terminal-first Mango — structured like Aider / Claude Code."""
 
     CSS_PATH = "theme.tcss"
     TITLE = "mango"
-    # No Footer / command palette chrome — keyboard only.
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
         Binding("ctrl+enter", "submit_goal", "Run", show=False),
@@ -47,24 +47,28 @@ class MangoApp(App):
         )
         self._running = False
         self._thought_buf = ""
-        self._model_name = "local model"
+        self._mode = "agent"
 
     def compose(self) -> ComposeResult:
         yield MangoHeader(id="header")
         with Vertical(id="main"):
             yield TranscriptLog(id="transcript")
             with Horizontal(id="composer-row"):
-                yield Static(">", id="prompt-glyph")
-                yield ComposerInput(id="composer", soft_wrap=True, show_line_numbers=False)
+                yield Static("❯", id="prompt-glyph")
+                yield ComposerInput(id="composer")
         yield MangoStatusBar(id="status")
 
     def on_mount(self) -> None:
-        self.query_one(MangoHeader).set_workspace(self._workspace)
+        header = self.query_one(MangoHeader)
+        header.set_workspace(self._workspace)
+        header.set_mode(self._mode)
         status = self.query_one(MangoStatusBar)
         status.set_ready()
+        status.set_mode(self._mode)
         transcript = self.query_one(TranscriptLog)
-        transcript.push_system(f"config {_short(self._config)}")
-        transcript.push_system("type a goal · ^⏎ / ^j run · esc cancel · ^c quit")
+        transcript.push_banner(str(self._workspace))
+        transcript.push_system(f"config {short_path(self._config)}")
+        self._refresh_prompt_glyph()
         composer = self.query_one(ComposerInput)
         composer.focus()
         if self._initial_goal:
@@ -72,7 +76,10 @@ class MangoApp(App):
             self.call_after_refresh(self.action_submit_goal)
 
     def action_clear_transcript(self) -> None:
-        self.query_one(TranscriptLog).clear()
+        log = self.query_one(TranscriptLog)
+        log.clear()
+        log.push_banner(str(self._workspace), self._bridge.model_path)
+        log.push_system("transcript cleared")
 
     def action_cancel_run(self) -> None:
         if not self._running:
@@ -86,35 +93,90 @@ class MangoApp(App):
             return
         self.exit()
 
+    def on_composer_input_submitted(self, _event: ComposerInput.Submitted) -> None:
+        self.action_submit_goal()
+
     def action_submit_goal(self) -> None:
         if self._running:
             return
         composer = self.query_one(ComposerInput)
-        goal = composer.text.strip()
-        if not goal:
-            self.query_one(MangoStatusBar).set_ready("empty goal")
+        raw = composer.text.strip()
+        if not raw:
+            self.query_one(MangoStatusBar).set_ready("empty")
             return
+
+        parsed = parse_slash(raw)
+        if parsed.kind == "local" and parsed.command is not None:
+            composer.load_text("")
+            self._handle_local(parsed.command.name)
+            return
+
+        if parsed.kind == "plain" and not parsed.goal:
+            self.query_one(TranscriptLog).push_system("that command needs an argument — try /help")
+            return
+
+        mode = parsed.mode if parsed.kind == "mode" else ""
+        goal = parsed.goal
+        display = parsed.display or goal
+        self._mode = mode or "agent"
+        self._refresh_prompt_glyph()
+        self.query_one(MangoHeader).set_mode(self._mode)
+        self.query_one(MangoStatusBar).set_mode(self._mode)
+
         composer.disabled = True
         self._running = True
         self._thought_buf = ""
-        self.query_one(TranscriptLog).push_user(goal)
-        self.query_one(MangoStatusBar).set_running("loading model")
-        composer.clear()
-        self._run_goal_worker(goal)
+        self.query_one(TranscriptLog).push_user(display, mode=self._mode if mode else "")
+        self.query_one(MangoStatusBar).set_running("loading model", mode=self._mode)
+        composer.load_text("")
+        self._run_goal_worker(goal, mode)
+
+    def _handle_local(self, name: str) -> None:
+        log = self.query_one(TranscriptLog)
+        if name == "help":
+            log.push_markup(help_text())
+            return
+        if name == "clear":
+            self.action_clear_transcript()
+            return
+        if name == "status":
+            model = self._bridge.model_path or "(not loaded yet)"
+            color = SLASH_COLORS.get(self._mode, "#e8943a")
+            log.push_markup(
+                "[#e8943a]status[/]\n"
+                f"  [#7a7268]workspace[/]  [#a89f94]{short_path(self._workspace, 64)}[/]\n"
+                f"  [#7a7268]config[/]     [#a89f94]{short_path(self._config, 64)}[/]\n"
+                f"  [#7a7268]mode[/]       [{color}]{self._mode}[/]\n"
+                f"  [#7a7268]model[/]      [#a89f94]{model}[/]"
+            )
+            return
+        if name == "quit":
+            self.exit()
+
+    def _refresh_prompt_glyph(self) -> None:
+        glyph = self.query_one("#prompt-glyph", Static)
+        color = SLASH_COLORS.get(self._mode, "#e8943a")
+        glyph.update(f"[{color}]❯[/]")
 
     @work(thread=True, exclusive=True)
-    def _run_goal_worker(self, goal: str) -> None:
+    def _run_goal_worker(self, goal: str, mode: str) -> None:
         try:
             self._bridge.attach_event_handler(self._on_agent_event)
-            self.call_from_thread(self._status_running, "thinking")
+            self.call_from_thread(self._status_running, "thinking", mode)
             self._bridge.load()
-            result = self._bridge.run(goal)
+            model = self._bridge.model_path
+            if model:
+                self.call_from_thread(self._set_model_header, model)
+            result = self._bridge.run(goal, mode=mode)
             self.call_from_thread(self._on_run_finished, result)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(self._on_run_error, str(exc))
 
-    def _status_running(self, detail: str) -> None:
-        self.query_one(MangoStatusBar).set_running(detail)
+    def _set_model_header(self, model: str) -> None:
+        self.query_one(MangoHeader).set_model(model)
+
+    def _status_running(self, detail: str, mode: str = "") -> None:
+        self.query_one(MangoStatusBar).set_running(detail, mode=mode or self._mode)
 
     def _on_agent_event(self, message: dict[str, Any]) -> None:
         event = str(message.get("event") or "")
@@ -142,7 +204,7 @@ class MangoApp(App):
             blocked = bool(payload.get("blocked"))
             ok = payload.get("ok", True)
             transcript.push_tool(title, ok=bool(ok), blocked=blocked)
-            status.set_running(title[:48])
+            status.set_running(title[:48], mode=self._mode)
             return
 
         if event == "agent.file":
@@ -154,9 +216,7 @@ class MangoApp(App):
             return
 
         if event == "agent.verification":
-            ok = bool(payload.get("ok"))
-            report = str(payload.get("report") or "")
-            transcript.push_verify(ok, report)
+            transcript.push_verify(bool(payload.get("ok")), str(payload.get("report") or ""))
             return
 
         if event == "agent.syntax":
@@ -166,8 +226,7 @@ class MangoApp(App):
             return
 
         if event == "agent.final":
-            text = str(payload.get("text") or "")
-            transcript.push_final(text)
+            transcript.push_final(str(payload.get("text") or ""))
             return
 
         if event == "agent.error":
@@ -176,7 +235,7 @@ class MangoApp(App):
 
         if event == "agent.started":
             ws = str(payload.get("workspace") or self._workspace)
-            status.set_running(_short(ws, 40))
+            status.set_running(short_path(ws, 40), mode=self._mode)
 
     def _on_run_finished(self, result: Any) -> None:
         self._running = False
@@ -202,10 +261,3 @@ class MangoApp(App):
 
     def on_unmount(self) -> None:
         self._bridge.unload()
-
-
-def _short(path: Path | str, max_len: int = 56) -> str:
-    text = str(path).replace("\\", "/")
-    if len(text) <= max_len:
-        return text
-    return "…" + text[-(max_len - 1) :]

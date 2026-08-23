@@ -49,11 +49,19 @@ class ContextEngine:
     def set_work_plan(self, plan: str) -> None:
         self._state.work_plan = plan.strip()
 
+    def set_coding_attention_slim(self, slim: bool) -> None:
+        self._state.coding_attention_slim = bool(slim)
+
     def set_impl_status(self, status: str) -> None:
         self._state.impl_status = status.strip()
 
     def set_verification_feedback(self, report: str) -> None:
-        self._state.verification_feedback = report.strip()
+        # Cap runner feedback — long repeated Verification blocks kill attention
+        # on small models (Discord-bot thrash: same BLOCKED text every turn).
+        text = report.strip()
+        if len(text) > 700:
+            text = text[:680].rstrip() + "…"
+        self._state.verification_feedback = text
 
     def remember_file(self, path: str, source: str, *, iteration: int = 0) -> None:
         remember_file_slice(

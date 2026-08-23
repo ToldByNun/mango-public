@@ -89,6 +89,7 @@ def _render(
     results: list[ToolResultEntry],
 ) -> str:
     sections: list[str] = []
+    slim = bool(getattr(state, "coding_attention_slim", False))
 
     if state.system_prompt.strip():
         sections.append(state.system_prompt.strip())
@@ -100,63 +101,88 @@ def _render(
 
     sections.append(f"## Goal\n{state.goal.strip()}")
 
-    if state.work_plan.strip():
+    # Coding phases: hide the multi-step work plan — Verification carries NEXT.
+    if state.work_plan.strip() and not slim:
         sections.append("## Work plan\n" + state.work_plan.strip())
+    elif slim and state.work_plan.strip():
+        # One-liner only so the model still sees the top priority.
+        first = state.work_plan.strip().splitlines()[0].strip()
+        sections.append(f"## Focus\n{first}")
 
     if state.impl_status.strip():
-        sections.append("## Implementation status\n" + state.impl_status.strip())
+        status = state.impl_status.strip()
+        if slim and len(status) > 240:
+            status = status[:220].rstrip() + "…"
+        sections.append("## Implementation status\n" + status)
 
-    memory_text = ""
-    if getattr(state, "memory", None) is not None and not state.memory.is_empty():
-        memory_text = state.memory.render(max_chars=state.budget.memory_max_chars)
-    if memory_text:
-        sections.append("## Memory\n" + memory_text)
+    if not slim:
+        memory_text = ""
+        if getattr(state, "memory", None) is not None and not state.memory.is_empty():
+            memory_text = state.memory.render(max_chars=state.budget.memory_max_chars)
+        if memory_text:
+            sections.append("## Memory\n" + memory_text)
 
-    if state.reasoning_summary.strip():
-        sections.append(
-            "## Compressed reasoning summary\n" + state.reasoning_summary.strip()
-        )
+        if state.reasoning_summary.strip():
+            sections.append(
+                "## Compressed reasoning summary\n" + state.reasoning_summary.strip()
+            )
 
-    if state.constraints:
-        bullets = "\n".join(f"- {item}" for item in state.constraints)
-        sections.append(f"## Constraints\n{bullets}")
+        if state.constraints:
+            bullets = "\n".join(f"- {item}" for item in state.constraints)
+            sections.append(f"## Constraints\n{bullets}")
 
     if state.relevant_files:
-        files = "\n".join(f"- {path}" for path in state.relevant_files)
+        files = "\n".join(f"- {path}" for path in state.relevant_files[: (4 if slim else None)])
         sections.append(f"## Relevant files\n{files}")
 
-    if actions:
+    if actions and not slim:
         lines = [f"- [{item.iteration}] {item.summary}" for item in actions]
         sections.append("## Previous actions\n" + "\n".join(lines))
+    elif actions and slim:
+        # Last action only — enough to avoid repeating the same failed call.
+        last = actions[-1]
+        sections.append(f"## Previous actions\n- [{last.iteration}] {last.summary}")
 
     if results:
-        blocks = [_format_result(entry) for entry in results]
+        keep = results[-1:] if slim else results
+        blocks = [_format_result(entry) for entry in keep]
         sections.append("## Tool results\n" + "\n\n".join(blocks))
 
     # Volatile runner feedback last so KV prefix (system + goal + tool history) stays stable.
     if state.verification_feedback.strip():
-        sections.append("## Verification\n" + state.verification_feedback.strip())
+        feedback = state.verification_feedback.strip()
+        if slim:
+            # Cap verification to ~3 lines so attention stays on NEXT.
+            lines = [ln for ln in feedback.splitlines() if ln.strip()]
+            feedback = "\n".join(lines[:6])
+        sections.append("## Verification\n" + feedback)
 
     next_bit = (
         "Continue the goal. Emit one tool call, or give the final answer if the task is done."
     )
-    status = _verification_next_status(state)
-    if status == "collection":
-        next_bit = _collection_next_bit(state, idle=False)
-    elif state.allow_multi_edit and status == "failed":
-        next_bit = _failed_next_bit(
-            state,
-            idle=False,
-            extra=(
-                "Verification failed across multiple implementation files. "
-                "You MAY emit multiple edit_symbol/write_file/rename_symbol tool calls in this turn "
-                "(one per affected file), then stop. Do not give a final answer yet."
-            ),
+    if slim:
+        next_bit = (
+            "CODE NOW. Emit the ONE tool call named in ## Verification. "
+            "No long thought. No read_file unless Verification says so. No final answer yet."
         )
-    elif status == "failed":
-        next_bit = _failed_next_bit(state, idle=False)
-    elif status == "passed":
-        next_bit = "Verification passed. Reply with a short summary and NO tool calls."
+    else:
+        status = _verification_next_status(state)
+        if status == "collection":
+            next_bit = _collection_next_bit(state, idle=False)
+        elif state.allow_multi_edit and status == "failed":
+            next_bit = _failed_next_bit(
+                state,
+                idle=False,
+                extra=(
+                    "Verification failed across multiple implementation files. "
+                    "You MAY emit multiple edit_symbol/write_file/rename_symbol tool calls in this turn "
+                    "(one per affected file), then stop. Do not give a final answer yet."
+                ),
+            )
+        elif status == "failed":
+            next_bit = _failed_next_bit(state, idle=False)
+        elif status == "passed":
+            next_bit = "Verification passed. Reply with a short summary and NO tool calls."
     sections.append("## Next\n" + next_bit)
     return "\n\n".join(sections) + "\n"
 

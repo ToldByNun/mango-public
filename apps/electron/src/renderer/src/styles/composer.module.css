@@ -519,12 +519,12 @@ button.metaItem:hover {
   width: 24px;
   height: 24px;
   border-radius: 6px;
-  background: var(--surface-3);
-  border: 1px solid var(--border-default);
+  background: color-mix(in srgb, var(--slash-color, var(--accent)) 16%, var(--surface-3));
+  border: 1px solid color-mix(in srgb, var(--slash-color, var(--accent)) 35%, var(--border-default));
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-secondary);
+  color: var(--slash-color, var(--text-secondary));
 }
 
 .slashBody {
@@ -538,7 +538,7 @@ button.metaItem:hover {
 .slashName {
   font-size: 13px;
   font-weight: var(--weight-semibold);
-  color: var(--accent);
+  color: var(--slash-color, var(--accent));
   font-family: var(--font-ui);
 }
 
@@ -569,7 +569,7 @@ button.metaItem:hover {
 .slashTipLabel {
   font-size: 10px;
   font-weight: var(--weight-semibold);
-  color: var(--text-secondary);
+  color: var(--slash-color, var(--text-secondary));
   font-family: var(--font-ui);
 }
 
@@ -598,7 +598,7 @@ button.metaItem:hover {
 }
 
 .slashInInput {
-  color: var(--accent);
+  color: var(--slash-color, var(--accent));
   font-weight: var(--weight-semibold);
 }
 

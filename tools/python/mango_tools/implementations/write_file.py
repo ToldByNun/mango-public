@@ -34,7 +34,7 @@ def write_file(
         raise ValueError(
             "write_file content is empty/junk (e.g. a lone quote). "
             "File was not changed. Write a COMPLETE file body inside the ``` fence, "
-            "or write a short skeleton first then edit_file."
+            "or write a short skeleton first then insert_lines/edit_file."
         )
 
     if file_path.suffix == ".py":

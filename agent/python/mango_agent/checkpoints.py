@@ -22,6 +22,7 @@ MUTATING_TOOLS = frozenset(
     {
         "write_file",
         "edit_file",
+        "insert_lines",
         "edit_symbol",
         "rename_symbol",
         "delete_file",

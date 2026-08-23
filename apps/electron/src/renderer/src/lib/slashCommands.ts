@@ -12,9 +12,20 @@ export type SlashCommand = {
   source: string;
   /** Needs text after the trigger before submit */
   takesArg: boolean;
+  /** Distinct accent for this command (input + popup) */
+  color: string;
   /** Handled in the UI only — no agent run */
   localOnly?: boolean;
 };
+
+/** Per-command palette — keep hues distinct on the warm dark UI. */
+export const SLASH_COLORS = {
+  plan: "#5b9fd4", // sky blue — planning
+  ask: "#4ec99a", // mint — Q&A
+  debug: "#e8786e", // coral — bugs
+  refactor: "#b794f6", // violet — reshape
+  clear: "#9a9288", // muted stone — utility
+} as const;
 
 export const SLASH_COMMANDS: SlashCommand[] = [
   {
@@ -26,6 +37,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     paramHint: "What should we plan?",
     source: "Mango",
     takesArg: true,
+    color: SLASH_COLORS.plan,
   },
   {
     id: "ask",
@@ -36,6 +48,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     paramHint: "Your question",
     source: "Mango",
     takesArg: true,
+    color: SLASH_COLORS.ask,
   },
   {
     id: "debug",
@@ -46,6 +59,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     paramHint: "What to debug",
     source: "Mango",
     takesArg: true,
+    color: SLASH_COLORS.debug,
   },
   {
     id: "refactor",
@@ -56,6 +70,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     paramHint: "Symbol to refactor",
     source: "Mango",
     takesArg: true,
+    color: SLASH_COLORS.refactor,
   },
   {
     id: "clear",
@@ -66,6 +81,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     paramHint: "",
     source: "Mango",
     takesArg: false,
+    color: SLASH_COLORS.clear,
     localOnly: true,
   },
 ];
@@ -97,8 +113,10 @@ export function activeSlashCommand(text: string): SlashCommand | null {
   return null;
 }
 
-/** Orange prefix + remainder for the input highlight overlay. */
-export function slashInputHighlight(text: string): { prefix: string; rest: string } | null {
+/** Colored prefix + remainder for the input highlight overlay. */
+export function slashInputHighlight(
+  text: string,
+): { prefix: string; rest: string; color: string; id: string } | null {
   const lead = text.match(/^\s*/)?.[0] ?? "";
   const body = text.slice(lead.length);
   const ranked = [...SLASH_COMMANDS].sort((a, b) => b.trigger.length - a.trigger.length);
@@ -108,7 +126,12 @@ export function slashInputHighlight(text: string): { prefix: string; rest: strin
       body.startsWith(`${cmd.trigger} `) ||
       body.startsWith(`${cmd.trigger}\n`)
     ) {
-      return { prefix: lead + cmd.trigger, rest: body.slice(cmd.trigger.length) };
+      return {
+        prefix: lead + cmd.trigger,
+        rest: body.slice(cmd.trigger.length),
+        color: cmd.color,
+        id: cmd.id,
+      };
     }
   }
   return null;

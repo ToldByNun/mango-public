@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mango_tools.implementations.delete_file import delete_file
 from mango_tools.implementations.edit_file import edit_file
+from mango_tools.implementations.insert_lines import insert_lines
 from mango_tools.implementations.edit_symbol import edit_symbol
 from mango_tools.implementations.glob_files import glob_files
 from mango_tools.implementations.list_dir import list_dir
@@ -83,6 +84,24 @@ def register_builtin_tools(registry: ToolRegistry, *, enable_delete: bool | None
             "replace_all": {"type": "boolean", "description": "Replace all occurrences", "default": False},
         },
         required=["path", "old_string", "new_string"],
+    )
+    registry.register(
+        "insert_lines",
+        insert_lines,
+        description="Insert a multi-line block at a 1-based line (prefer fenced body after the JSON).",
+        parameters={
+            "path": {"type": "string", "description": "Target file path"},
+            "line": {
+                "type": "integer",
+                "description": "1-based line number where content is inserted (existing line shifts down)",
+            },
+            "content": {
+                "type": "string",
+                "description": "Multi-line text to insert (use ``` fence after the tool call for large blocks)",
+            },
+            "encoding": {"type": "string", "description": "Text encoding", "default": "utf-8"},
+        },
+        required=["path", "line"],
     )
     if enable_delete:
         registry.register(

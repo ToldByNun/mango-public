@@ -44,9 +44,12 @@ from mango_agent.experiment import (
 from mango_agent.impl_completeness import (
     find_impl_gaps,
     goal_wants_runnable_script,
+    looks_truncated_source,
     required_features,
     summarize_impl_status,
+    try_auto_add_entry_point,
 )
+from mango_agent.resolved_work import closed_items, merge_resolved
 from mango_agent.work_plan import build_work_plan
 from mango_agent.prompt import compose_agent_system_prompt, feedback, render_system_prompt
 from mango_agent.thinking import thinking_preset, verify_hint_for
@@ -55,6 +58,14 @@ from mango_agent.checkpoints import (
     paths_for_tool_call,
     snapshot_paths,
     undo_last_mutation as restore_last_mutation,
+)
+from mango_agent.coding_phase import (
+    CODING_PHASES,
+    PHASE_TOOLS,
+    THOUGHT_CAP_TOKENS,
+    CodingPhase,
+    forced_tool_for_phase,
+    resolve_coding_phase,
 )
 from mango_agent.flags import (
     OPTIONAL_TOOLS_TINY,
@@ -70,8 +81,10 @@ from mango_agent.flags import (
 from mango_agent.metrics import build_run_metrics, emit_stderr_json, persist_run_metrics
 from mango_agent.types import AgentResult, AgentStep, LoopMetrics, ModelRunnerProtocol, StopReason
 
-_CODE_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "edit_symbol", "rename_symbol", "delete_file"})
+_CODE_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "insert_lines", "edit_symbol", "rename_symbol", "delete_file"})
 _WORK_TOOLS = _CODE_MUTATING_TOOLS | {"run_tests", "run_terminal_command"}
+_ACTION_LOOP_NUDGE = 2
+_ACTION_LOOP_BLOCK = 1
 _RESEARCH_TOOLS = frozenset({"web_research", "doc_lookup", "package_source_lookup"})
 _ACTING_TOOLS = _WORK_TOOLS | _RESEARCH_TOOLS
 _INSPECT_TOOLS = frozenset(
@@ -216,6 +229,8 @@ _STALL_LIMIT = 4
 _WRITE_TOOL_MAX_TOKENS = 3072
 _TRUNCATED_WRITE_TOOL_MAX_TOKENS = 4096
 _CLI_SKELETON_WRITE_MAX_TOKENS = 1024
+_MIN_LOGIC_INSERT_LINES = 8
+_HOLLOW_SKELETON_MIN_LINES = 40
 _MAX_REASONING_CYCLES_PER_ITER = 3
 _UNFINISHED_ANSWER = re.compile(
     r"(?i)\b("
@@ -235,15 +250,21 @@ _CONCURRENCY_TEST = re.compile(
 )
 _FENCE_RE = re.compile(r"```[\w+-]*\n.*?```", re.DOTALL)
 _GOAL_WANTS_TESTS = re.compile(r"(?i)test_|pytest|\btests?\b|\bteste")
-# Explicit request to author tests — only this keeps agent-created test files
-# alive after the run ("schreibe tests", "write tests", "erstelle test_*.py").
+# Explicit request to author / keep tests. Includes "include unit tests",
+# "with tests covering", not only "write tests" / "schreibe tests".
 _GOAL_WANTS_TESTS_WRITTEN = re.compile(
-    r"(?i)\b(?:schreib\w*|erstell\w*|erzeug\w*|write|create|generate|add)\b"
-    r"(?:\s+\w+){0,3}?\s+\btest\w*"
+    r"(?i)(?:"
+    r"\b(?:schreib\w*|erstell\w*|erzeug\w*|write|create|generate|add|include|with)\b"
+    r"(?:\s+\w+){0,4}?\s+\btest\w*"
+    r"|\bunit\s+tests?\b"
+    r"|\btest\s+file\b"
+    r"|\btest_coverage\b"
+    r")"
 )
 # pytest exits 5 when the collected targets contain no tests — the classic
 # "run_tests before the test file was written" trap that loops forever.
 _PYTEST_NO_TESTS_EXIT = 5
+_PYTEST_COLLECTION_EXIT = 2
 # Shell shortcuts that read source — force read_file so the model sees full content.
 _SHELL_READ_CMD = re.compile(
     r"(?i)^\s*(?:type|cat|more|head|tail|Get-Content|gc)\s+[\"']?([^\s|&;\"']+)"
@@ -433,6 +454,7 @@ class Agent:
         self._inspected_once = False
         self._apis_declared_once = False
         self._epistemic_once = False
+        self._epistemic_failures = 0
         self._declared_libraries: list[str] = []
         if enable_declare_apis:
             self._register_declare_apis()
@@ -459,10 +481,21 @@ class Agent:
         self._write_truncation_streak = 0
         self._incomplete_impl_writes = 0
         self._prefer_edit_gaps = False
+        self._prefer_insert_lines = False
         self._run_tests_failures = 0
         self._runtime_smoke_failures = 0
         self._stress_nudges = 0
         self._prefer_write_file = False
+        self._goal_met = False
+        self._pytest_green = False
+        self._action_loop_force_write = False
+        self._action_loop_last_action = ""
+        self._call_fp_counts: dict[str, int] = {}
+        self._path_last_read_iter: dict[str, int] = {}
+        self._path_last_mutate_iter: dict[str, int] = {}
+        self._resolved_work: list[str] = []
+        self._reasserted_resolved: list[str] = []
+        self._last_open_impl_gaps: list[str] = []
         self._prefer_read_file = False
         self._forced_read_path = ""
         self._missing_attempted_paths: set[str] = set()
@@ -482,6 +515,7 @@ class Agent:
         self._step_tokens = 0
         self._syntax_emitted = False
         self._syntax_broken = False
+        self._tests_uncollectable: set[str] = set()
         self._run_id = ""
         self._task = ""
         self._experiment_reverts = 0
@@ -695,10 +729,20 @@ class Agent:
                 if useful and self._epistemic_covers_plan(question, output) and not import_miss:
                     self._epistemic_once = True
                     self._apis_declared_once = True
+                    self._epistemic_failures = 0
                     engine.set_verification_feedback(feedback("epistemic_ok"))
                 else:
+                    self._epistemic_failures = int(getattr(self, "_epistemic_failures", 0) or 0) + 1
                     needed = ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries()) or "the declared libraries"
-                    if import_miss or (
+                    # Soft-lock forever is the Discord-bot thrash. After two failed
+                    # lookups/installs, clear the gate and let the model write.
+                    if self._epistemic_failures >= 2:
+                        self._epistemic_once = True
+                        self._apis_declared_once = True
+                        engine.set_verification_feedback(
+                            feedback("epistemic_give_up", needed=needed)
+                        )
+                    elif import_miss or (
                         output.get("install_command") and not output.get("install_ok", True)
                     ):
                         pkgs = output.get("failed") or output.get("installed") or []
@@ -893,6 +937,9 @@ class Agent:
         self._write_truncation_streak = 0
         self._incomplete_impl_writes = 0
         self._prefer_edit_gaps = False
+        self._prefer_insert_lines = False
+        self._no_progress_writes = 0
+        self._last_mutation_snapshots: dict[str, str] = {}
         if self._require_tools:
             # UI create-from-scratch tasks should not scan/index the whole repo first.
             self._pending_symbol_lookups = []
@@ -906,6 +953,7 @@ class Agent:
         self._inspected_once = False
         self._apis_declared_once = False
         self._epistemic_once = False
+        self._epistemic_failures = 0
         self._research_done = set()
         self._declared_libraries = []
         self._idle_tool_retries = 0
@@ -922,14 +970,15 @@ class Agent:
             if self._task_wants_tests_override is not None
             else bool(_GOAL_WANTS_TESTS.search(task or ""))
         )
-        # Explicit "user wants tests kept" signal: "schreibe/erstelle Tests",
-        # "write tests", or a test file named in the goal. When set, agent-created
-        # test files are kept after the run instead of being cleaned up.
+        # Keep agent-authored tests when the goal asks for tests at all.
+        # Deleting them after a green run is why UI looked "done" with no tests.
         self._keep_agent_tests = bool(
-            _GOAL_WANTS_TESTS_WRITTEN.search(task or "")
-        ) or any(
-            _looks_like_test_path(rel)
-            for rel in (extract_goal_targets(task or "").files if task else ())
+            self._task_wants_tests
+            or _GOAL_WANTS_TESTS_WRITTEN.search(task or "")
+            or any(
+                _looks_like_test_path(rel)
+                for rel in (extract_goal_targets(task or "").files if task else ())
+            )
         )
         self._agent_created_test_paths = []
         self._impl_gaps = []
@@ -948,6 +997,7 @@ class Agent:
         self._write_truncation_streak = 0
         self._incomplete_impl_writes = 0
         self._prefer_edit_gaps = False
+        self._prefer_insert_lines = False
         self._edit_fail_counts = {}
         self._review_needed = False
         self._review_done = False
@@ -956,6 +1006,7 @@ class Agent:
         self._lock_coarsened = False
         self._syntax_broken = False
         self._syntax_emitted = False
+        self._tests_uncollectable = set()
         self._files_read = set()
         self._impl_mutated_once = False
         self._greenfield_run = not self._impl_python_files() and not self._discover_test_files()
@@ -999,11 +1050,15 @@ class Agent:
             self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
             # Cap constrained write so GBNF short-content rule can finish (skeleton only).
             self._write_tool_max_tokens = 768
-        elif self._cli_goal:
-            # Full CLI dumps truncate mid-JSON and loop forever (gauntlet G6).
+        elif self._inventory_cli_budget():
+            # Multi-feature inventory CLIs truncate mid-JSON — skeleton first.
+            # Integration bots (Discord→API) must NOT get this: they need full logic.
             engine.set_verification_feedback(feedback("cli_skeleton_first"))
             self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 96)
             self._write_tool_max_tokens = _CLI_SKELETON_WRITE_MAX_TOKENS
+        else:
+            # Discord bots / single-purpose scripts: full write budget (no skeleton cap).
+            self._write_tool_max_tokens = _WRITE_TOOL_MAX_TOKENS
         if self._agent_mode == "ask":
             engine.set_work_plan(
                 "ASK protocol:\n"
@@ -1046,16 +1101,9 @@ class Agent:
                 "4. Answer in chat — never mutate or run_tests"
             )
         elif self._agent_mode in {"agent", "work"}:
-            engine.set_work_plan(
-                "AGENT protocol:\n"
-                "1. Summarize task\n"
-                "2. Define APIs/interfaces\n"
-                "3. research_codebase (+ ask_epistemic after declare_apis for third-party)\n"
-                "4. CoT implementation order\n"
-                "5. Loop: implement slice → test when testable → next slice\n"
-                "6. Final in-depth summary (files, APIs, verification, open points)\n"
-                + build_work_plan(task)
-            )
+            # One short task-derived plan — do NOT restate the system protocol here
+            # (small models lose attention when the same ceremony is repeated 3x).
+            engine.set_work_plan(build_work_plan(task))
         else:
             engine.set_work_plan(build_work_plan(task))
         self._seed_impl_status(engine)
@@ -1294,6 +1342,7 @@ class Agent:
             # feedback (complete mode) can land in the same turn's Verification block.
             tool_names = self._action_tool_names() if self._use_tool_grammar else []
             self._apply_preferred_tool_feedback(engine)
+            self._apply_coding_phase_steering(engine)
             prompt = engine.build_idle_retry_prompt() if idle_retry else engine.build_prompt()
             try:
                 grammar = self._action_grammar(tool_names=tool_names)
@@ -1464,19 +1513,28 @@ class Agent:
                 if truncated:
                     self._write_truncation_streak += 1
                     self._last_tool_truncated = True
-                    if self._cli_goal or self._large_markup_goal or self._write_truncation_streak >= 2:
-                        # Raising the budget makes the dump-and-truncate loop worse.
+                    if self._inventory_cli_budget() or self._large_markup_goal:
+                        # Inventory/markup: smaller dumps beat endless truncate loops.
                         self._write_tool_max_tokens = min(
                             int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
-                            _CLI_SKELETON_WRITE_MAX_TOKENS if self._cli_goal else 768,
+                            _CLI_SKELETON_WRITE_MAX_TOKENS
+                            if self._inventory_cli_budget()
+                            else 768,
                         )
                         self._prefer_write_file = True
                         self._prefer_edit_gaps = False
+                        self._prefer_insert_lines = False
                     else:
+                        # Discord/integration: raise budget; extend via insert_lines.
                         self._write_tool_max_tokens = max(
-                            self._write_tool_max_tokens, _TRUNCATED_WRITE_TOOL_MAX_TOKENS
+                            int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
+                            _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
                         )
                         self._prefer_write_file = True
+                        if self._primary_impl_exists():
+                            self._prefer_insert_lines = True
+                            self._prefer_write_file = False
+                            self._prefer_edit_gaps = False
                 self._trace(
                     f"iter {iteration} no tool call"
                     + (" (truncated/invalid JSON)" if truncated else "")
@@ -1596,6 +1654,7 @@ class Agent:
                             )
                         )
                         if self._ran_tests_ok and not self._design_review_blocked():
+                            self._mark_goal_met_if_ready(engine)
                             return self._complete(
                                 steps=steps,
                                 iterations=iteration,
@@ -1635,10 +1694,23 @@ class Agent:
                         self._prefer_write_file = True
                         # Next thought must stay tiny; the model was dumping the page into chat.
                         self._thought_max_tokens = min(int(self._thought_max_tokens or 128), 64)
-                        if self._cli_goal:
+                        if self._inventory_cli_budget():
                             engine.set_verification_feedback(feedback("truncated_write_cli"))
                         elif self._large_markup_goal or ".html" in model_output.lower():
                             engine.set_verification_feedback(feedback("truncated_write_markup"))
+                        elif self._primary_impl_exists():
+                            path_hint, line_hint = self._suggested_insert_hint()
+                            self._prefer_insert_lines = True
+                            self._prefer_write_file = False
+                            self._prefer_edit_gaps = False
+                            engine.set_verification_feedback(
+                                feedback(
+                                    "impl_logic_missing",
+                                    gaps="- previous write truncated — insert the missing logic",
+                                    path=path_hint,
+                                    line=str(line_hint),
+                                )
+                            )
                         else:
                             engine.set_verification_feedback(feedback("truncated_json"))
                     elif unfinished:
@@ -1758,6 +1830,8 @@ class Agent:
             for call in tool_calls:
                 self._trace(f"iter {iteration} tool={call.name} {_compact_args(call.arguments)}")
             snapshots = self._snapshot_paths(tool_calls)
+            self._last_mutation_snapshots = dict(snapshots)
+            gaps_before_mutation = list(self._impl_gaps)
             pending_tools = [call.name for call in tool_calls]
             self._last_hypothesis = hypothesis_from_thought(" ".join(self._thought_log))
             will_mutate = any(call.name in _CODE_MUTATING_TOOLS for call in tool_calls)
@@ -1836,6 +1910,10 @@ class Agent:
                     error="cancelled",
                 )
             tool_results = self._reject_fuzzy_edits(tool_results)
+            tool_results = self._reject_nibble_mutations(tool_results, snapshots)
+            tool_results = self._reject_unchanged_gap_mutations(
+                engine, tool_results, gaps_before_mutation
+            )
             tool_results = self._fallback_failed_edits(tool_results)
             self._note_tool_result_metrics(tool_results)
             self._note_review_reads(engine, tool_results)
@@ -1907,29 +1985,121 @@ class Agent:
             if not syntax_bad:
                 self._handle_run_tests_results(tool_results, engine)
             self._refresh_impl_completeness(engine)
-            if (
-                self._cli_goal
-                and self._impl_gaps
-                and any(result.success and result.tool_name == "write_file" for result in tool_results)
+            # Heal sole missing entry BEFORE tests — otherwise CLI goals thrash
+            # rewrite/edit forever and never reach write_file(test_*.py)/run_tests.
+            if self._impl_gaps and all(
+                "entry point" in str(gap).lower() for gap in self._impl_gaps
             ):
-                self._incomplete_impl_writes += 1
-                if self._incomplete_impl_writes >= 1:
-                    # File exists but still gappy — stop full rewrites; edit the gaps.
-                    self._prefer_edit_gaps = True
-                    self._prefer_write_file = False
-                    self._prefer_read_file = True
-                    primary = self._primary_impl_path()
-                    if primary:
-                        self._forced_read_path = primary
+                if self._auto_heal_missing_entry_points(engine):
+                    self._prefer_edit_gaps = False
+                    self._prefer_insert_lines = False
+                    self._prefer_write_file = bool(
+                        self._task_wants_tests and not self._discover_test_files()
+                    )
+            if (
+                self._impl_gaps
+                and any(
+                    result.success and result.tool_name in {"write_file", "edit_file", "insert_lines"}
+                    for result in tool_results
+                )
+            ):
+                logic = self._logic_gaps()
+                if logic:
+                    # Missing real behavior — extend the skeleton with insert_lines
+                    # instead of rewriting the whole file (truncates on small models).
+                    self._incomplete_impl_writes += 1
+                    self._prefer_edit_gaps = False
+                    self._prefer_read_file = False
+                    self._forced_read_path = ""
+                    path_hint, line_hint = self._suggested_insert_hint()
+                    if self._primary_impl_exists() and "insert_lines" in set(
+                        self._enabled_registry_names()
+                    ):
+                        self._prefer_insert_lines = True
+                        self._prefer_write_file = False
+                        self._action_loop_force_write = False
+                    else:
+                        self._prefer_insert_lines = False
+                        self._prefer_write_file = True
+                        self._action_loop_force_write = bool(
+                            "write_file" in set(self._enabled_registry_names())
+                        )
+                        self._write_tool_max_tokens = max(
+                            int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
+                            _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
+                        )
                     engine.set_verification_feedback(
                         feedback(
-                            "impl_incomplete",
-                            gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                            "impl_logic_missing",
+                            gaps="\n".join(f"- {gap}" for gap in logic[:8]),
+                            path=path_hint,
+                            line=str(line_hint),
                         )
                     )
-            elif self._cli_goal and not self._impl_gaps:
+                elif self._inventory_cli_budget():
+                    self._incomplete_impl_writes += 1
+                    if self._incomplete_impl_writes >= 1:
+                        # Inventory CLI: grow via small edits after a skeleton exists.
+                        self._prefer_edit_gaps = True
+                        self._prefer_write_file = False
+                        self._prefer_read_file = True
+                        primary = self._primary_impl_path()
+                        if primary:
+                            self._forced_read_path = primary
+                        path_hint, line_hint = self._suggested_insert_hint()
+                        engine.set_verification_feedback(
+                            feedback(
+                                "impl_incomplete",
+                                gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                                path=path_hint,
+                                line=str(line_hint),
+                            )
+                        )
+                else:
+                    # Bot / integration: extend skeleton — never ±3-line edit thrash.
+                    path_hint, line_hint = self._suggested_insert_hint()
+                    if "insert_lines" in set(self._enabled_registry_names()):
+                        self._prefer_insert_lines = True
+                        self._prefer_edit_gaps = False
+                        self._prefer_write_file = False
+                        engine.set_verification_feedback(
+                            feedback(
+                                "impl_logic_missing",
+                                gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                                path=path_hint,
+                                line=str(line_hint),
+                            )
+                        )
+                    else:
+                        self._prefer_edit_gaps = True
+                        self._prefer_write_file = False
+                        engine.set_verification_feedback(
+                            feedback(
+                                "impl_incomplete",
+                                gaps="\n".join(f"- {gap}" for gap in self._impl_gaps[:8]),
+                                path=path_hint,
+                                line=str(line_hint),
+                            )
+                        )
+            elif not self._impl_gaps:
                 self._prefer_edit_gaps = False
+                self._prefer_insert_lines = False
                 self._incomplete_impl_writes = 0
+                self._action_loop_force_write = False
+            # Impl settled (or healed) but goal still wants tests and none exist.
+            if (
+                self._task_wants_tests
+                and not self._discover_test_files()
+                and self._impl_python_files()
+                and not self._syntax_broken
+            ):
+                self._prefer_write_file = True
+                self._prefer_edit_gaps = False
+                self._prefer_insert_lines = False
+                self._prefer_read_file = False
+                self._forced_read_path = ""
+                self._action_loop_force_write = False
+                engine.set_verification_feedback(feedback("tests_before_run"))
             auto_results = [] if syntax_bad else self._auto_run_tests_if_needed(tool_results, iteration)
             if auto_results:
                 tool_results = [*tool_results, *auto_results]
@@ -1950,14 +2120,25 @@ class Agent:
                     )
                 elif self._review_hold == 0 and self._stress_nudges == 0:
                     self._note_repo_impact(engine, tool_results)
+            tests_still_on_disk = (
+                not self._task_wants_tests or bool(self._discover_test_files())
+            )
             if (
                 not reverted
                 and self._require_tools
-                and self._task_wants_tests
-                and self._ran_tests_ok
                 and not self._syntax_broken
                 and not self._design_review_blocked()
+                and tests_still_on_disk
+                and (
+                    self._goal_met
+                    or (
+                        (self._ran_tests_ok or getattr(self, "_pytest_green", False))
+                        and not self._impl_gaps
+                        and not self._tests_still_required()
+                    )
+                )
             ):
+                self._mark_goal_met_if_ready(engine)
                 self._emit_tool_events(tool_calls, tool_results, snapshots, skip_files=True)
                 steps.append(
                     self._record_step(
@@ -2056,6 +2237,8 @@ class Agent:
         return self._remaining_seconds() <= 0
 
     def _finish_allowed(self) -> bool:
+        if self._goal_met:
+            return True
         if self._plan_mode:
             # Plan runs deliver a markdown plan in the chat: no impl gates apply.
             return self._acted_once or not self._require_tools
@@ -2068,8 +2251,6 @@ class Agent:
         if self._missing_goal_deliverables():
             return False
         if self._tests_still_required():
-            return False
-        if self._design_review_still_required() or self._review_hold > 0:
             return False
         if (
             self._grounded_edits_enabled()
@@ -2494,6 +2675,8 @@ class Agent:
         self._stall_repeats = 0
 
     def _needs_tool(self) -> bool:
+        if self._goal_met:
+            return False
         if self._plan_mode:
             # One successful read/lookup is enough; then the plan markdown may finish.
             return not self._acted_once
@@ -2562,9 +2745,123 @@ class Agent:
                 unread.append(rel_norm)
         return unread
 
+    def _apply_coding_phase_steering(self, engine: ContextEngine) -> None:
+        """Attention diet + one clear NEXT for coding phases."""
+        phase = self._resolve_coding_phase()
+        slim = phase in CODING_PHASES
+        engine.set_coding_attention_slim(slim)
+        if slim:
+            self._thought_max_tokens = min(
+                int(self._thought_max_tokens or THOUGHT_CAP_TOKENS),
+                THOUGHT_CAP_TOKENS,
+            )
+        # Prefer write/insert flags stay derived from the phase.
+        if phase is CodingPhase.CODE_REPAIR:
+            self._prefer_write_file = True
+            self._prefer_insert_lines = False
+            self._prefer_edit_gaps = False
+        elif phase is CodingPhase.CODE_COMPLETE:
+            self._prefer_write_file = True
+            self._prefer_insert_lines = False
+        elif phase is CodingPhase.CODE_EXTEND:
+            self._prefer_insert_lines = True
+            self._prefer_write_file = False
+            self._prefer_edit_gaps = False
+
+        existing = str(getattr(engine.state, "verification_feedback", "") or "")
+        # Do not clobber hard blocks (nibble / gap / hollow / syntax reports).
+        hard = (
+            "BLOCKED",
+            "PHASE=",
+            "Syntax error",
+            "syntax_broken",
+            "truncated_write",
+            "Tests still",
+            "GOAL ALREADY MET",
+        )
+        if any(token in existing for token in hard):
+            return
+        path_hint, line_hint = self._suggested_insert_hint()
+        if phase is CodingPhase.CODE_REPAIR:
+            engine.set_verification_feedback(
+                feedback("coding_repair", path=path_hint or "impl.py")
+            )
+        elif phase is CodingPhase.CODE_COMPLETE:
+            deliverable = (
+                path_hint
+                or (self._goal_deliverable_files[0] if self._goal_deliverable_files else "")
+                or "impl.py"
+            )
+            engine.set_verification_feedback(
+                feedback("coding_complete", path=deliverable)
+            )
+        elif phase is CodingPhase.CODE_EXTEND:
+            gaps = self._logic_gaps() or self._impl_gaps
+            engine.set_verification_feedback(
+                feedback(
+                    "coding_extend",
+                    path=path_hint,
+                    line=str(line_hint),
+                    gaps="\n".join(f"- {gap}" for gap in gaps[:6]),
+                )
+            )
+
+    def _resolve_coding_phase(self) -> "CodingPhase":
+        """Single source of truth for what the agent must do this turn."""
+        return resolve_coding_phase(
+            plan_gate_phase=self._plan_gate_phase(),
+            syntax_broken=bool(self._syntax_broken),
+            collection_error=bool(
+                self._context is not None
+                and getattr(self._context.state, "verification_collection_error", False)
+            ),
+            primary_impl_exists=self._primary_impl_exists(),
+            has_logic_gaps=bool(self._logic_gaps()),
+            task_wants_tests=bool(self._task_wants_tests),
+            ran_tests_ok=bool(self._ran_tests_ok or getattr(self, "_pytest_green", False)),
+            test_files_exist=bool(self._discover_test_files()) if self._task_wants_tests else True,
+            tests_uncollectable=bool(self._tests_uncollectable) and bool(self._task_wants_tests),
+        )
+
     def _forced_tool_name(self) -> str | None:
         """When set, GBNF may emit only this tool — stops edit/read ping-pong on small models."""
         enabled = set(self._enabled_registry_names())
+        if getattr(self, "_goal_met", False):
+            return None
+        # Phase machine first: syntax beats gaps, gaps beat everything else.
+        phase = self._resolve_coding_phase()
+        forced = forced_tool_for_phase(phase, enabled)
+        if phase is CodingPhase.CODE_REPAIR:
+            if not self._tests_uncollectable and self._primary_impl_path():
+                # Repair the broken impl file specifically.
+                pass
+            return forced
+        if phase in (CodingPhase.CODE_COMPLETE, CodingPhase.CODE_EXTEND):
+            return forced
+        if phase is CodingPhase.TEST:
+            # Never sole-force run_tests (wordstats loop) — ordering handles it.
+            return None
+        # Uncollectable tests (pytest exit 5) beat everything: re-running can
+        # never succeed, so the ONLY way out is a full rewrite of the test file.
+        if self._tests_uncollectable and "write_file" in enabled:
+            return "write_file"
+        # Missing core behavior (HTTP/send/handlers): extend skeleton, not micro-edit.
+        if self._logic_gaps() or getattr(self, "_prefer_insert_lines", False):
+            if self._primary_impl_exists() and "insert_lines" in enabled:
+                return "insert_lines"
+            if "write_file" in enabled:
+                return "write_file"
+        # Non-inventory bot gaps with an existing skeleton → insert, not edit thrash.
+        if (
+            self._impl_gaps
+            and self._cli_goal
+            and not self._inventory_cli_budget()
+            and self._primary_impl_exists()
+            and "insert_lines" in enabled
+        ):
+            return "insert_lines"
+        if getattr(self, "_action_loop_force_write", False) and "write_file" in enabled:
+            return "write_file"
         # Missing-file redirect beats research-read lock: once the model tried to
         # touch a non-existent deliverable and inputs are done, force write_file.
         if (
@@ -2578,14 +2875,20 @@ class Agent:
             return "read_file"
         if self._prefer_write_file and self._missing_attempted_paths and "write_file" in enabled:
             return "write_file"
-        # CLI gap fill: never force another full write_file dump.
+        # Broken syntax + edit streak: full rewrite beats endless failed edit_file.
+        if (
+            self._syntax_broken
+            and self._prefer_edit_gaps
+            and int(getattr(self, "_metric_edit_fail", 0) or 0) >= 2
+            and "write_file" in enabled
+        ):
+            return "write_file"
+        # CLI gap fill: prefer edit via ordering, but NEVER sole-force edit_file —
+        # that strips run_tests/write_file and causes "Tests never passed" thrash.
         if self._prefer_edit_gaps and self._impl_gaps:
             if self._prefer_read_file and "read_file" in enabled:
                 return "read_file"
-            if "edit_file" in enabled:
-                return "edit_file"
-            if "write_file" in enabled:
-                return "write_file"
+            return None
         if self._prefer_read_file and "read_file" in enabled:
             return "read_file"
         if (
@@ -2681,6 +2984,13 @@ class Agent:
             _add("declare_apis", "ask_epistemic", "research_codebase", "read_file", "search_code")
         elif phase == "epistemic":
             _add("ask_epistemic", "research_codebase", "read_file", "search_code")
+        elif self._resolve_coding_phase() in CODING_PHASES:
+            # Attention on code: the phase dictates the single next mutation tool.
+            coding = self._resolve_coding_phase()
+            if coding is CodingPhase.CODE_EXTEND:
+                _add("insert_lines", "write_file", "edit_file", "read_file")
+            else:
+                _add("write_file", "insert_lines", "edit_file", "read_file")
         elif self._agent_mode in {"agent", "work", "debug", "refactor"} and not self._acted_once:
             _add(
                 "research_codebase",
@@ -2708,6 +3018,8 @@ class Agent:
                 _add("edit_file", "read_file", "write_file", "run_tests")
         elif self._prefer_write_file:
             _add("write_file", "edit_file", "read_file")
+        elif getattr(self, "_prefer_insert_lines", False) and self._logic_gaps():
+            _add("insert_lines", "read_file", "edit_file", "write_file")
         elif self._prefer_edit_gaps and self._impl_gaps:
             if self._prefer_read_file:
                 _add("read_file", "edit_file", "write_file")
@@ -2793,6 +3105,22 @@ class Agent:
         forced = self._forced_tool_name()
         if forced and forced in names:
             return [forced]
+        # Defense in depth: even without sole-force, coding phases never offer
+        # edit_file/read ping-pong — REPAIR=write_file, EXTEND=insert_lines.
+        phase = self._resolve_coding_phase()
+        if phase in (CodingPhase.CODE_REPAIR, CodingPhase.CODE_COMPLETE):
+            allowed = {name for name in PHASE_TOOLS[phase] if name in names}
+            if allowed:
+                return list(allowed)
+        if phase is CodingPhase.CODE_EXTEND:
+            allowed = {
+                name
+                for name in ("insert_lines", "write_file")
+                if name in names
+            }
+            if allowed:
+                ordered = [n for n in ("insert_lines", "write_file") if n in allowed]
+                return ordered
         if self._research_inputs_unread():
             if "read_file" in self._enabled_registry_names():
                 names = ["read_file"]
@@ -2837,7 +3165,10 @@ class Agent:
         if self._grounded_edits_enabled() or self._require_tools:
             names = [name for name in names if name != "run_terminal_command"]
         if self._prefer_read_file and "read_file" in names:
-            if self._rename_pair and "rename_symbol" in names:
+            # Never sole-lock read when core behavior is missing — insert/write first.
+            if self._logic_gaps() or getattr(self, "_prefer_insert_lines", False):
+                pass
+            elif self._rename_pair and "rename_symbol" in names:
                 names = ["read_file", "rename_symbol"]
             else:
                 names = ["read_file"]
@@ -2846,9 +3177,37 @@ class Agent:
             names = [name for name in names if name != "run_terminal_command"]
         if self._impl_gaps and self._plan_gate_phase() is None:
             names = [name for name in names if name != "run_terminal_command"]
-            if self._prefer_edit_gaps:
-                names = [name for name in names if name in {"read_file", "edit_file", "write_file"}]
-                if not self._prefer_read_file and "edit_file" in names:
+            if self._logic_gaps() or getattr(self, "_prefer_insert_lines", False):
+                allowed = {"insert_lines", "read_file", "write_file"}
+                names = [name for name in names if name in allowed]
+                if "insert_lines" in names:
+                    names = ["insert_lines", *[n for n in names if n != "insert_lines"]]
+            elif self._prefer_edit_gaps:
+                allowed = {"read_file", "edit_file", "write_file", "insert_lines"}
+                # Keep run_tests available when tests exist but are not green yet —
+                # sole edit_file grammar is the wordstats "Tests never passed" loop.
+                if (
+                    self._tests_still_required()
+                    and self._discover_test_files()
+                    and "run_tests" in self._enabled_registry_names()
+                ):
+                    allowed.add("run_tests")
+                # Missing tests: keep write_file + run_tests path open (do not edit-only).
+                if self._tests_still_required() and not self._discover_test_files():
+                    allowed.add("write_file")
+                    if "run_tests" in self._enabled_registry_names():
+                        # Still useless without files, but don't hard-lock the grammar.
+                        pass
+                names = [name for name in names if name in allowed]
+                if (
+                    self._tests_still_required()
+                    and not self._discover_test_files()
+                    and "write_file" in names
+                ):
+                    names = ["write_file", *[n for n in names if n != "write_file"]]
+                elif not self._prefer_read_file and "insert_lines" in names and self._logic_gaps():
+                    names = ["insert_lines", *[n for n in names if n != "insert_lines"]]
+                elif not self._prefer_read_file and "edit_file" in names:
                     names = ["edit_file", *[n for n in names if n != "edit_file"]]
         return names
 
@@ -2901,6 +3260,13 @@ class Agent:
                 ]
             else:
                 names = ["run_tests", *[name for name in names if name != "run_tests"]]
+        elif getattr(self, "_pytest_green", False) or self._ran_tests_ok:
+            # Pytest already green — never prefer another run_tests; finish or fix gaps.
+            names = [name for name in names if name != "run_tests"]
+            if self._impl_gaps and "edit_file" in names:
+                names = ["edit_file", *[n for n in names if n != "edit_file"]]
+            elif self._impl_gaps and "write_file" in names and self._prefer_write_file:
+                names = ["write_file", *[n for n in names if n != "write_file"]]
         elif self._design_review_still_required() and "read_file" in names:
             names = ["read_file"]
         elif self._lock_coarsened and self._review_done and "edit_file" in names:
@@ -2999,10 +3365,32 @@ class Agent:
                 "truncated" in err_l or "incomplete" in err_l
             ):
                 self._write_truncation_streak += 1
-                if self._cli_goal:
+                if self._inventory_cli_budget():
                     self._write_tool_max_tokens = _CLI_SKELETON_WRITE_MAX_TOKENS
                     self._prefer_write_file = True
                     lines.append(feedback("truncated_write_cli"))
+                else:
+                    self._write_tool_max_tokens = max(
+                        int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
+                        _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
+                    )
+                    if self._primary_impl_exists() and "insert_lines" in set(
+                        self._enabled_registry_names()
+                    ):
+                        self._prefer_insert_lines = True
+                        self._prefer_write_file = False
+                        self._prefer_edit_gaps = False
+                        path_hint, line_hint = self._suggested_insert_hint()
+                        lines.append(
+                            feedback(
+                                "impl_logic_missing",
+                                gaps="- write truncated — insert the missing logic",
+                                path=path_hint,
+                                line=str(line_hint),
+                            )
+                        )
+                    else:
+                        self._prefer_write_file = True
             if (
                 path
                 and "old_string not found" not in err_l
@@ -3298,6 +3686,7 @@ class Agent:
             if path:
                 abs_path = self._abs_impl_path(path)
                 self._files_read.add(abs_path)
+                self._path_last_read_iter[abs_path] = int(getattr(self, "_current_iteration", 0))
                 # Relative follow-up calls should resolve next to the file the
                 # model just read — that is its de-facto working directory when
                 # no workspace was declared.
@@ -3322,12 +3711,315 @@ class Agent:
                     # Created the missing file — stop forcing write_file.
                     pass
             if _looks_like_test_path(abs_path) and Path(abs_path).is_file():
+                # A successful write/edit proves the file is collectable again.
+                self._tests_uncollectable.discard(abs_path)
                 # Track scratch tests so they can be removed at run end when the
                 # user never asked for tests (see _cleanup_agent_tests).
                 if abs_path not in self._agent_created_test_paths:
                     self._agent_created_test_paths.append(abs_path)
             if raw and not _looks_like_test_path(raw):
                 self._impl_mutated_once = True
+            self._path_last_mutate_iter[abs_path] = int(getattr(self, "_current_iteration", 0))
+
+    def _logic_gap_block_reason(self, call: ToolCall) -> str | None:
+        """Ban ±3-line edit_file while core behavior is still missing."""
+        if call.name != "edit_file":
+            return None
+        if not self._logic_gaps() and not getattr(self, "_prefer_insert_lines", False):
+            return None
+        path_hint, line_hint = self._suggested_insert_hint()
+        self._prefer_insert_lines = True
+        self._prefer_edit_gaps = False
+        return feedback(
+            "nibble_edit_blocked",
+            path=path_hint,
+            line=str(line_hint),
+            gaps="\n".join(f"- {gap}" for gap in (self._logic_gaps() or self._impl_gaps)[:6]),
+        )
+
+    def _reject_nibble_mutations(
+        self,
+        tool_results: list[ToolResult],
+        snapshots: dict[str, str],
+    ) -> list[ToolResult]:
+        """Undo tiny patches that leave logic gaps open — they burn iterations."""
+        pre_logic = list(self._logic_gaps() or [])
+        if not pre_logic and not getattr(self, "_prefer_insert_lines", False):
+            return tool_results
+        rewritten: list[ToolResult] = []
+        for result in tool_results:
+            if not result.success or result.tool_name not in {"edit_file", "insert_lines", "edit_symbol"}:
+                rewritten.append(result)
+                continue
+            call = getattr(result, "call", None)
+            arguments = getattr(call, "arguments", None) if call is not None else None
+            path = ""
+            content = ""
+            if isinstance(arguments, dict):
+                path = str(arguments.get("path") or "")
+                content = str(
+                    arguments.get("content")
+                    or arguments.get("new_string")
+                    or arguments.get("body")
+                    or ""
+                )
+            abs_path = self._abs_impl_path(path) if path else ""
+            lines_added = 0
+            if result.tool_name == "insert_lines" and isinstance(result.output, dict):
+                lines_added = int(result.output.get("lines_inserted") or 0)
+            else:
+                lines_added = len([ln for ln in content.splitlines() if ln.strip()])
+
+            tiny = lines_added < _MIN_LOGIC_INSERT_LINES
+            addresses = self._content_addresses_logic_gaps(content, pre_logic)
+            if result.tool_name == "edit_file" or (tiny and not addresses):
+                if abs_path and abs_path in snapshots:
+                    previous = snapshots[abs_path]
+                    try:
+                        if previous:
+                            Path(abs_path).write_text(previous, encoding="utf-8")
+                        elif Path(abs_path).is_file() and not previous:
+                            # New file nibble — leave file but still fail the result.
+                            pass
+                    except OSError:
+                        pass
+                path_hint, line_hint = self._suggested_insert_hint()
+                self._prefer_insert_lines = True
+                self._prefer_edit_gaps = False
+                rewritten.append(
+                    ToolResult(
+                        success=False,
+                        tool_name=result.tool_name,
+                        error=feedback(
+                            "nibble_edit_blocked",
+                            path=path_hint,
+                            line=str(line_hint),
+                            gaps="\n".join(f"- {gap}" for gap in pre_logic[:6]),
+                        ),
+                        call=call,
+                        metadata={"nibble_rejected": True, "lines_added": lines_added},
+                    )
+                )
+                continue
+            rewritten.append(result)
+        return rewritten
+
+    def _reject_unchanged_gap_mutations(
+        self,
+        engine: ContextEngine,
+        tool_results: list[ToolResult],
+        gaps_before: list[str],
+    ) -> list[ToolResult]:
+        """Close-the-loop gate: a successful mutation MUST close a work item.
+
+        If the same logic gaps are still open after the mutation, the result is
+        turned into a failure, the file snapshot is restored, and repeated
+        no-progress escalates EXTEND -> REPAIR (full rewrite).
+        """
+        mutating = {"write_file", "insert_lines", "edit_file", "edit_symbol"}
+        if not any(r.success and r.tool_name in mutating for r in tool_results):
+            return tool_results
+        # Re-scan AFTER the mutation.
+        primary = self._primary_impl_path()
+        if primary:
+            self._update_impl_status_from_path(engine, primary)
+        gaps_after = list(self._impl_gaps)
+
+        def _norm(gaps: list[str]) -> set[str]:
+            # Compare gap bodies only — display path prefixes vary (rel vs abs).
+            out: set[str] = set()
+            for g in gaps:
+                text = str(g).strip().lower()
+                if ": " in text:
+                    text = text.split(": ", 1)[1]
+                out.add(text)
+            return out
+
+        before_keys = _norm(gaps_before)
+        after_keys = _norm(gaps_after)
+        closed_any = bool(before_keys - after_keys)
+        if self._integration_goal():
+            # Integration bots: closing a cosmetic "incomplete" gap while HTTP/send/entry
+            # remain is NOT progress — require a logic-gap key to disappear.
+            def _is_logic(key: str) -> bool:
+                return any(
+                    token in key
+                    for token in (
+                        "http",
+                        "api",
+                        "model host",
+                        "send",
+                        "reply",
+                        "bot.run",
+                        "client.run",
+                        "entry point",
+                        "bot start",
+                        "truncated",
+                        "stub",
+                        "early-return",
+                        "goal needs",
+                    )
+                )
+
+            logic_before = {k for k in before_keys if _is_logic(k)}
+            logic_after = {k for k in after_keys if _is_logic(k)}
+            if logic_before:
+                closed_any = bool(logic_before - logic_after)
+        hollow_rejects = self._reject_hollow_skeleton_writes(tool_results, engine)
+        if hollow_rejects:
+            tool_results = hollow_rejects
+        still_failing = [r for r in tool_results if r.success and r.tool_name in mutating]
+        if not still_failing or closed_any:
+            self._no_progress_writes = 0
+            return tool_results
+        # Same gaps open after mutation -> revert + fail.
+        reverted = False
+        for result in still_failing:
+            call = getattr(result, "call", None)
+            arguments = getattr(call, "arguments", None) if call is not None else None
+            path = str(arguments.get("path") or "") if isinstance(arguments, dict) else ""
+            abs_path = self._abs_impl_path(path) if path else ""
+            if abs_path and abs_path in getattr(self, "_last_mutation_snapshots", {}):
+                previous = self._last_mutation_snapshots[abs_path]
+                try:
+                    if previous:
+                        Path(abs_path).write_text(previous, encoding="utf-8")
+                        reverted = True
+                except OSError:
+                    pass
+        self._no_progress_writes = int(getattr(self, "_no_progress_writes", 0)) + 1
+        path_hint, line_hint = self._suggested_insert_hint()
+        template = (
+            "gap_not_closed_rewrite"
+            if self._no_progress_writes >= 2
+            else "gap_not_closed"
+        )
+        if self._no_progress_writes >= 2:
+            # Escalate: two identical-gap mutations -> force full rewrite next turn.
+            self._prefer_write_file = True
+            self._prefer_insert_lines = False
+            self._syntax_broken = False
+        error_text = feedback(
+            template,
+            gaps="\n".join(f"- {gap}" for gap in (gaps_after or gaps_before)[:6]),
+            path=path_hint,
+            line=str(line_hint),
+        )
+        failed_keys = {id(r) for r in still_failing}
+        rewritten: list[ToolResult] = []
+        for result in tool_results:
+            if id(result) in failed_keys:
+                call = getattr(result, "call", None)
+                rewritten.append(
+                    ToolResult(
+                        success=False,
+                        tool_name=result.tool_name,
+                        error=error_text,
+                        call=call,
+                        metadata={
+                            "gap_not_closed": True,
+                            "reverted": reverted,
+                            "gaps_before": len(gaps_before),
+                            "gaps_after": len(gaps_after),
+                        },
+                    )
+                )
+            else:
+                rewritten.append(result)
+        return rewritten
+
+    def _reject_hollow_skeleton_writes(
+        self, tool_results: list[ToolResult], engine: ContextEngine
+    ) -> list[ToolResult] | None:
+        """Integration goals must never bank an 8-line skeleton as progress."""
+        if not self._integration_goal():
+            return None
+        rewritten: list[ToolResult] | None = None
+        for idx, result in enumerate(tool_results):
+            if not result.success or result.tool_name != "write_file":
+                continue
+            call = getattr(result, "call", None)
+            arguments = getattr(call, "arguments", None) if call is not None else None
+            path = str(arguments.get("path") or "") if isinstance(arguments, dict) else ""
+            abs_path = self._abs_impl_path(path) if path else ""
+            file_path = Path(abs_path) if abs_path else None
+            if file_path is None or not file_path.is_file():
+                continue
+            try:
+                source = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            line_count = len(source.splitlines())
+            gaps = find_impl_gaps(
+                source, self._task or "", path=self._display_path(abs_path)
+            )
+            if line_count >= _HOLLOW_SKELETON_MIN_LINES and not gaps:
+                continue
+            if not gaps and line_count >= _HOLLOW_SKELETON_MIN_LINES:
+                continue
+            if line_count < _HOLLOW_SKELETON_MIN_LINES and gaps:
+                # Keep the skeleton on disk so the next turn can CODE_EXTEND via
+                # insert_lines. Deleting it caused "no files recorded" + endless
+                # rewrite thrash (every write rejected → file gone → write again).
+                self._prefer_insert_lines = True
+                self._prefer_write_file = False
+                self._prefer_edit_gaps = False
+                if rewritten is None:
+                    rewritten = list(tool_results)
+                path_hint, line_hint = self._suggested_insert_hint()
+                rewritten[idx] = ToolResult(
+                    success=False,
+                    tool_name=result.tool_name,
+                    error=feedback(
+                        "hollow_skeleton_blocked",
+                        path=self._display_path(abs_path) or path_hint,
+                        min_lines=str(_HOLLOW_SKELETON_MIN_LINES),
+                        gaps="\n".join(f"- {gap}" for gap in gaps[:6]),
+                    ),
+                    call=call,
+                    metadata={
+                        "hollow_skeleton": True,
+                        "line_count": line_count,
+                        "kept_on_disk": True,
+                    },
+                )
+        return rewritten
+
+    def _integration_goal(self) -> bool:
+        task = (self._task or "").lower()
+        markers = ("discord", "bot", "telegram", "slack bot", "webhook", "lm studio", "ollama", "api server", "flask", "fastapi")
+        return any(m in task for m in markers)
+
+    @staticmethod
+    def _content_addresses_logic_gaps(content: str, gaps: list[str]) -> bool:
+        text = (content or "").lower()
+        if not text.strip():
+            return False
+        blob = " ".join(str(g).lower() for g in gaps)
+        checks: list[tuple[str, tuple[str, ...]]] = [
+            ("http", ("requests.", "httpx.", "aiohttp.", "urllib", "/v1/chat", "chat/completions")),
+            ("send/reply", (".send(", ".reply(", "channel.send", "send_message")),
+            ("bot.run", ("bot.run(", "client.run(")),
+            ("entry", ('__name__ == "__main__"', "__name__ == '__main__'")),
+            ("early-return", ("requests.", ".send(", ".reply(", "bot.run(")),
+            ("truncated", ("requests.", ".send(", ".reply(", "bot.run(")),
+            ("incomplete", ("requests.", ".send(", ".reply(", "bot.run(")),
+        ]
+        for key, needles in checks:
+            if key in blob and any(n in text for n in needles):
+                return True
+        # Generic: any HTTP/send/run marker counts as real logic.
+        return any(
+            n in text
+            for n in (
+                "requests.",
+                "httpx.",
+                ".send(",
+                ".reply(",
+                "bot.run(",
+                "client.run(",
+            )
+        )
 
     def _reject_fuzzy_edits(self, tool_results: list[ToolResult]) -> list[ToolResult]:
         if not self._grounded_edits_enabled():
@@ -3360,6 +4052,17 @@ class Agent:
         return rewritten
 
     def _execute_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolResult]:
+        filtered: list[ToolCall] = []
+        blocked_only: list[ToolResult] = []
+        for call in tool_calls:
+            reason = self._action_loop_block_reason(call)
+            if reason:
+                blocked_only.append(ToolResult(success=False, tool_name=call.name, error=reason, call=call, metadata={"blocked": True}))
+            else:
+                filtered.append(call)
+        tool_calls = filtered
+        if blocked_only and not tool_calls:
+            return blocked_only
         phase = self._plan_gate_phase()
         tool_ctx = {**self._tool_context(), "_cancelled": self._cancelled}
         if phase is not None:
@@ -3446,6 +4149,8 @@ class Agent:
         grounded_blocked: list[ToolResult] = []
         for call in tool_calls:
             reason = self._grounding_block_reason(call)
+            if reason is None:
+                reason = self._logic_gap_block_reason(call)
             if reason:
                 grounded_blocked.append(
                     ToolResult(
@@ -3471,7 +4176,61 @@ class Agent:
         tool_ctx: dict[str, Any],
     ) -> list[ToolResult]:
         self._maybe_checkpoint_mutations(tool_calls)
-        return run_tool_calls(tool_calls, self._registry, context=tool_ctx)
+        results = run_tool_calls(tool_calls, self._registry, context=tool_ctx)
+        return self._validate_written_files(results)
+
+    def _validate_written_files(self, results: list[ToolResult]) -> list[ToolResult]:
+        """A write that lands a SyntaxError on disk must not count as success.
+
+        Truncated GBNF tool JSON parses fine but stores half a module; the next
+        pytest then fails collection and the run loops. Compile-check instead.
+        """
+        rewritten: list[ToolResult] = []
+        for result in results:
+            if (
+                result.success
+                and result.tool_name in {"write_file", "edit_file", "insert_lines"}
+                and isinstance(result.output, dict)
+            ):
+                raw = str(result.output.get("path") or result.output.get("absolute_path") or "")
+                call = getattr(result, "call", None)
+                arguments = getattr(call, "arguments", None) if call is not None else None
+                if not raw and isinstance(arguments, dict):
+                    raw = str(arguments.get("path") or "")
+                abs_path = self._abs_impl_path(raw) if raw else ""
+                if abs_path and abs_path.endswith(".py") and Path(abs_path).is_file():
+                    try:
+                        source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+                        compile(source, abs_path, "exec")
+                    except (OSError, SyntaxError):
+                        source = ""
+                        bad = True
+                    else:
+                        bad = looks_truncated_source(source)
+                    if bad:
+                        self._write_tool_max_tokens = max(
+                            int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
+                            _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
+                        )
+                        self._prefer_write_file = True
+                        self._prefer_edit_gaps = False
+                        self._prefer_insert_lines = False
+                        self._action_loop_force_write = bool(
+                            "write_file" in set(self._enabled_registry_names())
+                        )
+                        display = self._display_path(abs_path)
+                        rewritten.append(
+                            ToolResult(
+                                success=False,
+                                tool_name=result.tool_name,
+                                error=feedback("truncated_write_detected", path=display),
+                                call=call,
+                                metadata={"truncated": True},
+                            )
+                        )
+                        continue
+            rewritten.append(result)
+        return rewritten
 
     def _maybe_checkpoint_mutations(self, tool_calls: list[ToolCall]) -> None:
         paths: list[str] = []
@@ -3511,7 +4270,7 @@ class Agent:
         write tests ("schreibe tests"), no agent-authored test files may be
         left behind when the run ends.
         """
-        if self._keep_agent_tests:
+        if self._keep_agent_tests or self._task_wants_tests:
             return []
         removed: list[str] = []
         for abs_path in self._agent_created_test_paths:
@@ -3523,6 +4282,7 @@ class Agent:
                     continue
                 path.unlink(missing_ok=True)
                 removed.append(abs_path)
+                self._tests_uncollectable.discard(abs_path)
                 self._emit(
                     agent_events.FILE,
                     {
@@ -3676,6 +4436,15 @@ class Agent:
             if result.tool_name != "run_tests" or not isinstance(result.output, dict):
                 continue
             if bool(result.output.get("ok")):
+                # Pytest green ALWAYS latches tests-ok. Re-forcing run_tests after a
+                # green pytest (while smoke/entry still open) is the wordstats loop.
+                self._pytest_green = True
+                self._ran_tests_ok = True
+                self._run_tests_failures = 0
+                self._prefer_read_file = False
+                self._fix_hint_path = ""
+                self._prefer_write_file = False
+                self._action_loop_force_write = False
                 if self._concurrency_tests_missing():
                     self._ran_tests_ok = False
                     self._stress_nudges += 1
@@ -3683,12 +4452,15 @@ class Agent:
                         engine.set_verification_feedback(feedback("stress"))
                         continue
                 if not self._runtime_smoke_passes(engine):
+                    # Smoke/entry is a separate gap — prefer edit, never another pytest.
+                    self._prefer_edit_gaps = True
+                    self._prefer_write_file = False
+                    self._action_loop_force_write = False
                     continue
-                self._ran_tests_ok = True
-                self._run_tests_failures = 0
                 self._runtime_smoke_failures = 0
-                self._prefer_read_file = False
-                self._fix_hint_path = ""
+                self._prefer_edit_gaps = False
+                self._prefer_insert_lines = False
+                self._mark_goal_met_if_ready(engine)
                 if self._design_review_still_required():
                     engine.set_verification_feedback(
                         review_message(coarsened=self._lock_coarsened)
@@ -3704,12 +4476,46 @@ class Agent:
                 # tests (or were reverted). Re-running can never succeed — the
                 # only way out of the loop is to WRITE the tests first.
                 self._ran_tests_ok = False
+                for raw_target in targets:
+                    abs_path = self._abs_impl_path(str(raw_target))
+                    if _looks_like_test_path(abs_path):
+                        self._tests_uncollectable.add(abs_path)
+                self._prefer_write_file = True
+                self._prefer_edit_gaps = False
+                self._prefer_insert_lines = False
+                self._action_loop_force_write = bool(
+                    "write_file" in set(self._enabled_registry_names())
+                )
+                self._forced_read_path = ""
+                self._prefer_read_file = False
                 names = ", ".join(Path(str(t)).name for t in targets)
                 engine.set_verification_feedback(feedback("no_tests_collected", targets=names))
                 continue
+            detail = str(result.output.get("stderr") or result.output.get("stdout") or "").strip()
+            if exit_code == _PYTEST_COLLECTION_EXIT or "SyntaxError" in detail[:400]:
+                # Collection error (truncated/hollow test file): pytest cannot even
+                # import the module — editing blind never fixes it. Force a full
+                # rewrite of the offending test file and lock out run_tests until.
+                self._ran_tests_ok = False
+                for raw_target in targets:
+                    abs_path = self._abs_impl_path(str(raw_target))
+                    if _looks_like_test_path(abs_path):
+                        self._tests_uncollectable.add(abs_path)
+                self._prefer_write_file = True
+                self._prefer_edit_gaps = False
+                self._prefer_insert_lines = False
+                self._prefer_read_file = False
+                self._forced_read_path = ""
+                self._action_loop_force_write = bool(
+                    "write_file" in set(self._enabled_registry_names())
+                )
+                names = ", ".join(Path(str(t)).name for t in targets)
+                engine.set_verification_feedback(
+                    feedback("test_collection_broken", targets=names, detail=detail[:600])
+                )
+                continue
             self._run_tests_failures += 1
             timed_out = bool(result.output.get("timed_out"))
-            detail = str(result.output.get("stderr") or result.output.get("stdout") or "").strip()
             missing = _parse_missing_modules(detail)
             if missing:
                 install_info = self._ensure_missing_deps(missing)
@@ -3752,25 +4558,190 @@ class Agent:
                 )
             )
 
+    def _tool_call_fingerprint(self, call: ToolCall) -> str:
+        args = call.arguments if isinstance(call.arguments, dict) else {}
+        path = str(args.get("path") or "").strip()
+        return f"{call.name}|{path}"
+
+    def _goal_is_met(self) -> bool:
+        if self._syntax_broken or self._impl_gaps:
+            return False
+        if self._task_wants_tests and not self._ran_tests_ok:
+            return False
+        if self._task_wants_tests and not self._discover_test_files():
+            return False
+        if self._tests_uncollectable and self._task_wants_tests:
+            return False
+        if self._missing_goal_deliverables():
+            return False
+        if self._design_review_still_required() or self._review_hold > 0:
+            return False
+        if self._require_tools and not self._acted_once:
+            return False
+        return True
+
+    def _mark_goal_met_if_ready(self, engine: ContextEngine | None = None) -> bool:
+        if self._goal_met:
+            return True
+        # Hard gate: a goal that asks for tests is NEVER met while pytest has not
+        # gone green this run — hollow test files must not latch completion.
+        if self._task_wants_tests and not self._ran_tests_ok:
+            return False
+        if not self._goal_is_met():
+            return False
+        self._goal_met = True
+        self._prefer_edit_gaps = False
+        self._prefer_insert_lines = False
+        self._prefer_write_file = False
+        self._prefer_read_file = False
+        self._forced_read_path = ""
+        self._action_loop_force_write = False
+        if engine is not None:
+            engine.set_verification_feedback(feedback("goal_met_stop"))
+        return True
+
+    def _arm_action_loop_redirect(self, action: str) -> None:
+        # After pytest is green, write redirects destroy working trees (truncate loop).
+        if getattr(self, "_pytest_green", False) or self._ran_tests_ok or self._goal_met:
+            self._action_loop_force_write = False
+            self._prefer_write_file = False
+            self._prefer_edit_gaps = True
+            self._prefer_read_file = False
+            self._forced_read_path = ""
+            self._action_loop_last_action = action
+            return
+        self._action_loop_force_write = True
+        self._action_loop_last_action = action
+        self._prefer_write_file = True
+        self._prefer_read_file = False
+        self._forced_read_path = ""
+
+
+    def _action_loop_block_reason(self, call: ToolCall) -> str | None:
+        fp = self._tool_call_fingerprint(call)
+        count = int(self._call_fp_counts.get(fp, 0))
+        args = call.arguments if isinstance(call.arguments, dict) else {}
+        path = str(args.get("path") or "").strip()
+        abs_path = self._abs_impl_path(path) if path else ""
+        display = self._display_path(abs_path) if abs_path else (path or call.name)
+
+        # Green pytest already proved tests — repeating run_tests is the wordstats loop.
+        if call.name == "run_tests" and (
+            getattr(self, "_pytest_green", False) or self._ran_tests_ok
+        ):
+            self._prefer_write_file = False
+            self._action_loop_force_write = False
+            if self._impl_gaps:
+                if self._logic_gaps() or not self._inventory_cli_budget():
+                    self._prefer_insert_lines = True
+                    self._prefer_edit_gaps = False
+                else:
+                    self._prefer_edit_gaps = True
+            return feedback("tests_already_green")
+
+        if call.name in _CODE_MUTATING_TOOLS and (self._goal_met or self._goal_is_met()):
+            if self._goal_is_met():
+                self._goal_met = True
+                self._action_loop_force_write = False
+                return feedback("goal_met_stop")
+        if call.name == "read_file" and abs_path and abs_path in self._files_read:
+            last_read = int(self._path_last_read_iter.get(abs_path, -1))
+            last_mut = int(self._path_last_mutate_iter.get(abs_path, -1))
+            if last_read >= last_mut and count >= 1:
+                if self._goal_is_met():
+                    self._goal_met = True
+                    self._action_loop_force_write = False
+                    return feedback("goal_met_stop")
+                if getattr(self, "_pytest_green", False) or self._ran_tests_ok:
+                    self._prefer_write_file = False
+                    self._action_loop_force_write = False
+                    if self._logic_gaps():
+                        self._prefer_insert_lines = True
+                        self._prefer_edit_gaps = False
+                    else:
+                        self._prefer_edit_gaps = True
+                    return feedback("action_loop_blocked", action=f"read_file {display}")
+                # Hollow bot / unfinished impl: stop re-reading, insert missing logic.
+                if self._logic_gaps() or self._impl_gaps:
+                    self._prefer_insert_lines = True
+                    self._prefer_edit_gaps = False
+                    self._prefer_write_file = False
+                    self._action_loop_force_write = False
+                    self._prefer_read_file = False
+                    return feedback("action_loop_blocked", action=f"read_file {display}")
+                self._arm_action_loop_redirect(f"read_file {display}")
+                return feedback("action_loop_blocked", action=f"read_file {display}")
+        if count >= _ACTION_LOOP_BLOCK:
+            self._arm_action_loop_redirect(f"{call.name} {display}".strip())
+            return feedback("action_loop_blocked", action=f"{call.name} {display}".strip())
+        return None
+
+
+
+
+    def _auto_heal_missing_entry_points(self, engine: ContextEngine) -> bool:
+        """Append entry point when that is the only remaining gap (stops rewrite loops)."""
+        healed_any = False
+        for abs_path in list(self._impl_python_files()):
+            if _looks_like_test_path(abs_path):
+                continue
+            try:
+                original = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            healed = try_auto_add_entry_point(
+                original, self._task or "", path=self._display_path(abs_path)
+            )
+            if not healed or healed == original:
+                continue
+            try:
+                Path(abs_path).write_text(healed, encoding="utf-8")
+            except OSError:
+                continue
+            healed_any = True
+            self._trace(
+                f"iter {getattr(self, '_current_iteration', 0)} auto-heal entry "
+                f"path={self._display_path(abs_path)}"
+            )
+        if healed_any:
+            self._refresh_impl_completeness(engine)
+            self._prefer_write_file = False
+            self._action_loop_force_write = False
+            self._prefer_edit_gaps = False
+            self._prefer_insert_lines = False
+        return healed_any
+
     def _runtime_smoke_passes(self, engine: ContextEngine) -> bool:
         """Pytest green is not enough — smoke-run __main__ scripts for real crashes."""
         from mango_tools.implementations.runtime_smoke import run_runtime_smoke
+
+        # Green pytest + only-missing-entry → heal once (no rewrite thrash).
+        if getattr(self, "_pytest_green", False):
+            self._auto_heal_missing_entry_points(engine)
 
         prefer = [path for path in self._impl_python_files() if not _looks_like_test_path(path)]
         ctx = {**self._tool_context(), "prefer_scripts": prefer[:8]}
         smoke = run_runtime_smoke(_context=ctx)
         if smoke.get("skipped"):
             if goal_wants_runnable_script(self._task or ""):
-                self._ran_tests_ok = False
+                # Never arm write thrash for a missing entry after green pytest.
+                self._prefer_write_file = False
+                self._action_loop_force_write = False
+                self._prefer_edit_gaps = True
                 engine.set_verification_feedback(feedback("runtime_no_entry"))
                 return False
             return True
         if bool(smoke.get("ok")):
             return True
-        self._ran_tests_ok = False
+        # Do NOT clear _ran_tests_ok — that re-arms endless run_tests after green pytest.
         self._runtime_smoke_failures += 1
+        self._prefer_edit_gaps = True
+        self._prefer_write_file = False
+        self._action_loop_force_write = False
         failed = str(smoke.get("failed_script") or "entry script")
-        detail = str(smoke.get("detail") or smoke.get("stderr") or smoke.get("stdout") or "").strip()
+        detail = str(
+            smoke.get("detail") or smoke.get("stderr") or smoke.get("stdout") or ""
+        ).strip()
         display = self._display_path(failed) if failed else "entry script"
         engine.set_verification_feedback(
             feedback(
@@ -3781,10 +4752,31 @@ class Agent:
         )
         return False
 
+
     def _tests_still_required(self) -> bool:
+        # Goal asked for tests but none exist — keep requiring work (rewrite/run).
+        if (
+            self._require_tools
+            and self._task_wants_tests
+            and self._acted_once
+            and not self._syntax_broken
+            and not self._discover_test_files()
+        ):
+            self._pytest_green = False
+            self._ran_tests_ok = False
+            return True
+        # pytest collected nothing (exit 5): green can never be latched until the
+        # test file is fully rewritten — never finish over a hollow test file.
+        if self._tests_uncollectable:
+            self._pytest_green = False
+            self._ran_tests_ok = False
+            return True
+        # Once pytest has gone green this run (and tests still on disk), never
+        # keep forcing another run_tests — that is the wordstats thrash loop.
+        if getattr(self, "_pytest_green", False) or self._ran_tests_ok:
+            return False
         return bool(
             self._require_tools
-            and not self._ran_tests_ok
             and not self._syntax_broken
             and self._acted_once
             and (self._task_wants_tests or self._run_tests_failures > 0)
@@ -3900,6 +4892,9 @@ class Agent:
         if not mutated:
             return []
         if not self._discover_test_files():
+            return []
+        if self._tests_uncollectable:
+            # Exit-5 targets: rewriting must come first, pytest would just 5 again.
             return []
         if self._experiments_enabled():
             return self._run_workspace_tests(iteration)
@@ -4152,8 +5147,10 @@ class Agent:
                 if self._experiment_reverts >= MAX_REVERTS:
                     self._experiment_exhausted = True
                     self._experiment_locked_paths.update(snapshots.keys())
-            if tests_ok is False:
-                self._ran_tests_ok = False
+            # Revert undoes the mutation that may have produced a green pytest —
+            # clear the latch or we early-complete / skip run_tests on a dead tree.
+            self._ran_tests_ok = False
+            self._pytest_green = False
             self._trace(f"iter {iteration} experiment revert {verdict.reason}")
         elif verdict.reason != "command_changed" and after is not None and self._experiment_command:
             self._experiment_baseline = {
@@ -4720,20 +5717,27 @@ class Agent:
         return "bot.py"
 
     def _impl_python_files(self) -> list[str]:
+        return [p for p in self._impl_source_files() if p.lower().endswith(".py")]
+
+    def _impl_source_files(self) -> list[str]:
+        """Impl sources across languages (not just Python) for completeness checks."""
         root = self._verification_root
         if root is None:
             return []
         base = Path(root)
         found: list[str] = []
         skip = {".venv", "venv", "__pycache__", ".git", ".mango", ".devdeck", "node_modules", ".pytest_cache"}
-        for path in base.rglob("*.py"):
+        suffixes = {".py", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".go", ".rs", ".js", ".mjs", ".cjs", ".ts"}
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
             try:
                 rel_parts = path.relative_to(base).parts
             except ValueError:
                 rel_parts = path.parts
             if any(part in skip for part in rel_parts[:-1]):
                 continue
-            if path.name.startswith("test_"):
+            if path.name.startswith("test_") or path.name.endswith("_test.go"):
                 continue
             found.append(str(path.resolve()))
         return found
@@ -4741,29 +5745,118 @@ class Agent:
     def _syntax_errors(self, paths: list[str] | None = None) -> list[str]:
         return collect_python_syntax_errors(paths if paths is not None else self._impl_python_files())
 
+    def _inventory_cli_budget(self) -> bool:
+        """Only multi-feature inventory CLIs get the skeleton write-token cap."""
+        return bool(self._cli_goal and self._inventory_style_goal(self._task or ""))
+
+    def _inventory_style_goal(self, task: str) -> bool:
+        """Multi-subcommand inventory CLIs — skeleton-then-edit is appropriate."""
+        labels = required_features(task or "")
+        inventory_bits = {"add/create items", "remove items", "update item count", "list/show inventory"}
+        return len(set(labels) & inventory_bits) >= 2
+
+    def _primary_impl_exists(self) -> bool:
+        primary = self._primary_impl_path()
+        if not primary:
+            return False
+        abs_path = self._abs_impl_path(primary)
+        return bool(abs_path and Path(abs_path).is_file())
+
+    def _suggested_insert_hint(self) -> tuple[str, int]:
+        primary = self._primary_impl_path() or ""
+        abs_path = self._abs_impl_path(primary) if primary else ""
+        display = self._display_path(abs_path) if abs_path else primary
+        line = 1
+        if abs_path and Path(abs_path).is_file():
+            try:
+                text = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            lines = text.splitlines()
+            if looks_truncated_source(text) and lines:
+                line = len(lines)
+            else:
+                line = len(lines) + 1
+        return display or primary, line
+
+    def _logic_gaps(self) -> list[str]:
+        """Gaps that require full behavior, not ±3-line base tweaks."""
+        inventory = self._inventory_style_goal(self._task or "")
+        out: list[str] = []
+        for gap in self._impl_gaps:
+            g = str(gap).lower()
+            if any(
+                key in g
+                for key in (
+                    "truncated",
+                    "incomplete",
+                    "stub",
+                    "early-return",
+                    "http/api",
+                    "model host",
+                    "send/reply",
+                    "model output",
+                    "message receive",
+                )
+            ):
+                out.append(str(gap))
+                continue
+            # Inventory CLIs grow feature-by-feature via edit; integration goals
+            # (bots/APIs) must not nibble — treat remaining "goal needs" as logic.
+            if "goal needs" in g and not inventory:
+                out.append(str(gap))
+                continue
+            # Entry-only / bot.start alone → small edit or auto-heal.
+        return out
+
     def _refresh_impl_completeness(self, engine: ContextEngine) -> None:
         """Re-scan impl modules; block finish while CLI/stub gaps remain."""
         task = self._task or ""
         if not self._require_tools:
             self._impl_gaps = []
             return
-        if not goal_wants_runnable_script(task) and not required_features(task):
+        # Always scan when an impl file exists. Gating on CLI-only left Discord
+        # bots "complete" with hollow on_message stubs.
+        previously_open = list(self._last_open_impl_gaps)
+        primary = self._primary_impl_path()
+        if not primary:
             self._impl_gaps = []
             return
-        primary = self._primary_impl_path()
-        if primary:
-            self._update_impl_status_from_path(engine, primary)
+        self._update_impl_status_from_path(engine, primary)
         gaps = list(self._impl_gaps)
+        newly_closed = closed_items(previously_open, gaps)
+        if newly_closed:
+            self._resolved_work = merge_resolved(self._resolved_work, newly_closed)
+            self._prefer_edit_gaps = False
+            self._prefer_insert_lines = False
+            if not gaps:
+                self._prefer_read_file = False
+                self._forced_read_path = ""
         if gaps:
+            self._last_open_impl_gaps = gaps
+            path_hint, line_hint = self._suggested_insert_hint()
             engine.set_verification_feedback(
                 feedback(
                     "impl_incomplete",
                     gaps="\n".join(f"- {gap}" for gap in gaps[:8]),
+                    path=path_hint,
+                    line=str(line_hint),
                 )
             )
+            return
+        self._last_open_impl_gaps = []
+        resolved = newly_closed or list(self._resolved_work[-8:])
+        if resolved:
+            engine.set_verification_feedback(
+                feedback(
+                    "impl_complete",
+                    resolved="\n".join(f"- {item}" for item in resolved[:8]),
+                )
+            )
+        self._mark_goal_met_if_ready(engine)
 
     def _primary_impl_path(self) -> str:
-        files = [p for p in self._impl_python_files() if not _looks_like_test_path(p)]
+        files = [p for p in self._impl_source_files() if not _looks_like_test_path(p)]
         if not files:
             return ""
         if self._fix_hint_path:
@@ -4779,8 +5872,6 @@ class Agent:
 
     def _update_impl_status_from_path(self, engine: ContextEngine, abs_path: str) -> None:
         task = self._task or ""
-        if not goal_wants_runnable_script(task) and not required_features(task):
-            return
         try:
             source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -4788,7 +5879,7 @@ class Agent:
         display = self._display_path(abs_path)
         engine.set_impl_status(summarize_impl_status(source, task, path=display))
         self._impl_gaps = [
-            f"{display}: {gap}" for gap in find_impl_gaps(source, task)
+            f"{display}: {gap}" for gap in find_impl_gaps(source, task, path=display)
         ]
 
     def _sync_impl_status_from_reads(
@@ -5428,7 +6519,13 @@ def _looks_like_api_dump(text: str) -> bool:
 
 
 def _clean_finish_summary(text: str) -> str:
-    cleaned = (text or "").strip()
+    cleaned = strip_thought_markup(text or "")
+    # Finish messages must never surface internal chain-of-thought.
+    cleaned = re.sub(
+        r"(?is)<\s*(?:redacted_thinking|think(?:ing)?)\b[^>]*>[\s\S]*?(?:<\s*/\s*(?:redacted_thinking|think(?:ing)?)\s*>|$)",
+        "",
+        cleaned,
+    ).strip()
     cut = re.search(r"<tool_call\b", cleaned, flags=re.IGNORECASE)
     if cut:
         cleaned = cleaned[: cut.start()].strip()
@@ -5445,6 +6542,24 @@ def _is_good_finish_summary(text: str) -> bool:
         return False
     low = blob.lower()
     if "<tool_call" in low or "```" in text:
+        return False
+    if "<think" in low or "redacted_thinking" in low:
+        return False
+    # Meta-reasoning about Facts / summary instructions is not a user-facing answer.
+    if any(
+        token in low
+        for token in (
+            "changed_files:",
+            "facts show",
+            "no files recorded",
+            "re-read the instructions",
+            "this was q&a",
+            "ask / read-only",
+            "i need to be honest",
+            "looking more carefully",
+            "let me re-read",
+        )
+    ):
         return False
     if low in {"done", "all done.", "all tests passed.", "tests passed."}:
         return False
@@ -5685,9 +6800,17 @@ def _parse_libraries(raw: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
     for part in text.split(","):
-        name = part.strip().strip("'\"")
-        key = name.lower()
-        if not name or key in seen:
+        # Strip parentheticals: "requests (for LM Studio HTTP API)" → "requests"
+        name = re.sub(r"\([^)]*\)", "", part).strip().strip("'\"")
+        name = re.sub(r"\s+", " ", name).strip()
+        if not name:
+            continue
+        # Normalize pip-style names that are not import names.
+        key = name.lower().replace(" ", "-")
+        if key == "discord.py":
+            name = "discord"
+            key = "discord"
+        if key in seen:
             continue
         seen.add(key)
         names.append(name)

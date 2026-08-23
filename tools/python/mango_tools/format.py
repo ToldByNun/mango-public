@@ -18,8 +18,10 @@ def format_tool_call(name: str, arguments: dict[str, Any]) -> str:
 def tool_call_instruction() -> str:
     """Short spec string for system prompts (used by agent/context later)."""
     return (
-        "You may write a short plan (a few sentences), then emit exactly one tool call:\n"
+        "Emit exactly one tool call:\n"
         f"  {TOOL_CALL_PREFIX}<tool_name> : {{\"arg\": \"value\"}}{TOOL_CALL_SUFFIX}\n"
-        "For write_file put a SHORT skeleton in JSON \"content\" (under ~60 lines). "
-        "Then edit_file to grow the file. Stop after the tool call."
+        "For new files: write_file the COMPLETE file in one call. "
+        "To extend an existing file: insert_lines with a fenced multi-line block "
+        "(not tiny edit_file patches). "
+        "Stop after the tool call."
     )

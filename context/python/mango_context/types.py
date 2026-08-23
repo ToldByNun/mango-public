@@ -71,6 +71,9 @@ class ContextState:
     work_plan: str = ""
     impl_status: str = ""
     verification_feedback: str = ""
+    # When True, prompt_window hides work_plan / memory / long history so
+    # coding phases keep model attention on the single NEXT mutation.
+    coding_attention_slim: bool = False
     verification_failed_tests: list[str] = field(default_factory=list)
     verification_impl_paths: list[str] = field(default_factory=list)
     verification_impl_symbols: list[str] = field(default_factory=list)

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+} from "react";
 import { useAgent } from "../context/AgentSession";
 import { useSpeechInput } from "../lib/useSpeechInput";
 import { shortWorkspace } from "../lib/session";
@@ -227,6 +234,8 @@ export function Composer(): JSX.Element {
                       role="option"
                       aria-selected={i === slashIndex}
                       className={`${styles.slashRow} ${i === slashIndex ? styles.slashRowActive : ""}`}
+                      data-slash={cmd.id}
+                      style={{ ["--slash-color" as string]: cmd.color }}
                       onMouseEnter={() => setSlashIndex(i)}
                       onClick={() => applySlashCommand(cmd)}
                     >
@@ -245,7 +254,11 @@ export function Composer(): JSX.Element {
             </div>
           ) : null}
           {activeCmd?.takesArg && activeCmd.paramHint ? (
-            <div className={styles.slashTip} aria-label={`${activeCmd.trigger} parameter`}>
+            <div
+              className={styles.slashTip}
+              aria-label={`${activeCmd.trigger} parameter`}
+              style={{ ["--slash-color" as string]: activeCmd.color }}
+            >
               <span className={styles.slashTipLabel}>{activeCmd.paramLabel}</span>
               <span className={styles.slashTipHint}>{activeCmd.paramHint}</span>
             </div>
@@ -253,7 +266,18 @@ export function Composer(): JSX.Element {
           <div className={styles.inputStack}>
             {inputHighlight ? (
               <div className={styles.inputHighlight} aria-hidden>
-                <span className={styles.slashInInput}>{inputHighlight.prefix}</span>
+                <span
+                  className={styles.slashInInput}
+                  data-slash={inputHighlight.id}
+                  style={
+                    {
+                      color: inputHighlight.color,
+                      ["--slash-color" as string]: inputHighlight.color,
+                    } as CSSProperties
+                  }
+                >
+                  {inputHighlight.prefix}
+                </span>
                 <span>{inputHighlight.rest}</span>
               </div>
             ) : null}

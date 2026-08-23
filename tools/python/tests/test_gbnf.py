@@ -75,6 +75,34 @@ def test_gbnf_write_file_prefers_fence_with_json_alt() -> None:
     assert '"\\"old_name\\""' in grammar
 
 
+def test_gbnf_insert_lines_prefers_fence() -> None:
+    grammar = tool_call_gbnf(["insert_lines", "edit_file", "read_file"])
+    assert "insert-lines-full" in grammar
+    assert "insert-lines-fence" in grammar
+    assert "write-body" in grammar
+    assert "insert-lines-json" in grammar
+    # edit_file stays JSON-only (short patches); insert gets the fence path.
+    assert "edit-file-call" in grammar or "edit_file" in grammar
+
+
+def test_gbnf_sole_write_file_is_fence_only() -> None:
+    """CODE_REPAIR / CODE_COMPLETE: only write_file → fence body, no JSON content alt."""
+    grammar = tool_call_gbnf(["write_file"])
+    assert "write-file-fence" in grammar
+    assert "write-file-full" not in grammar
+    assert "write-file-json" not in grammar
+    assert "write-body" in grammar
+
+
+def test_gbnf_sole_insert_lines_is_fence_only() -> None:
+    """CODE_EXTEND: only insert_lines → fence body, no JSON content alt."""
+    grammar = tool_call_gbnf(["insert_lines"])
+    assert "insert-lines-fence" in grammar
+    assert "insert-lines-full" not in grammar
+    assert "insert-lines-json" not in grammar
+    assert "write-body" in grammar
+
+
 def test_gbnf_compiles_with_llama_cpp() -> None:
     grammar_cls = _llama_grammar_cls()
     names = create_default_registry().list_tools()

@@ -22,7 +22,7 @@ def test_system_prompts_load_from_markdown() -> None:
     assert "declare_apis" in DEFAULT_SYSTEM_PROMPT
     assert "write_file" in DEFAULT_SYSTEM_PROMPT
     assert "research_codebase" in DEFAULT_SYSTEM_PROMPT
-    assert "AGENT PROTOCOL" in DEFAULT_SYSTEM_PROMPT
+    assert "One short thought" in DEFAULT_SYSTEM_PROMPT
     assert "GitHub issue" in SWE_BENCH_SYSTEM_PROMPT
     assert "old_string" in SWE_BENCH_SYSTEM_PROMPT
     assert "API Agent" in EPISTEMIC_SYSTEM_PROMPT or "epistemic" in EPISTEMIC_SYSTEM_PROMPT.lower()
@@ -41,7 +41,7 @@ def test_thinking_level_prompts_compose() -> None:
     assert off == load_system_prompt(_prompt_variant_name())
     assert off == load_system_prompt("agent_v2")
     assert "THINKING LEVEL: think" in think
-    assert "AGENT PROTOCOL" in think
+    assert "One short thought" in think
     assert "research_codebase" in think
     assert "THINKING LEVEL: deep" in deep
     assert "inspect" in deep.lower()

@@ -9,6 +9,16 @@ from mango_tools.implementations.run_tests import _SKIP_DIRS, _run_subprocess
 
 _MAIN_GUARD = re.compile(r'if\s+__name__\s*==\s*["\']__main__["\']')
 _TRACEBACK = re.compile(r"Traceback \(most recent call last\)", re.IGNORECASE)
+# Bare `python script.py` often exits 2 for argparse CLIs that require a path/args.
+# That is not a crash — unit tests cover the real CLI paths.
+_CLI_USAGE = re.compile(
+    r"^usage:|"
+    r"error:\s+the following arguments are required|"
+    r"unrecognized arguments:|"
+    r"too few arguments|"
+    r"the following arguments are required",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 _SMOKE_TIMEOUT_SECONDS = 8
 _MAX_SCRIPTS = 6
@@ -72,6 +82,9 @@ def _smoke_ok(code: int, stdout: str, stderr: str, *, timed_out: bool) -> bool:
     if code == 0:
         return True
     if timed_out:
+        return True
+    # CLI entry points that require args: usage / missing-arg exits are healthy.
+    if code in (1, 2) and _CLI_USAGE.search(blob):
         return True
     return False
 

@@ -392,7 +392,17 @@ class AgentServer:
                     plan_mode=True,
                     plan_apis_first=False,
                     task_wants_tests=False,
-                    disabled_tools=frozenset({"declare_apis"}),
+                    disabled_tools=frozenset(
+                        {
+                            "declare_apis",
+                            "codebase_lookup",
+                            "ask_epistemic",
+                            "research_codebase",
+                            "package_source_lookup",
+                            "doc_lookup",
+                            "web_research",
+                        }
+                    ),
                     thought_max_tokens=effective_thought,
                     tool_max_tokens=3072,
                     thinking_level=preset.level,

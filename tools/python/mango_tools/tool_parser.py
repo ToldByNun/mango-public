@@ -28,7 +28,7 @@ _PARAMETER_TAG = re.compile(
 
 # Models often invent `<write_file | {...}>` instead of `<tool_call=write_file : {...}>`.
 _TOOL_NAMES = (
-    "write_file|edit_file|read_file|edit_symbol|rename_symbol|search_code|"
+    "write_file|edit_file|insert_lines|read_file|edit_symbol|rename_symbol|search_code|"
     "codebase_lookup|ask_epistemic|research_codebase|declare_apis|run_terminal_command|measure|run_tests|"
     "list_dir|glob_files|delete_file"
 )
@@ -105,7 +105,7 @@ def _parse_function_tag_calls(text: str) -> list[ToolCall]:
 
 def _normalize_function_name(raw_name: str) -> str | None:
     known = {
-        "read_file", "write_file", "edit_file", "edit_symbol", "rename_symbol",
+        "read_file", "write_file", "edit_file", "insert_lines", "edit_symbol", "rename_symbol",
         "search_code", "codebase_lookup", "ask_epistemic", "research_codebase", "declare_apis",
         "run_terminal_command", "measure", "run_tests", "list_dir",
         "glob_files", "delete_file",
@@ -143,15 +143,11 @@ def _parse_loose_prefix_calls(text: str) -> list[ToolCall]:
         arguments = _parse_arguments_json(json_text)
         if arguments is None:
             continue
-        if name == "write_file":
-            fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
-            if fenced is not None and fence_complete:
-                arguments["content"] = fenced
-                json_end = fence_end
-            elif fenced is not None and not fence_complete:
+        if name in {"write_file", "insert_lines"}:
+            attached, json_end, ok = _attach_fenced_content(name, arguments, text, json_end)
+            if not ok:
                 continue
-        if name == "write_file" and not str(arguments.get("content") or ""):
-            continue
+            arguments = attached
         key = (match.start(), name)
         if key in seen:
             continue
@@ -190,11 +186,11 @@ def _parse_json_name_calls(text: str) -> list[ToolCall]:
         if name == "edit_file" and "content" in arguments and "old_string" not in arguments:
             name = "write_file"
             arguments = {"path": arguments.get("path", ""), "content": arguments.get("content", "")}
-        if name == "write_file" and not str(arguments.get("content") or ""):
-            fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
-            if fenced is not None and fence_complete:
-                arguments["content"] = fenced
-                json_end = fence_end
+        if name in {"write_file", "insert_lines"}:
+            attached, json_end, ok = _attach_fenced_content(name, arguments, text, json_end)
+            if not ok:
+                continue
+            arguments = attached
         key = (match.start(), name)
         if key in seen:
             continue
@@ -225,16 +221,13 @@ def _parse_embedded_calls(text: str) -> list[ToolCall]:
             arguments = _parse_arguments_json(json_text)
             if arguments is None:
                 continue
-            if name.replace("-", "_").lower() == "write_file":
-                fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
-                if fenced is not None and fence_complete:
-                    arguments["content"] = fenced
-                    json_end = fence_end
-                elif fenced is not None and not fence_complete:
-                    # Truncated generation: do not treat partial fence as a successful write.
+            norm = name.replace("-", "_").lower()
+            if norm in {"write_file", "insert_lines"}:
+                attached, json_end, ok = _attach_fenced_content(norm, arguments, text, json_end)
+                if not ok:
                     continue
-            if name.replace("-", "_").lower() == "write_file" and not str(arguments.get("content") or ""):
-                continue
+                arguments = attached
+                name = norm
             key = (match.start(), name)
             if key in seen:
                 continue
@@ -255,6 +248,30 @@ def _parse_embedded_calls(text: str) -> list[ToolCall]:
             )
     calls.sort(key=lambda item: item.start)
     return calls
+
+
+def _attach_fenced_content(
+    name: str,
+    arguments: dict[str, Any],
+    text: str,
+    json_end: int,
+) -> tuple[dict[str, Any], int, bool]:
+    """Attach markdown-fence body for write_file / insert_lines.
+
+    Returns (arguments, new_json_end, ok). ok=False means truncated fence — drop call.
+    """
+    if str(arguments.get("content") or "").strip():
+        return arguments, json_end, True
+    fenced, fence_end, fence_complete = _extract_fenced_content(text, json_end)
+    if fenced is not None and fence_complete:
+        arguments = {**arguments, "content": fenced}
+        return arguments, fence_end, True
+    if fenced is not None and not fence_complete:
+        return arguments, json_end, False
+    # JSON body without fence and without content — invalid for these tools.
+    if name in {"write_file", "insert_lines"} and not str(arguments.get("content") or "").strip():
+        return arguments, json_end, False
+    return arguments, json_end, True
 
 
 def _extract_json_object(text: str, start: int) -> tuple[str | None, int]:
