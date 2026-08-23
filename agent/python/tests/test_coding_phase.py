@@ -135,8 +135,10 @@ def test_hollow_skeleton_write_rejected_for_discord(tmp_path: Path) -> None:
     assert out is not None
     assert out[0].success is False
     assert "hollow" in (out[0].error or "").lower() or "skeleton" in (out[0].error or "").lower()
-    # Snapshot restored (new file → deleted).
-    assert not target.exists()
+    # Skeleton stays on disk so the next turn can insert_lines (not rewrite thrash).
+    assert target.exists()
+    assert "discord" in target.read_text(encoding="utf-8").lower() or "Bot" in target.read_text(encoding="utf-8")
+    assert agent._prefer_insert_lines is True
 
 
 def test_gap_unchanged_mutation_reverted(tmp_path: Path) -> None:
@@ -220,3 +222,31 @@ def test_attention_slim_hides_work_plan() -> None:
     assert "## Work plan" not in prompt
     assert "## Focus" in prompt
     assert "CODE NOW" in prompt
+
+
+def test_finish_summary_strips_think_and_rejects_meta() -> None:
+    from mango_agent.agent import _clean_finish_summary, _is_good_finish_summary
+
+    think = (
+        "<think>\n"
+        "Looking at the Facts: changed_files: no files recorded. "
+        "I need to be honest. Let me re-read the instructions. "
+        "If Facts show no file changes this was Q&A...\n"
+        "</think>\n"
+        "I created discord_bot.py with LM Studio wiring."
+    )
+    cleaned = _clean_finish_summary(think)
+    assert "<think" not in cleaned.lower()
+    assert "re-read the instructions" not in cleaned.lower()
+    # Meta-only dumps must not pass as a good finish.
+    meta = (
+        "Looking at the Facts carefully: changed_files: no files recorded and "
+        "tests: not confirmed. I need to be honest about what happened and "
+        "re-read the instructions about ASK / READ-ONLY runs."
+    )
+    assert _is_good_finish_summary(meta) is False
+    good = (
+        "Created discord_bot.py. It listens for channel messages, forwards them "
+        "to the local LM Studio chat-completions API, and posts the model reply."
+    )
+    assert _is_good_finish_summary(good) is True

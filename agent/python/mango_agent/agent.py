@@ -2356,7 +2356,9 @@ class Agent:
         tests_ok = self._ran_tests_ok
         for step in steps:
             for result in getattr(step, "tool_results", None) or []:
-                if not result.success or result.tool_name not in _CODE_MUTATING_TOOLS:
+                # Count kept-on-disk hollow writes too — file exists even if result failed.
+                kept = bool((result.metadata or {}).get("kept_on_disk"))
+                if (not result.success and not kept) or result.tool_name not in _CODE_MUTATING_TOOLS:
                     continue
                 output = result.output if isinstance(result.output, dict) else {}
                 raw = str(output.get("path") or output.get("absolute_path") or "")
@@ -2368,6 +2370,17 @@ class Agent:
                 if name and name not in seen:
                     seen.add(name)
                     files.append(name)
+        # Also pick up impl files that survived on disk after rejected hollow writes.
+        if not files:
+            for abs_path in self._impl_source_files()[:6]:
+                name = Path(abs_path).name
+                if name and name not in seen and Path(abs_path).is_file():
+                    try:
+                        if Path(abs_path).stat().st_size > 0:
+                            seen.add(name)
+                            files.append(name)
+                    except OSError:
+                        continue
         tests_ok = self._ran_tests_ok
         if tests_ok:
             tests = "passed"
@@ -6519,13 +6532,14 @@ def _looks_like_api_dump(text: str) -> bool:
 
 
 def _clean_finish_summary(text: str) -> str:
-    cleaned = strip_thought_markup(text or "")
-    # Finish messages must never surface internal chain-of-thought.
+    cleaned = text or ""
+    # Drop chain-of-thought entirely BEFORE generic markup strip (which keeps bodies).
     cleaned = re.sub(
         r"(?is)<\s*(?:redacted_thinking|think(?:ing)?)\b[^>]*>[\s\S]*?(?:<\s*/\s*(?:redacted_thinking|think(?:ing)?)\s*>|$)",
         "",
         cleaned,
-    ).strip()
+    )
+    cleaned = strip_thought_markup(cleaned)
     cut = re.search(r"<tool_call\b", cleaned, flags=re.IGNORECASE)
     if cut:
         cleaned = cleaned[: cut.start()].strip()
