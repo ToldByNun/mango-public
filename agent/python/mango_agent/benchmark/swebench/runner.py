@@ -147,6 +147,10 @@ def run_swebench(
     fixture_path: Path | None = None,
     instance_ids: list[str] | None = None,
     limit: int | None = None,
+    count: int | None = None,
+    shuffle: bool = False,
+    shuffle_reset: bool = False,
+    shuffle_seed: int | None = None,
     work_root: Path | None = None,
     cache_root: Path | None = None,
     output_dir: Path | None = None,
@@ -165,13 +169,38 @@ def run_swebench(
     verbose: bool = True,
 ) -> dict[str, Any]:
     warnings.filterwarnings("ignore", category=SyntaxWarning)
-    instances = load_instances(
+    run_count = count if count is not None else limit
+    pool = load_instances(
         dataset_name=dataset_name,
         split=split,
         fixture_path=fixture_path,
         instance_ids=instance_ids,
-        limit=limit,
+        limit=None,
     )
+    shuffle_state: dict[str, Any] | None = None
+    if shuffle:
+        from mango_agent.benchmark.swebench.shuffle import pick_shuffled_instances, shuffle_state_path
+
+        if run_count is None:
+            run_count = 1
+        state_path = shuffle_state_path(Path(output_dir) if output_dir else Path.cwd() / "swebench_reports")
+        instances, shuffle_state = pick_shuffled_instances(
+            pool,
+            count=run_count,
+            state_path=state_path,
+            dataset_name=dataset_name,
+            split=split,
+            seed=shuffle_seed,
+            reset=shuffle_reset,
+        )
+        status = shuffle_state.get("remaining") or []
+        print(
+            f"[Mango SWE-bench] shuffle cycle={shuffle_state.get('cycle')} "
+            f"picked={len(instances)} remaining_in_cycle={len(status)}",
+            flush=True,
+        )
+    else:
+        instances = pool[:run_count] if run_count is not None else pool
     base = work_root or (Path.cwd() / ".mango" / "swebench_runs")
     base.mkdir(parents=True, exist_ok=True)
     cache = cache_root or (Path.cwd() / ".mango" / "swebench" / "repo_cache")
@@ -253,19 +282,46 @@ def run_swebench(
 
     harness_summary: dict[str, Any] | None = None
     if evaluate:
-        from mango_agent.benchmark.swebench.evaluate import run_official_evaluation
-
-        harness_summary = run_official_evaluation(
-            predictions_path=pred_path,
-            dataset_name=dataset_name,
-            split=split,
-            run_id=eval_run_id or f"mango-{int(time.time())}",
-            model_name=model_name,
-            max_workers=eval_max_workers,
-            instance_ids=[item.instance_id for item in instances],
-            report_dir=Path(output_dir) if output_dir else None,
+        from mango_agent.benchmark.swebench.evaluate import (
+            EvaluationError,
+            docker_daemon_ready,
+            run_official_evaluation,
         )
-        if harness_summary:
+
+        ready, docker_msg = docker_daemon_ready()
+        if not ready:
+            print(f"[Mango SWE-bench] SKIP harness evaluation: {docker_msg}", flush=True)
+            harness_summary = {
+                "skipped": True,
+                "error": docker_msg,
+                "resolved_count": 0,
+                "total": 0,
+                "pass_rate": 0.0,
+                "instances": [],
+            }
+        else:
+            try:
+                harness_summary = run_official_evaluation(
+                    predictions_path=pred_path,
+                    dataset_name=dataset_name,
+                    split=split,
+                    run_id=eval_run_id or f"mango-{int(time.time())}",
+                    model_name=model_name,
+                    max_workers=eval_max_workers,
+                    instance_ids=[item.instance_id for item in instances],
+                    report_dir=Path(output_dir) if output_dir else None,
+                )
+            except EvaluationError as exc:
+                print(f"[Mango SWE-bench] harness evaluation failed: {exc}", flush=True)
+                harness_summary = {
+                    "failed": True,
+                    "error": str(exc),
+                    "resolved_count": 0,
+                    "total": 0,
+                    "pass_rate": 0.0,
+                    "instances": [],
+                }
+        if harness_summary and not harness_summary.get("skipped") and not harness_summary.get("failed"):
             resolved = {
                 str(item["instance_id"]): bool(item.get("resolved"))
                 for item in harness_summary.get("instances", [])
@@ -292,6 +348,12 @@ def run_swebench(
         harness_summary=harness_summary,
         model_name=model_name,
     )
+    if shuffle_state is not None:
+        payload["shuffle"] = {
+            "cycle": shuffle_state.get("cycle"),
+            "remaining_in_cycle": len(shuffle_state.get("remaining") or []),
+            "completed_this_cycle": len(shuffle_state.get("completed") or []),
+        }
     if output_dir is not None:
         write_swebench_reports(payload, Path(output_dir))
     return payload

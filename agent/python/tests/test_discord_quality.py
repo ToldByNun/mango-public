@@ -263,7 +263,37 @@ if __name__ == '__main__':
     assert find_impl_gaps(healed, DISCORD_GOAL, path="impl.py") == []
 
 
-def test_mash_insert_rejected(tmp_path: Path) -> None:
+def test_discord_hollow_forces_write_file_not_insert(tmp_path: Path) -> None:
+    """Regression: Discord CODE_EXTEND must not sole-lock insert_lines (no-file / hollow loops)."""
+    from mango_context import ContextEngine
+    from mango_tools import create_default_registry
+    from test_agent_loop import FakeModelRunner
+    from mango_agent import Agent
+
+    target = tmp_path / "bot.py"
+    target.write_text(
+        "import discord\nbot = discord.Client()\n@bot.event\nasync def on_message(m):\n    return\n",
+        encoding="utf-8",
+    )
+    agent = Agent(
+        FakeModelRunner(["done"]),
+        max_iterations=2,
+        verification_root=tmp_path,
+        require_tools=True,
+        plan_apis_first=False,
+        task_wants_tests=False,
+        tool_registry=create_default_registry(),
+    )
+    agent._task = DISCORD_GOAL
+    agent._acted_once = True
+    engine = ContextEngine(goal=DISCORD_GOAL)
+    agent._refresh_impl_completeness(engine)
+    agent._apply_coding_phase_steering(engine)
+    assert agent._integration_goal()
+    assert agent._logic_gaps()
+    assert agent._forced_tool_name() == "write_file"
+    assert agent._apply_grammar_filters(list(agent._enabled_registry_names())) == ["write_file"]
+
     from mango_agent import Agent
     from mango_context import ContextEngine
     from mango_tools import create_default_registry

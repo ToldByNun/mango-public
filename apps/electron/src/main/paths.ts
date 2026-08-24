@@ -38,6 +38,26 @@ export function pythonExecutable(repoRoot: string): string {
   return process.platform === "win32" ? "python" : "python3";
 }
 
+/**
+ * Repo package roots for `python -m mango_agent.serve`.
+ * Sidecar sets PYTHONNOUSERSITE=1 (no user editable installs), so these must
+ * be on PYTHONPATH or import mango_agent / mango_tools fails.
+ */
+export function pythonPackagePaths(repoRoot: string): string[] {
+  const dirs = [
+    join(repoRoot, "agent", "python"),
+    join(repoRoot, "tools", "python"),
+    join(repoRoot, "runtime", "python"),
+    join(repoRoot, "context", "python"),
+    join(repoRoot, "cot", "python"),
+    join(repoRoot, "epistemic", "python"),
+    join(repoRoot, "codeintel", "python"),
+    join(repoRoot, "verification", "python"),
+    join(repoRoot, "cli", "python"),
+  ];
+  return dirs.filter((dir) => existsSync(dir));
+}
+
 /** Bundled template inside the install / dev repo. */
 export function bundledRuntimeConfigExample(repoRoot: string): string {
   const example = join(repoRoot, "runtime", "config.example.yaml");

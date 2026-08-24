@@ -15,7 +15,8 @@ from mango_agent.benchmark.swebench.baseline import (
     load_baseline_config,
     render_comparison,
 )
-from mango_agent.benchmark.swebench.evaluate import docker_available, swebench_installed
+from mango_agent.benchmark.swebench.evaluate import docker_available, docker_daemon_ready, swebench_installed
+from mango_agent.benchmark.swebench.shuffle import pick_shuffled_instances, shuffle_state_path, validate_count
 from mango_agent.benchmark.swebench.instances import (
     DEFAULT_DATASET,
     LITE_DATASET_HF,
@@ -377,13 +378,77 @@ def test_compare_reports_shows_regression() -> None:
 def test_evaluate_helpers_report_optional_deps() -> None:
     assert isinstance(swebench_installed(), bool)
     assert isinstance(docker_available(), bool)
+    ready, msg = docker_daemon_ready()
+    assert isinstance(ready, bool)
+    assert isinstance(msg, str)
+
+
+def test_shuffle_deck_no_repeats_until_cycle_complete(tmp_path: Path) -> None:
+    pool = [
+        SweBenchInstance.from_official(
+            {
+                "instance_id": f"org__repo-{idx}",
+                "repo": "org/repo",
+                "base_commit": "abc",
+                "problem_statement": f"issue {idx}",
+            }
+        )
+        for idx in range(5)
+    ]
+    state_path = shuffle_state_path(tmp_path)
+    first, s1 = pick_shuffled_instances(
+        pool, count=2, state_path=state_path, dataset_name="lite", split="test", seed=1
+    )
+    second, s2 = pick_shuffled_instances(
+        pool, count=2, state_path=state_path, dataset_name="lite", split="test", seed=1
+    )
+    assert len(first) == 2
+    assert len(second) == 2
+    assert len({item.instance_id for item in first + second}) == 4
+    assert len(s2.get("remaining") or []) == 1
+
+
+def test_shuffle_deck_reshuffles_after_full_cycle(tmp_path: Path) -> None:
+    pool = [
+        SweBenchInstance.from_official(
+            {
+                "instance_id": f"org__repo-{idx}",
+                "repo": "org/repo",
+                "base_commit": "abc",
+                "problem_statement": f"issue {idx}",
+            }
+        )
+        for idx in range(3)
+    ]
+    state_path = shuffle_state_path(tmp_path)
+    ids: list[str] = []
+    for _ in range(3):
+        picked, _ = pick_shuffled_instances(
+            pool, count=1, state_path=state_path, dataset_name="lite", split="test", seed=42
+        )
+        ids.append(picked[0].instance_id)
+    assert len(set(ids)) == 3
+    picked4, state = pick_shuffled_instances(
+        pool, count=1, state_path=state_path, dataset_name="lite", split="test", seed=42
+    )
+    assert state.get("cycle") == 2
+    assert len(picked4) == 1
+
+
+def test_validate_count_rejects_out_of_range() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        validate_count(0, dataset_name=DEFAULT_DATASET, split="test")
+    with pytest.raises(ValueError, match="<= 300"):
+        validate_count(301, dataset_name=DEFAULT_DATASET, split="test")
+    assert validate_count(10, dataset_name=DEFAULT_DATASET, split="test") == 10
 
 
 @pytest.mark.swebench_live
 def test_official_harness_requires_docker_and_predictions() -> None:
     if not swebench_installed():
         pytest.skip("swebench not installed")
-    if not docker_available():
+    ready, _ = docker_daemon_ready()
+    if not ready:
         from mango_agent.benchmark.swebench.evaluate import EvaluationError, run_official_evaluation
 
         with pytest.raises(EvaluationError, match="Docker"):

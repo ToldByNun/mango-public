@@ -17,7 +17,31 @@ class EvaluationError(Exception):
 
 
 def docker_available() -> bool:
+    """True when the docker CLI exists (may still be unreachable)."""
     return shutil.which("docker") is not None
+
+
+def docker_daemon_ready() -> tuple[bool, str]:
+    """True when Docker Desktop / daemon responds to ``docker info``."""
+    if not docker_available():
+        return False, "Docker CLI not found on PATH. Install Docker Desktop + WSL2 (see agent/README.md)."
+    try:
+        proc = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Docker daemon not reachable: {exc}"
+    if proc.returncode == 0:
+        return True, ""
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else "docker info failed"
+    if "CreateFile" in tail or "cannot find the file" in tail.lower():
+        return False, "Docker Desktop is not running. Start Docker Desktop, then re-run with --evaluate."
+    return False, f"Docker daemon not ready: {tail}"
 
 
 def swebench_installed() -> bool:
@@ -42,8 +66,9 @@ def run_official_evaluation(
     report_dir: Path | None = None,
 ) -> dict[str, Any]:
     require_swebench()
-    if not docker_available():
-        raise EvaluationError("Docker is required for SWE-bench evaluation but was not found on PATH.")
+    ready, reason = docker_daemon_ready()
+    if not ready:
+        raise EvaluationError(reason)
 
     cmd = [
         sys.executable,

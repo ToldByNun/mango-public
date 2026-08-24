@@ -89,13 +89,23 @@ python -m mango_agent.benchmark.swebench `
 # Small batch from SWE-bench Lite
 python -m mango_agent.benchmark.swebench `
   --dataset lite `
-  --limit 5 `
+  --count 5 `
   --output-dir swebench_reports
+
+# Random deck: 3 instances per run, no repeats until all 300 seen once
+python -m mango_agent.benchmark.swebench `
+  --dataset lite `
+  --shuffle `
+  --count 3 `
+  --output-dir swebench_reports/lite_shuffle
+
+# Check shuffle progress
+python -m mango_agent.benchmark.swebench --shuffle-status --output-dir swebench_reports/lite_shuffle
 
 # Generate predictions + score with official Docker harness
 python -m mango_agent.benchmark.swebench `
   --dataset lite `
-  --limit 10 `
+  --count 10 `
   --evaluate `
   --eval-workers 4 `
   --output-dir swebench_reports
@@ -148,7 +158,7 @@ Comparison writes `comparison.md` and `comparison.json` next to `latest.json`.
 
 ### Docker setup (required for `--evaluate`)
 
-Official SWE-bench scoring needs **Docker Desktop + WSL2** on Windows. Run **PowerShell as Administrator**:
+Official SWE-bench scoring needs **Docker Desktop + WSL2** on Windows. If Docker is not running, inference still completes and predictions are saved; harness evaluation is skipped with a clear message.
 
 ```powershell
 cd agent/python

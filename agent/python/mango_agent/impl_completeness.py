@@ -20,6 +20,16 @@ _GOAL_WANTS_RUNNABLE = re.compile(
     r")\b"
 )
 
+_REPO_PATCH_GOAL = re.compile(
+    r"(?i)fix the following github issue|minimal code changes needed to resolve|"
+    r"failing tests \(use these to locate"
+)
+
+
+def is_repo_patch_goal(task: str) -> bool:
+    """SWE-bench / existing-repo patch goals — not greenfield CLI completeness."""
+    return bool(_REPO_PATCH_GOAL.search(task or ""))
+
 # Bare "|count|" must NOT match "Counts word frequency" CLI goals.
 _FEATURE_HINTS: tuple[tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
     (
@@ -261,10 +271,10 @@ def summarize_impl_status(source: str, task: str = "", *, path: str = "") -> str
         lines.append(f"Entry point ({rule.label}): {'present' if present else 'MISSING'}")
 
     needed = required_features(task)
-    if needed:
+    if needed and not is_repo_patch_goal(task):
         lines.append(f"Goal requires: {', '.join(needed)}")
 
-    gaps = find_impl_gaps(text, task, path=path)
+    gaps = find_impl_gaps(text, task, path=path) if not is_repo_patch_goal(task) else []
     if gaps:
         lines.append("Still missing / incomplete:")
         for gap in gaps[:10]:

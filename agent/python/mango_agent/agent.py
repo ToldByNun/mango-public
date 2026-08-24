@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -44,6 +45,7 @@ from mango_agent.experiment import (
 from mango_agent.impl_completeness import (
     find_impl_gaps,
     goal_wants_runnable_script,
+    is_repo_patch_goal,
     looks_truncated_source,
     required_features,
     summarize_impl_status,
@@ -223,6 +225,9 @@ _TEST_DIR_NAMES = frozenset({"tests", "testing", "test"})
 _IDLE_TOOL_RETRIES = 6
 _MAX_TEST_FIX_ATTEMPTS = 5  # messaging threshold only — loop stops at max_iterations/time, not here
 _MAX_STRESS_NUDGES = 2
+# Plan gate (declare → ask_epistemic) must not burn the whole run: after this many
+# gated turns, fail-open so create/implement can write_file.
+_PLAN_GATE_FAIL_OPEN_TURNS = 4
 # Identical model answers with no tool call in between. Escalate the feedback once,
 # then stop: without this the loop burns every remaining iteration on one answer.
 _STALL_ESCALATE = 2
@@ -281,6 +286,7 @@ _GOAL_IMPLIES_EDIT = re.compile(
     r"(?i)\b(fix|bug|refactor|rename|implement|add|update|change|modify|patch|correct|repair)\b"
 )
 _EXPLORE_TOOLS = frozenset({"search_code", "read_file", "codebase_lookup", "declare_apis", "ask_epistemic"})
+_LOOKUP_TOOLS = frozenset({"codebase_lookup", "search_code", "research_codebase"})
 _MIN_SECONDS_FOR_REASONING = 0.5
 _RENAME_GOAL = re.compile(
     r"\brename\s+(?:the\s+)?(?:class\s+|function\s+|method\s+|symbol\s+)?[\"'`]*"
@@ -490,6 +496,7 @@ class Agent:
         self._goal_met = False
         self._pytest_green = False
         self._action_loop_force_write = False
+        self._action_loop_force_edit = False
         self._action_loop_last_action = ""
         self._call_fp_counts: dict[str, int] = {}
         self._path_last_read_iter: dict[str, int] = {}
@@ -662,6 +669,38 @@ class Agent:
             return "epistemic"
         return None
 
+    def _create_impl_goal(self) -> bool:
+        """True for greenfield create/implement (bots, CLIs, scripts) — not repo patches."""
+        if self._patch_repo_mode() or self._plan_mode:
+            return False
+        return bool(
+            self._greenfield_run
+            or self._cli_goal
+            or self._integration_goal()
+            or self._goal_wants_file_io
+        )
+
+    def _maybe_fail_open_plan_gate(self, engine: ContextEngine) -> None:
+        """Clear declare/epistemic lock after too many gated turns with no write path."""
+        if self._plan_gate_phase() is None:
+            return
+        if int(self._metric_plan_gate_turns or 0) < _PLAN_GATE_FAIL_OPEN_TURNS:
+            return
+        self._epistemic_once = True
+        self._apis_declared_once = True
+        needed = (
+            ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries())
+            or "the declared libraries"
+        )
+        engine.set_verification_feedback(
+            feedback("_note_plan_progress.epistemic_give_up", needed=needed)
+        )
+        self._prefer_write_file = True
+        self._prefer_insert_lines = False
+        self._trace(
+            f"plan gate fail-open after {self._metric_plan_gate_turns} gated turns → write_file"
+        )
+
     def _impl_declared_libraries(self) -> list[str]:
         return [
             name
@@ -696,6 +735,22 @@ class Agent:
         if not self._plan_apis_enabled():
             return
         for result in tool_results:
+            # Failed ask_epistemic still counts toward fail-open (Discord thrash lock).
+            if (
+                not result.success
+                and result.tool_name == "ask_epistemic"
+                and not result.metadata.get("blocked")
+            ):
+                self._epistemic_failures = int(getattr(self, "_epistemic_failures", 0) or 0) + 1
+                if self._epistemic_failures >= 2:
+                    self._epistemic_once = True
+                    self._apis_declared_once = True
+                    needed = (
+                        ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries())
+                        or "the declared libraries"
+                    )
+                    engine.set_verification_feedback(feedback("epistemic_give_up", needed=needed))
+                continue
             if not result.success:
                 continue
             if result.tool_name == "declare_apis":
@@ -1347,6 +1402,7 @@ class Agent:
             tool_names = self._action_tool_names() if self._use_tool_grammar else []
             self._apply_preferred_tool_feedback(engine)
             self._apply_coding_phase_steering(engine)
+            self._maybe_fail_open_plan_gate(engine)
             prompt = engine.build_idle_retry_prompt() if idle_retry else engine.build_prompt()
             try:
                 grammar = self._action_grammar(tool_names=tool_names)
@@ -1529,15 +1585,20 @@ class Agent:
                         self._prefer_edit_gaps = False
                         self._prefer_insert_lines = False
                     else:
-                        # Discord/integration: raise budget; extend via insert_lines.
+                        # Discord/integration / create: raise budget; prefer full write.
                         self._write_tool_max_tokens = max(
                             int(self._write_tool_max_tokens or _WRITE_TOOL_MAX_TOKENS),
                             _TRUNCATED_WRITE_TOOL_MAX_TOKENS,
                         )
                         self._prefer_write_file = True
-                        if self._primary_impl_exists():
+                        # Never flip to insert_lines while the create goal still has no
+                        # solid impl — that sole-locks GBNF and yields empty workspaces.
+                        if self._primary_impl_exists() and not self._create_impl_goal():
                             self._prefer_insert_lines = True
                             self._prefer_write_file = False
+                            self._prefer_edit_gaps = False
+                        else:
+                            self._prefer_insert_lines = False
                             self._prefer_edit_gaps = False
                 self._trace(
                     f"iter {iteration} no tool call"
@@ -1702,7 +1763,7 @@ class Agent:
                             engine.set_verification_feedback(feedback("truncated_write_cli"))
                         elif self._large_markup_goal or ".html" in model_output.lower():
                             engine.set_verification_feedback(feedback("truncated_write_markup"))
-                        elif self._primary_impl_exists():
+                        elif self._primary_impl_exists() and not self._create_impl_goal():
                             path_hint, line_hint = self._suggested_insert_hint()
                             self._prefer_insert_lines = True
                             self._prefer_write_file = False
@@ -1716,6 +1777,8 @@ class Agent:
                                 )
                             )
                         else:
+                            self._prefer_write_file = True
+                            self._prefer_insert_lines = False
                             engine.set_verification_feedback(feedback("truncated_json"))
                     elif unfinished:
                         engine.set_verification_feedback(feedback("continue_work"))
@@ -1831,6 +1894,9 @@ class Agent:
             self._auto_test_runs = 0
             self._clear_stall()
             self._last_tool_truncated = False
+            thought_blob = " ".join(self._thought_log)
+            if thought_blob.strip() and tool_calls:
+                self._note_thought_action_loop(engine, thought_blob, tool_calls)
             for call in tool_calls:
                 self._trace(f"iter {iteration} tool={call.name} {_compact_args(call.arguments)}")
             snapshots = self._snapshot_paths(tool_calls)
@@ -1922,6 +1988,8 @@ class Agent:
             self._note_tool_result_metrics(tool_results)
             self._note_review_reads(engine, tool_results)
             self._note_read_files(tool_results)
+            self._note_action_loop_results(engine, tool_calls, tool_results)
+            self._note_lookup_progress(engine, tool_results)
             self._sync_impl_status_from_reads(engine, tool_results)
             if any(result.success and result.tool_name == "read_file" for result in tool_results):
                 for result in tool_results:
@@ -2206,7 +2274,9 @@ class Agent:
                     verification_report=self._last_verification_report or report,
                 )
             if self._require_tools and self._readonly_iters >= 3 and not self._acted_once:
-                if self._inspect_before_edit() and not self._inspected_once:
+                if self._inspect_before_edit() and not self._inspected_once and not getattr(
+            self, "_action_loop_force_edit", False
+        ):
                     if self._readonly_iters >= 4:
                         self._inspected_once = True
                     engine.set_verification_feedback(feedback("readonly_no_impl"))
@@ -2216,13 +2286,31 @@ class Agent:
         return self._result(
             final_answer=(
                 self._fallback_summary(steps, draft=final_answer)
-                if self._tests_still_required() or self._syntax_broken
+                if (
+                    self._tests_still_required()
+                    or self._syntax_broken
+                    or (
+                        self._require_tools
+                        and self._create_impl_goal()
+                        and not self._impl_mutated_once
+                    )
+                )
                 else (final_answer or self._fallback_summary(steps))
             ),
             steps=steps,
             iterations=self._limits.max_iterations,
             stop_reason=(
-                StopReason.ERROR if self._tests_still_required() or self._syntax_broken else StopReason.MAX_ITERATIONS
+                StopReason.ERROR
+                if (
+                    self._tests_still_required()
+                    or self._syntax_broken
+                    or (
+                        self._require_tools
+                        and self._create_impl_goal()
+                        and not self._impl_mutated_once
+                    )
+                )
+                else StopReason.MAX_ITERATIONS
             ),
             error=(
                 feedback("tests_deadline")
@@ -2230,7 +2318,15 @@ class Agent:
                 else (
                     feedback("syntax_broken", report=self._last_verification_report or "Python syntax check failed.")
                     if self._syntax_broken
-                    else None
+                    else (
+                        feedback("no_impl_change")
+                        if (
+                            self._require_tools
+                            and self._create_impl_goal()
+                            and not self._impl_mutated_once
+                        )
+                        else None
+                    )
                 )
             ),
         )
@@ -2249,6 +2345,13 @@ class Agent:
         if self._plan_mode:
             # Plan runs deliver a markdown plan in the chat: no impl gates apply.
             return self._acted_once or not self._require_tools
+        # Create/implement must land at least one mutating write/edit before finish.
+        if (
+            self._require_tools
+            and self._create_impl_goal()
+            and not self._impl_mutated_once
+        ):
+            return False
         if self._syntax_broken:
             return False
         if self._rename_still_needed():
@@ -2463,14 +2566,22 @@ class Agent:
                     "Der Create-/Implementierungsauftrag ist damit nicht erledigt. "
                     "Bitte denselben Prompt nochmal senden — der Runner startet frisch."
                 )
-                closing = "Kein Bot-Code liegt im Workspace."
+                closing = (
+                    "Kein Implementierungs-Code liegt im Workspace."
+                    if not self._integration_goal()
+                    else "Kein Bot-Code liegt im Workspace."
+                )
             else:
                 opening = "No files were written in this run."
                 body = (
                     "The create/implement goal is unfinished. "
                     "Re-send the same prompt for a fresh attempt."
                 )
-                closing = "No bot code is in the workspace."
+                closing = (
+                    "No implementation code is in the workspace."
+                    if not self._integration_goal()
+                    else "No bot code is in the workspace."
+                )
             return f"{opening}\n\n{body}\n\n{closing}"
 
         display = ", ".join(file_names)
@@ -2896,9 +3007,17 @@ class Agent:
             self._prefer_write_file = True
             self._prefer_insert_lines = False
         elif phase is CodingPhase.CODE_EXTEND:
-            self._prefer_insert_lines = True
-            self._prefer_write_file = False
-            self._prefer_edit_gaps = False
+            # Create/implement (bots, CLIs, scripts): full write_file rewrite for gaps —
+            # insert_lines thrash is what produced "No files were written" / hollow loops.
+            # Inventory CLIs still extend via insert_lines.
+            if self._create_impl_goal() and not self._inventory_cli_budget():
+                self._prefer_write_file = True
+                self._prefer_insert_lines = False
+                self._prefer_edit_gaps = False
+            else:
+                self._prefer_insert_lines = True
+                self._prefer_write_file = False
+                self._prefer_edit_gaps = False
 
         existing = str(getattr(engine.state, "verification_feedback", "") or "")
         # Do not clobber hard blocks (nibble / gap / hollow / syntax reports).
@@ -2969,9 +3088,46 @@ class Agent:
         enabled = set(self._enabled_registry_names())
         if getattr(self, "_goal_met", False):
             return None
-        # Phase machine first: syntax beats gaps, gaps beat everything else.
+        # Action-loop redirect beats phase machine — prompt and grammar must agree.
+        if getattr(self, "_action_loop_force_write", False) and "write_file" in enabled:
+            return "write_file"
+        if getattr(self, "_action_loop_force_edit", False) and "edit_file" in enabled:
+            return "edit_file"
+        if not self._require_tools:
+            return None
+        # Plan/API gate owns the turn — never sole-force write/edit until declare+epistemic clear.
+        if self._plan_gate_phase() is not None:
+            return None
+        if self._patch_repo_mode():
+            if self._prefer_read_file and self._forced_read_path and "read_file" in enabled:
+                unread = self._forced_read_path not in self._files_read
+                if unread:
+                    return "read_file"
+            if "edit_file" in enabled and (
+                self._prefer_edit_gaps
+                or self._action_loop_force_edit
+            ) and self._files_read:
+                return "edit_file"
+            if self._tests_still_required() and "run_tests" in enabled:
+                return None
+            return None
+        # Phase machine: greenfield CLI bots only.
         phase = self._resolve_coding_phase()
         if self._needs_full_rewrite() and "write_file" in enabled:
+            return "write_file"
+        # Create/implement goals (Discord, CLIs, scripts): always rewrite with write_file.
+        # Sole-forcing insert_lines locks the model out of delivering a complete module.
+        if (
+            self._create_impl_goal()
+            and not self._inventory_cli_budget()
+            and "write_file" in enabled
+            and self._plan_gate_phase() is None
+            and (
+                phase in (CodingPhase.CODE_COMPLETE, CodingPhase.CODE_EXTEND, CodingPhase.CODE_REPAIR)
+                or self._prefer_write_file
+                or self._logic_gaps()
+            )
+        ):
             return "write_file"
         forced = forced_tool_for_phase(phase, enabled)
         if phase is CodingPhase.CODE_REPAIR:
@@ -2979,7 +3135,13 @@ class Agent:
                 # Repair the broken impl file specifically.
                 pass
             return forced
-        if phase in (CodingPhase.CODE_COMPLETE, CodingPhase.CODE_EXTEND):
+        if phase is CodingPhase.CODE_COMPLETE:
+            return forced
+        if phase is CodingPhase.CODE_EXTEND:
+            # Inventory CLIs: insert_lines. Everything else with write_file available: write.
+            if forced == "insert_lines" and "write_file" in enabled and not self._inventory_cli_budget():
+                if self._prefer_write_file or self._logic_gaps():
+                    return "write_file"
             return forced
         if phase is CodingPhase.TEST:
             # Never sole-force run_tests (wordstats loop) — ordering handles it.
@@ -3003,17 +3165,6 @@ class Agent:
             and "insert_lines" in enabled
         ):
             return "insert_lines"
-        if getattr(self, "_action_loop_force_write", False) and "write_file" in enabled:
-            return "write_file"
-        # Missing-file redirect beats research-read lock: once the model tried to
-        # touch a non-existent deliverable and inputs are done, force write_file.
-        if (
-            self._prefer_write_file
-            and self._missing_attempted_paths
-            and not self._research_inputs_unread()
-            and "write_file" in enabled
-        ):
-            return "write_file"
         if self._research_inputs_unread() and "read_file" in enabled:
             return "read_file"
         if self._prefer_write_file and self._missing_attempted_paths and "write_file" in enabled:
@@ -3042,13 +3193,9 @@ class Agent:
             and "rename_symbol" in enabled
         ):
             return "rename_symbol"
-        if self._inspect_before_edit() and not self._inspected_once and not self._rename_pair:
-            if not self._located_once:
-                for name in ("codebase_lookup", "search_code", "read_file"):
-                    if name in enabled:
-                        return name
-            elif "read_file" in enabled:
-                return "read_file"
+        # Inspect-before-edit: prefer search/read via grammar ordering, but do NOT
+        # sole-lock GBNF — edit_file must stay available; ungrounded edits are blocked
+        # at execution (_grounding_block_reason).
         return None
 
     def _action_grammar(self, tool_names: list[str] | None = None) -> str | None:
@@ -3248,22 +3395,54 @@ class Agent:
         forced = self._forced_tool_name()
         if forced and forced in names:
             return [forced]
-        # Defense in depth: even without sole-force, coding phases never offer
-        # edit_file/read ping-pong — REPAIR=write_file, EXTEND=insert_lines.
-        phase = self._resolve_coding_phase()
-        if phase in (CodingPhase.CODE_REPAIR, CodingPhase.CODE_COMPLETE):
-            allowed = {name for name in PHASE_TOOLS[phase] if name in names}
-            if allowed:
-                return list(allowed)
-        if phase is CodingPhase.CODE_EXTEND:
-            allowed = {
+        if getattr(self, "_action_loop_force_edit", False) and "edit_file" in names:
+            return ["edit_file"]
+        if getattr(self, "_action_loop_force_write", False) and "write_file" in names:
+            return ["write_file"]
+        patch_mode = self._patch_repo_mode()
+        if not patch_mode and self._require_tools:
+            # Defense in depth: greenfield coding phases never offer edit/read ping-pong.
+            phase = self._resolve_coding_phase()
+            if phase in (CodingPhase.CODE_REPAIR, CodingPhase.CODE_COMPLETE):
+                allowed = {name for name in PHASE_TOOLS[phase] if name in names}
+                if allowed:
+                    return list(allowed)
+            if phase is CodingPhase.CODE_EXTEND:
+                if (
+                    self._create_impl_goal()
+                    and not self._inventory_cli_budget()
+                    and "write_file" in names
+                ):
+                    return ["write_file"]
+                allowed = {
+                    name
+                    for name in ("insert_lines", "write_file")
+                    if name in names
+                }
+                if allowed:
+                    if self._prefer_write_file and "write_file" in allowed:
+                        ordered = ["write_file", *[n for n in allowed if n != "write_file"]]
+                    else:
+                        ordered = [n for n in ("insert_lines", "write_file") if n in allowed]
+                    return ordered
+        else:
+            # Existing repo patch: edit/run_tests/search — never greenfield phase strips.
+            names = [
                 name
-                for name in ("insert_lines", "write_file")
-                if name in names
-            }
-            if allowed:
-                ordered = [n for n in ("insert_lines", "write_file") if n in allowed]
-                return ordered
+                for name in names
+                if name
+                in {
+                    "edit_file",
+                    "edit_symbol",
+                    "read_file",
+                    "run_tests",
+                    "search_code",
+                    "codebase_lookup",
+                    "research_codebase",
+                    "ask_epistemic",
+                    "measure",
+                }
+            ]
         if self._research_inputs_unread():
             if "read_file" in self._enabled_registry_names():
                 names = ["read_file"]
@@ -3291,8 +3470,15 @@ class Agent:
                     "codebase_lookup",
                 }
             ]
-        if self._inspect_before_edit() and not self._inspected_once:
+        if self._inspect_before_edit() and not self._inspected_once and not getattr(
+            self, "_action_loop_force_edit", False
+        ):
             inspect_names = [name for name in names if name in _EXPLORE_TOOLS]
+            if self._located_once:
+                # Symbol/file located — stop lookup thrash; read then edit.
+                inspect_names = [
+                    name for name in inspect_names if name not in _LOOKUP_TOOLS
+                ]
             if self._located_once and "read_file" in inspect_names:
                 inspect_names = ["read_file", *[name for name in inspect_names if name != "read_file"]]
             elif not self._located_once:
@@ -3304,10 +3490,16 @@ class Agent:
                         ]
                         break
             if inspect_names:
-                names = inspect_names
+                extra = [n for n in ("edit_file", "edit_symbol") if n in names]
+                names = inspect_names + [n for n in extra if n not in inspect_names]
         if self._grounded_edits_enabled() or self._require_tools:
             names = [name for name in names if name != "run_terminal_command"]
         if self._prefer_read_file and "read_file" in names:
+            # Action-loop redirect must not be overridden by read-only grammar lock.
+            if getattr(self, "_action_loop_force_edit", False) and "edit_file" in names:
+                return ["edit_file"]
+            if getattr(self, "_action_loop_force_write", False) and "write_file" in names:
+                return ["write_file"]
             # Never sole-lock read when core behavior is missing — insert/write first.
             if (
                 self._logic_gaps()
@@ -3318,12 +3510,18 @@ class Agent:
                 pass
             elif self._rename_pair and "rename_symbol" in names:
                 names = ["read_file", "rename_symbol"]
+            elif patch_mode and self._forced_read_path:
+                unread = self._forced_read_path not in self._files_read
+                if unread and "edit_file" in names:
+                    return ["read_file", "edit_file"]
+                if not unread and "edit_file" in names:
+                    return ["edit_file"]
             else:
                 names = ["read_file"]
         elif self._rename_pair and "rename_symbol" in names and not self._acted_once:
             names = ["rename_symbol", *[name for name in names if name != "rename_symbol"]]
             names = [name for name in names if name != "run_terminal_command"]
-        if self._impl_gaps and self._plan_gate_phase() is None:
+        if self._impl_gaps and self._plan_gate_phase() is None and not patch_mode:
             names = [name for name in names if name != "run_terminal_command"]
             if self._logic_gaps() or getattr(self, "_prefer_insert_lines", False):
                 allowed = {"insert_lines", "read_file", "write_file"}
@@ -3454,8 +3652,14 @@ class Agent:
             and "write_file" in names
         ):
             names = ["write_file"]
-        if self._inspect_before_edit() and not self._inspected_once:
+        if self._inspect_before_edit() and not self._inspected_once and not getattr(
+            self, "_action_loop_force_edit", False
+        ):
             inspect_names = [name for name in names if name in _EXPLORE_TOOLS]
+            if self._located_once:
+                inspect_names = [
+                    name for name in inspect_names if name not in _LOOKUP_TOOLS
+                ]
             if self._located_once and "read_file" in inspect_names:
                 inspect_names = ["read_file", *[name for name in inspect_names if name != "read_file"]]
             elif not self._located_once:
@@ -3464,7 +3668,8 @@ class Agent:
                         inspect_names = [preferred, *[name for name in inspect_names if name != preferred]]
                         break
             if inspect_names:
-                names = inspect_names
+                extra = [n for n in ("edit_file", "edit_symbol") if n in names]
+                names = inspect_names + [n for n in extra if n not in inspect_names]
         if not names:
             names = self._enabled_registry_names()
         if not names:
@@ -3505,7 +3710,13 @@ class Agent:
             if path and ("file not found" in err_l or "does not exist" in err_l):
                 abs_missing = self._abs_impl_path(str(path))
                 self._missing_attempted_paths.add(abs_missing)
-                if not self._research_inputs_unread():
+                if self._patch_repo_mode():
+                    lines.append(
+                        self._missing_file_patch_redirect(
+                            self._display_path(abs_missing), str(path)
+                        )
+                    )
+                elif not self._research_inputs_unread():
                     self._prefer_write_file = True
                     self._prefer_read_file = False
                     lines.append(feedback("file_missing_write", path=self._display_path(abs_missing)))
@@ -3564,14 +3775,49 @@ class Agent:
                     signature = f"{key}:{args_hash}"
                     self._edit_fail_counts[signature] = self._edit_fail_counts.get(signature, 0) + 1
                     fails = self._edit_fail_counts[signature]
-                    if fails >= 2:
+                    path_key = f"{key}:*"
+                    self._edit_fail_counts[path_key] = int(self._edit_fail_counts.get(path_key, 0)) + 1
+                    path_fails = int(self._edit_fail_counts[path_key])
+                    display = self._display_path(key)
+                    if self._patch_repo_mode():
+                        self._prefer_write_file = False
+                        self._action_loop_force_write = False
+                        snippet = self._closest_edit_snippet(
+                            key, str(arguments.get("old_string") or "")
+                        )
+                        if path_fails >= 2 and snippet:
+                            self._prefer_read_file = False
+                            self._prefer_edit_gaps = True
+                            self._action_loop_force_edit = True
+                            self._forced_read_path = ""
+                            lines.append(
+                                feedback(
+                                    "edit_fail_retry_patch",
+                                    path=display,
+                                    snippet=snippet,
+                                )
+                            )
+                        else:
+                            self._prefer_read_file = True
+                            self._forced_read_path = key
+                            self._prefer_edit_gaps = True
+                            self._action_loop_force_edit = False
+                            lines.append(
+                                feedback("edit_fail_reread_patch", path=display)
+                            )
+                            if snippet:
+                                lines.append(
+                                    f"Closest lines on disk in {display}:\n{snippet}\n"
+                                    "Next retry: set old_string to an exact verbatim substring."
+                                )
+                    elif fails >= 2:
                         self._prefer_read_file = True
                         self._prefer_write_file = True
                         lines.append(
                             "edit_file failed twice with the same args. "
                             "Preferred next tools: read_file, write_file."
                         )
-                    if fails >= 3:
+                    if fails >= 3 and not self._patch_repo_mode():
                         self._metric_stall_triggered = True
                         engine.set_verification_feedback(
                             feedback("stalled")
@@ -3586,11 +3832,47 @@ class Agent:
             lines.append(feedback("truncated_write_markup"))
         else:
             lines.append(feedback("retry"))
-        if self._prefer_write_file and not markup_truncated:
+        if self._prefer_write_file and not markup_truncated and not self._patch_repo_mode():
             lines.append(feedback("write_file"))
         if extra_snippets:
             lines.append("\n".join(extra_snippets))
         engine.set_verification_feedback("\n".join(lines))
+
+    def _closest_edit_snippet(self, abs_path: str, old_string: str, *, max_lines: int = 16) -> str:
+        """Return nearby on-disk lines most similar to a failed old_string."""
+        if not abs_path or not Path(abs_path).is_file():
+            return ""
+        try:
+            content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = content.splitlines()
+        if not lines:
+            return ""
+        needle = (old_string or "").strip()
+        if not needle:
+            return "\n".join(lines[:max_lines]).strip()[:1500]
+        needle_lines = [ln.rstrip() for ln in needle.splitlines() if ln.strip()]
+        if not needle_lines:
+            needle_lines = [needle[:120]]
+        best_i = 0
+        best_score = -1.0
+        window = max(1, len(needle_lines))
+        for i in range(0, max(1, len(lines) - window + 1)):
+            chunk = [ln.rstrip() for ln in lines[i : i + window]]
+            score = difflib.SequenceMatcher(
+                None, "\n".join(needle_lines), "\n".join(chunk)
+            ).ratio()
+            # Bonus when the first non-empty needle token appears in the window.
+            token = next((t for t in needle_lines[0].split() if len(t) > 3), "")
+            if token and any(token in ln for ln in chunk):
+                score += 0.15
+            if score > best_score:
+                best_score = score
+                best_i = i
+        start = max(0, best_i - 2)
+        end = min(len(lines), best_i + window + 6)
+        return "\n".join(lines[start:end]).strip()[:1500]
 
     def _grounded_edits_enabled(self) -> bool:
         if not self._require_tools or self._verification_root is None:
@@ -3604,6 +3886,28 @@ class Agent:
         if _GOAL_IMPLIES_EDIT.search(self._task or "") and self._pending_goal_files:
             return True
         return False
+
+    def _patch_repo_mode(self) -> bool:
+        """SWE-bench / existing-repo goals: patch with edit_file, write_file disabled."""
+        return (
+            "write_file" in self._disabled_tools
+            and self._require_tools
+            and self._verification_root is not None
+        )
+
+    def _patch_tracked_files(self) -> list[str]:
+        """Files touched this run — not the whole repo tree."""
+        paths: set[str] = set(self._files_read)
+        paths.update(self._path_last_mutate_iter.keys())
+        paths.update(self._path_last_read_iter.keys())
+        out: list[str] = []
+        for raw in paths:
+            if not raw:
+                continue
+            p = Path(raw)
+            if p.is_file():
+                out.append(str(p.resolve()))
+        return out
 
     def _inspect_before_edit(self) -> bool:
         if not self._require_tools:
@@ -3679,10 +3983,73 @@ class Agent:
                 path=display,
                 next_path=next_rel,
             )
+        if self._patch_repo_mode():
+            return self._missing_file_patch_redirect(display, path)
         self._prefer_write_file = True
         self._prefer_read_file = False
         self._forced_read_path = ""
         return feedback("file_missing_write", path=display)
+
+    def _missing_file_patch_redirect(self, display: str, raw_path: str) -> str:
+        """SWE-bench: invented paths must search — write_file is disabled."""
+        self._prefer_write_file = False
+        self._prefer_read_file = False
+        self._forced_read_path = ""
+        self._prefer_edit_gaps = False
+        self._action_loop_force_write = False
+        self._action_loop_force_edit = False
+        self._inspected_once = False
+        self._located_once = False
+        hints = self._similar_repo_path_hints(raw_path)
+        hint_block = ""
+        if hints:
+            hint_block = "\nPossible real paths:\n" + "\n".join(f"- {h}" for h in hints)
+            # Prefer reading the closest existing path next.
+            self._prefer_read_file = True
+            self._forced_read_path = self._abs_impl_path(hints[0])
+            self._located_once = True
+        return feedback("file_missing_search", path=display, hints=hint_block)
+
+    def _similar_repo_path_hints(self, raw_path: str, *, limit: int = 5) -> list[str]:
+        """Find existing files whose basename matches an invented path."""
+        root = Path(self._verification_root) if self._verification_root else None
+        if root is None or not root.is_dir():
+            return []
+        name = Path(normalize_tool_path(raw_path)).name
+        stem = Path(name).stem.lower() if name else ""
+        if not stem or stem in {".", ".."}:
+            return []
+        hits: list[str] = []
+        try:
+            for found in root.rglob(name):
+                if not found.is_file():
+                    continue
+                rel = self._display_path(str(found.resolve()))
+                if _looks_like_test_path(rel):
+                    continue
+                hits.append(rel)
+                if len(hits) >= limit:
+                    return hits
+        except OSError:
+            pass
+        if hits:
+            return hits
+        # Basename typo / wrong package: match by stem under common package dirs.
+        try:
+            for found in root.rglob(f"*{stem}*.py"):
+                if not found.is_file():
+                    continue
+                rel = self._display_path(str(found.resolve()))
+                if _looks_like_test_path(rel):
+                    continue
+                if stem not in found.stem.lower():
+                    continue
+                hits.append(rel)
+                if len(hits) >= limit:
+                    break
+        except OSError:
+            return hits
+        return hits
 
     def _test_discipline_block(self, call: ToolCall) -> str | None:
         """Block run_tests while no test file exists in the workspace.
@@ -3867,17 +4234,32 @@ class Agent:
                     self._agent_created_test_paths.append(abs_path)
             if raw and not _looks_like_test_path(raw):
                 self._impl_mutated_once = True
+                if self._patch_repo_mode():
+                    self._fix_hint_path = self._display_path(abs_path)
+                    self._impl_gaps = []
+                    self._action_loop_force_edit = False
+                    self._action_loop_force_write = False
+                    self._prefer_read_file = False
             self._path_last_mutate_iter[abs_path] = int(getattr(self, "_current_iteration", 0))
+            if result.success and call is not None:
+                self._call_fp_counts.pop(self._tool_call_fingerprint(call), None)
 
     def _logic_gap_block_reason(self, call: ToolCall) -> str | None:
         """Ban ±3-line edit_file while core behavior is still missing."""
+        if self._patch_repo_mode():
+            return None
         if call.name != "edit_file":
             return None
         if not self._logic_gaps() and not getattr(self, "_prefer_insert_lines", False):
             return None
         path_hint, line_hint = self._suggested_insert_hint()
-        self._prefer_insert_lines = True
-        self._prefer_edit_gaps = False
+        if self._integration_goal():
+            self._prefer_write_file = True
+            self._prefer_insert_lines = False
+            self._prefer_edit_gaps = False
+        else:
+            self._prefer_insert_lines = True
+            self._prefer_edit_gaps = False
         return feedback(
             "nibble_edit_blocked",
             path=path_hint,
@@ -3891,6 +4273,8 @@ class Agent:
         snapshots: dict[str, str],
     ) -> list[ToolResult]:
         """Undo tiny patches / mash inserts that leave logic gaps open."""
+        if self._patch_repo_mode():
+            return tool_results
         pre_logic = list(self._logic_gaps() or [])
         rewritten: list[ToolResult] = []
         for result in tool_results:
@@ -3940,6 +4324,16 @@ class Agent:
                     self._prefer_edit_gaps = False
                     self._prefer_read_file = False
                     err = feedback("coding_repair", path=path_hint or path)
+                elif self._integration_goal():
+                    self._prefer_write_file = True
+                    self._prefer_insert_lines = False
+                    self._prefer_edit_gaps = False
+                    err = feedback(
+                        "nibble_edit_blocked",
+                        path=path_hint,
+                        line=str(line_hint),
+                        gaps="\n".join(f"- {gap}" for gap in pre_logic[:6]),
+                    )
                 else:
                     self._prefer_insert_lines = True
                     self._prefer_edit_gaps = False
@@ -4003,7 +4397,14 @@ class Agent:
         If the same logic gaps are still open after the mutation, the result is
         turned into a failure, the file snapshot is restored, and repeated
         no-progress escalates EXTEND -> REPAIR (full rewrite).
+
+        Skipped for SWE-bench / grounded repo patches — impl_gaps heuristics
+        target greenfield CLI bots, not minimal edits to existing libraries.
         """
+        if "write_file" in self._disabled_tools and self._grounded_edits_enabled():
+            return tool_results
+        if not gaps_before:
+            return tool_results
         mutating = {"write_file", "insert_lines", "edit_file", "edit_symbol"}
         if not any(r.success and r.tool_name in mutating for r in tool_results):
             return tool_results
@@ -4170,12 +4571,16 @@ class Agent:
             if not gaps and line_count >= _HOLLOW_SKELETON_MIN_LINES:
                 continue
             if line_count < _HOLLOW_SKELETON_MIN_LINES and gaps:
-                # Keep the skeleton on disk so the next turn can CODE_EXTEND via
-                # insert_lines. Deleting it caused "no files recorded" + endless
-                # rewrite thrash (every write rejected → file gone → write again).
-                self._prefer_insert_lines = True
-                self._prefer_write_file = False
-                self._prefer_edit_gaps = False
+                # Create/implement: keep file but demand a COMPLETE write_file rewrite next.
+                # Inventory CLIs can CODE_EXTEND via insert_lines.
+                if self._create_impl_goal() and not self._inventory_cli_budget():
+                    self._prefer_write_file = True
+                    self._prefer_insert_lines = False
+                    self._prefer_edit_gaps = False
+                else:
+                    self._prefer_insert_lines = True
+                    self._prefer_write_file = False
+                    self._prefer_edit_gaps = False
                 if rewritten is None:
                     rewritten = list(tool_results)
                 path_hint, line_hint = self._suggested_insert_hint()
@@ -4321,7 +4726,9 @@ class Agent:
                     for call in blocked
                 )
             return results
-        if self._inspect_before_edit() and not self._inspected_once:
+        if self._inspect_before_edit() and not self._inspected_once and not getattr(
+            self, "_action_loop_force_edit", False
+        ):
             results: list[ToolResult] = []
             allowed: list[ToolCall] = []
             for call in tool_calls:
@@ -4776,9 +5183,109 @@ class Agent:
     def _tool_call_fingerprint(self, call: ToolCall) -> str:
         args = call.arguments if isinstance(call.arguments, dict) else {}
         path = str(args.get("path") or "").strip()
+        query = str(
+            args.get("query") or args.get("topic") or args.get("symbol") or ""
+        ).strip()
+        if call.name in _LOOKUP_TOOLS:
+            return f"{call.name}|{query or path}"
+        if call.name == "edit_file":
+            old = str(args.get("old_string") or "")[:160]
+            return f"{call.name}|{path}|{old}"
         return f"{call.name}|{path}"
 
+    def _action_loop_action_label(self, call: ToolCall) -> str:
+        args = call.arguments if isinstance(call.arguments, dict) else {}
+        path = str(args.get("path") or "").strip()
+        query = str(args.get("query") or args.get("topic") or "").strip()
+        if path:
+            return f"{call.name} {self._display_path(self._abs_impl_path(path))}"
+        if query:
+            return f"{call.name} {query[:80]}"
+        return call.name
+
+    def _note_action_loop_results(
+        self,
+        engine: ContextEngine,
+        calls: list[ToolCall],
+        results: list[ToolResult],
+    ) -> None:
+        """Track repeated identical tool calls and nudge toward progress."""
+        by_call = {
+            id(result.call): result
+            for result in results
+            if getattr(result, "call", None) is not None
+        }
+        for call in calls:
+            result = by_call.get(id(call))
+            if result is None or not result.success or result.metadata.get("blocked"):
+                continue
+            fp = self._tool_call_fingerprint(call)
+            self._call_fp_counts[fp] = int(self._call_fp_counts.get(fp, 0)) + 1
+            if self._call_fp_counts[fp] < _ACTION_LOOP_NUDGE:
+                continue
+            action = self._action_loop_action_label(call)
+            self._arm_action_loop_redirect(action)
+            if self._action_loop_force_edit:
+                engine.set_verification_feedback(feedback("readonly_edit_now"))
+            else:
+                engine.set_verification_feedback(feedback("action_loop", action=action))
+
+    def _note_thought_action_loop(
+        self,
+        engine: ContextEngine,
+        thought: str,
+        calls: list[ToolCall],
+    ) -> None:
+        """Detect read/lookup loops declared in thought without file changes."""
+        if not calls:
+            return
+        call = calls[0]
+        if call.name not in _LOOKUP_TOOLS | {"read_file"}:
+            return
+        key = _thought_key(thought)[:400]
+        if not key:
+            return
+        fp = f"thought|{call.name}|{key}"
+        self._call_fp_counts[fp] = int(self._call_fp_counts.get(fp, 0)) + 1
+        if self._call_fp_counts[fp] < _ACTION_LOOP_NUDGE:
+            return
+        self._arm_action_loop_redirect(call.name)
+        if self._action_loop_force_edit:
+            engine.set_verification_feedback(feedback("readonly_edit_now"))
+        else:
+            engine.set_verification_feedback(
+                feedback("action_loop", action=self._action_loop_action_label(call))
+            )
+
+    def _note_lookup_progress(
+        self,
+        engine: ContextEngine,
+        tool_results: list[ToolResult],
+    ) -> None:
+        """After a useful lookup, force read_file on the hit — not another lookup."""
+        for result in tool_results:
+            if not result.success or result.tool_name != "codebase_lookup":
+                continue
+            if not self._codebase_lookup_found_impl(result):
+                engine.set_verification_feedback(feedback("lookup_empty"))
+                continue
+            output = result.output if isinstance(result.output, dict) else {}
+            for item in list(output.get("definitions") or []) + list(output.get("files") or []):
+                if not isinstance(item, dict) or not item.get("path"):
+                    continue
+                rel = str(item["path"])
+                if _looks_like_test_path(rel):
+                    continue
+                abs_path = self._abs_impl_path(rel)
+                self._located_once = True
+                if abs_path not in self._files_read:
+                    self._forced_read_path = abs_path
+                    self._prefer_read_file = True
+                return
+
     def _goal_is_met(self) -> bool:
+        if self._patch_repo_mode() and self._impl_mutated_once:
+            return True
         if self._syntax_broken or self._impl_gaps:
             return False
         if self._task_wants_tests and not self._ran_tests_ok:
@@ -4819,17 +5326,29 @@ class Agent:
         # After pytest is green, write redirects destroy working trees (truncate loop).
         if getattr(self, "_pytest_green", False) or self._ran_tests_ok or self._goal_met:
             self._action_loop_force_write = False
+            self._action_loop_force_edit = False
             self._prefer_write_file = False
             self._prefer_edit_gaps = True
             self._prefer_read_file = False
             self._forced_read_path = ""
             self._action_loop_last_action = action
             return
-        self._action_loop_force_write = True
+        enabled = set(self._enabled_registry_names())
         self._action_loop_last_action = action
-        self._prefer_write_file = True
         self._prefer_read_file = False
         self._forced_read_path = ""
+        if "write_file" in enabled:
+            self._action_loop_force_write = True
+            self._action_loop_force_edit = False
+            self._prefer_write_file = True
+            return
+        # SWE-bench / grounded repos: write_file disabled — patch with edit_file.
+        self._action_loop_force_write = False
+        self._prefer_write_file = False
+        self._action_loop_force_edit = "edit_file" in enabled
+        self._prefer_edit_gaps = True
+        self._inspected_once = True
+        self._prefer_read_file = False
 
 
     def _action_loop_block_reason(self, call: ToolCall) -> str | None:
@@ -4839,6 +5358,11 @@ class Agent:
         path = str(args.get("path") or "").strip()
         abs_path = self._abs_impl_path(path) if path else ""
         display = self._display_path(abs_path) if abs_path else (path or call.name)
+
+        # Plan-gate epistemic retries must not be action-loop blocked — identical
+        # ask_epistemic is how fail-open (2 install misses) clears the Discord lock.
+        if call.name == "ask_epistemic" and self._plan_gate_phase() == "epistemic":
+            return None
 
         # Green pytest already proved tests — repeating run_tests is the wordstats loop.
         if call.name == "run_tests" and (
@@ -4859,6 +5383,39 @@ class Agent:
                 self._goal_met = True
                 self._action_loop_force_write = False
                 return feedback("goal_met_stop")
+        if call.name == "edit_file" and abs_path and self._patch_repo_mode():
+            # Block repeating an identical failed old_string (separate from success fps).
+            old = str(args.get("old_string") or "")
+            new = str(args.get("new_string") or "")
+            if old:
+                args_hash = hashlib.sha1(
+                    json.dumps(
+                        {"old": old, "new": new},
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()[:12]
+                signature = f"{abs_path}:{args_hash}"
+                if int(self._edit_fail_counts.get(signature, 0)) >= 1:
+                    self._prefer_write_file = False
+                    self._action_loop_force_write = False
+                    snippet = self._closest_edit_snippet(abs_path, old)
+                    path_fails = int(self._edit_fail_counts.get(f"{abs_path}:*", 0))
+                    if path_fails >= 2 and snippet:
+                        self._prefer_read_file = False
+                        self._forced_read_path = ""
+                        self._prefer_edit_gaps = True
+                        self._action_loop_force_edit = True
+                        return feedback(
+                            "edit_fail_retry_patch",
+                            path=display,
+                            snippet=snippet,
+                        )
+                    self._prefer_read_file = True
+                    self._forced_read_path = abs_path
+                    self._prefer_edit_gaps = True
+                    return feedback("edit_fail_reread_patch", path=display)
+
         if call.name == "read_file" and abs_path and abs_path in self._files_read:
             last_read = int(self._path_last_read_iter.get(abs_path, -1))
             last_mut = int(self._path_last_mutate_iter.get(abs_path, -1))
@@ -4875,6 +5432,8 @@ class Agent:
                         self._prefer_edit_gaps = False
                     else:
                         self._prefer_edit_gaps = True
+                    if self._patch_repo_mode():
+                        return self._patch_reread_block_feedback(abs_path, display)
                     return feedback("action_loop_blocked", action=f"read_file {display}")
                 # Hollow bot / unfinished impl: stop re-reading, insert missing logic.
                 if self._logic_gaps() or self._impl_gaps:
@@ -4883,13 +5442,94 @@ class Agent:
                     self._prefer_write_file = False
                     self._action_loop_force_write = False
                     self._prefer_read_file = False
+                    if self._patch_repo_mode():
+                        return self._patch_reread_block_feedback(abs_path, display)
                     return feedback("action_loop_blocked", action=f"read_file {display}")
+                if self._patch_repo_mode():
+                    return self._patch_reread_block_feedback(abs_path, display)
                 self._arm_action_loop_redirect(f"read_file {display}")
                 return feedback("action_loop_blocked", action=f"read_file {display}")
         if count >= _ACTION_LOOP_BLOCK:
+            if call.name == "edit_file" and abs_path:
+                old = str(args.get("old_string") or "")
+                new = str(args.get("new_string") or "")
+                if old:
+                    try:
+                        on_disk = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+                        # Only treat as already-applied when the intended new text is present
+                        # and the old anchor is gone (successful prior edit), not when the
+                        # model invented a never-matching old_string.
+                        if old not in on_disk and new and new in on_disk:
+                            self._call_fp_counts.pop(fp, None)
+                            self._action_loop_force_edit = False
+                            if self._patch_repo_mode():
+                                self._goal_met = True
+                                return feedback("patch_already_applied", path=display)
+                        if old not in on_disk and self._patch_repo_mode():
+                            # Failed-anchor repeat: re-read once with closest snippet.
+                            self._call_fp_counts.pop(fp, None)
+                            self._prefer_write_file = False
+                            self._action_loop_force_write = False
+                            self._prefer_read_file = True
+                            self._forced_read_path = abs_path
+                            self._prefer_edit_gaps = True
+                            snippet = self._closest_edit_snippet(abs_path, old)
+                            if snippet:
+                                return feedback(
+                                    "edit_fail_retry_patch",
+                                    path=display,
+                                    snippet=snippet,
+                                )
+                            return feedback("edit_fail_reread_patch", path=display)
+                    except OSError:
+                        pass
+            if call.name == "read_file" and abs_path:
+                last_read = int(self._path_last_read_iter.get(abs_path, -1))
+                last_mut = int(self._path_last_mutate_iter.get(abs_path, -1))
+                if last_mut > last_read:
+                    return None
+            if call.name in _LOOKUP_TOOLS:
+                self._inspected_once = True
+                self._prefer_edit_gaps = True
+                self._action_loop_force_write = False
+                self._action_loop_force_edit = "edit_file" in set(self._enabled_registry_names())
+                self._prefer_read_file = False
+                label = str(args.get("query") or args.get("topic") or display)[:80]
+                return feedback("action_loop_blocked", action=f"{call.name} {label}".strip())
             self._arm_action_loop_redirect(f"{call.name} {display}".strip())
+            if self._patch_repo_mode():
+                return feedback("action_loop_blocked_patch", action=f"{call.name} {display}".strip())
             return feedback("action_loop_blocked", action=f"{call.name} {display}".strip())
         return None
+
+    def _patch_reread_block_feedback(self, abs_path: str, display: str) -> str:
+        """Stop re-read thrash in SWE-bench; force edit with an on-disk snippet."""
+        self._prefer_write_file = False
+        self._action_loop_force_write = False
+        self._prefer_read_file = False
+        self._forced_read_path = ""
+        self._prefer_edit_gaps = True
+        self._action_loop_force_edit = "edit_file" in set(self._enabled_registry_names())
+        self._inspected_once = True
+        snippet = ""
+        try:
+            text = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            # Prefer a mid-file window — headers alone rarely contain the bug.
+            if len(lines) > 40:
+                mid = max(0, len(lines) // 3)
+                snippet = "\n".join(lines[mid : mid + 18]).strip()[:1500]
+            else:
+                snippet = "\n".join(lines[:18]).strip()[:1500]
+        except OSError:
+            snippet = ""
+        if snippet:
+            return feedback(
+                "action_loop_blocked_patch_snippet",
+                path=display,
+                snippet=snippet,
+            )
+        return feedback("action_loop_blocked_patch", action=f"read_file {display}")
 
 
 
@@ -4972,6 +5612,8 @@ class Agent:
 
 
     def _tests_still_required(self) -> bool:
+        if self._patch_repo_mode():
+            return False
         # Goal asked for tests but none exist — keep requiring work (rewrite/run).
         if (
             self._require_tools
@@ -5548,7 +6190,12 @@ class Agent:
             if not raw and isinstance(arguments, dict):
                 raw = str(arguments.get("path") or "")
             if raw:
-                self._edit_fail_counts.pop(self._abs_impl_path(raw), None)
+                key = self._abs_impl_path(raw)
+                self._edit_fail_counts.pop(key, None)
+                self._edit_fail_counts.pop(f"{key}:*", None)
+                for sig in list(self._edit_fail_counts):
+                    if sig.startswith(f"{key}:"):
+                        self._edit_fail_counts.pop(sig, None)
 
     def _fallback_failed_edits(self, tool_results: list[ToolResult]) -> list[ToolResult]:
         rewritten: list[ToolResult] = []
@@ -5939,6 +6586,14 @@ class Agent:
 
     def _impl_source_files(self) -> list[str]:
         """Impl sources across languages (not just Python) for completeness checks."""
+        if (
+            "write_file" in self._disabled_tools
+            and self._require_tools
+            and self._verification_root is not None
+        ):
+            tracked = self._patch_tracked_files()
+            if tracked:
+                return tracked
         root = self._verification_root
         if root is None:
             return []
@@ -6036,6 +6691,9 @@ class Agent:
 
     def _refresh_impl_completeness(self, engine: ContextEngine) -> None:
         """Re-scan impl modules; block finish while CLI/stub gaps remain."""
+        if self._patch_repo_mode() or is_repo_patch_goal(self._task or ""):
+            self._impl_gaps = []
+            return
         task = self._task or ""
         if not self._require_tools:
             self._impl_gaps = []
@@ -6081,6 +6739,10 @@ class Agent:
         self._mark_goal_met_if_ready(engine)
 
     def _primary_impl_path(self) -> str:
+        if self._patch_repo_mode() and self._path_last_mutate_iter:
+            latest = max(self._path_last_mutate_iter.items(), key=lambda item: item[1])[0]
+            if Path(latest).is_file():
+                return latest
         files = [p for p in self._impl_source_files() if not _looks_like_test_path(p)]
         if not files:
             return ""
@@ -6110,6 +6772,8 @@ class Agent:
     def _sync_impl_status_from_reads(
         self, engine: ContextEngine, tool_results: list[ToolResult]
     ) -> None:
+        if self._patch_repo_mode() or is_repo_patch_goal(self._task or ""):
+            return
         for result in tool_results:
             if not result.success or result.tool_name != "read_file":
                 continue

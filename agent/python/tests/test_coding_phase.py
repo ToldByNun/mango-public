@@ -135,10 +135,12 @@ def test_hollow_skeleton_write_rejected_for_discord(tmp_path: Path) -> None:
     assert out is not None
     assert out[0].success is False
     assert "hollow" in (out[0].error or "").lower() or "skeleton" in (out[0].error or "").lower()
-    # Skeleton stays on disk so the next turn can insert_lines (not rewrite thrash).
+    # Skeleton stays on disk; Discord must rewrite with write_file (not insert thrash).
     assert target.exists()
     assert "discord" in target.read_text(encoding="utf-8").lower() or "Bot" in target.read_text(encoding="utf-8")
-    assert agent._prefer_insert_lines is True
+    assert agent._prefer_write_file is True
+    assert agent._prefer_insert_lines is False
+    assert agent._forced_tool_name() == "write_file"
 
 
 def test_gap_unchanged_mutation_reverted(tmp_path: Path) -> None:

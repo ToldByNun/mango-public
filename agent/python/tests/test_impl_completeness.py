@@ -260,7 +260,7 @@ def test_agent_blocks_finish_on_hollow_discord_bot(tmp_path: Path) -> None:
     assert agent._impl_gaps
     assert not agent._finish_allowed()
     assert agent._logic_gaps()
-    assert agent._forced_tool_name() == "insert_lines"
+    assert agent._forced_tool_name() == "write_file"
     assert not agent._inventory_style_goal(DISCORD_GOAL)
 
 
@@ -309,13 +309,13 @@ def test_logic_gaps_grammar_excludes_edit_file(tmp_path: Path) -> None:
 
     engine = ContextEngine(goal=DISCORD_GOAL)
     agent._refresh_impl_completeness(engine)
-    assert agent._forced_tool_name() == "insert_lines"
+    assert agent._forced_tool_name() == "write_file"
     filtered = agent._apply_grammar_filters(list(agent._enabled_registry_names()))
-    assert filtered == ["insert_lines"]
+    assert filtered == ["write_file"]
 
 
 def test_logic_gaps_force_insert_not_micro_edit(tmp_path: Path) -> None:
-    """After a skeleton write, Discord bots must insert missing logic — not ±3-line edits."""
+    """After a skeleton write, Discord bots must rewrite with write_file — not ±3-line edits."""
     from mango_agent.prompt import feedback
     from mango_context import ContextEngine
 
@@ -336,7 +336,7 @@ def test_logic_gaps_force_insert_not_micro_edit(tmp_path: Path) -> None:
     agent._refresh_impl_completeness(engine)
     logic = agent._logic_gaps()
     assert logic
-    assert agent._forced_tool_name() == "insert_lines"
+    assert agent._forced_tool_name() == "write_file"
     engine.set_verification_feedback(
         feedback(
             "impl_logic_missing",
@@ -346,7 +346,7 @@ def test_logic_gaps_force_insert_not_micro_edit(tmp_path: Path) -> None:
         )
     )
     fb = engine.state.verification_feedback or ""
-    assert "insert_lines" in fb.lower()
+    assert "write_file" in fb.lower()
     assert "do not" in fb.lower() and "edit_file" in fb.lower()
 
 
@@ -385,7 +385,7 @@ def test_nibble_edit_blocked_and_reverted(tmp_path: Path) -> None:
         end=0,
     )
     reason = agent._logic_gap_block_reason(call)
-    assert reason and "insert_lines" in reason.lower()
+    assert reason and "write_file" in reason.lower()
 
     snaps = {str(target.resolve()): original}
     target.write_text(original + "x = 1\n", encoding="utf-8")

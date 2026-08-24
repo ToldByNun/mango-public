@@ -13,7 +13,7 @@ from mango_agent.benchmark.swebench.baseline import (
     load_baseline_config,
     render_comparison,
 )
-from mango_agent.benchmark.swebench.evaluate import run_official_evaluation
+from mango_agent.benchmark.swebench.evaluate import docker_daemon_ready, run_official_evaluation
 from mango_agent.benchmark.swebench.instances import (
     DEFAULT_DATASET,
     DEFAULT_SPLIT,
@@ -22,6 +22,7 @@ from mango_agent.benchmark.swebench.instances import (
     lite_instance_count,
 )
 from mango_agent.benchmark.swebench.runner import run_swebench
+from mango_agent.benchmark.swebench.shuffle import deck_status, shuffle_state_path, validate_count
 from mango_agent.types import AgentLimits
 
 
@@ -51,7 +52,29 @@ def main(argv: list[str] | None = None) -> int:
         "--baseline-config",
         help="Path to baseline JSON (default: bundled swebench-lite-baseline-10)",
     )
-    parser.add_argument("--limit", type=int, help="Maximum number of instances to run")
+    parser.add_argument("--limit", type=int, help="Maximum number of instances to run (alias for --count)")
+    parser.add_argument(
+        "--count",
+        type=int,
+        metavar="N",
+        help="How many instances to run this session (1-300 for Lite; use with --shuffle for random deck)",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Pick instances in random order; each instance runs once per cycle before repeats",
+    )
+    parser.add_argument(
+        "--shuffle-reset",
+        action="store_true",
+        help="Reset shuffle deck state in --output-dir before running",
+    )
+    parser.add_argument("--shuffle-seed", type=int, help="Optional RNG seed for shuffle (cycle-based default)")
+    parser.add_argument(
+        "--shuffle-status",
+        action="store_true",
+        help="Show shuffle deck progress from --output-dir and exit",
+    )
     parser.add_argument("--list", action="store_true", help="List instances and exit")
     parser.add_argument(
         "--output-dir",
@@ -108,13 +131,29 @@ def main(argv: list[str] | None = None) -> int:
         instance_ids = [str(item) for item in baseline_config["instance_ids"]]
     fixture_path = Path(args.fixture) if args.fixture else None
 
+    if args.shuffle_status:
+        status = deck_status(shuffle_state_path(Path(args.output_dir)))
+        if status is None:
+            print(f"No shuffle state in {Path(args.output_dir).resolve()}", file=sys.stderr)
+            return 1
+        print(json.dumps(status, indent=2))
+        return 0
+
+    run_count = args.count if args.count is not None else args.limit
+    if run_count is not None:
+        try:
+            run_count = validate_count(run_count, dataset_name=args.dataset, split=args.split)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     if args.list:
         items = load_instances(
             dataset_name=args.dataset,
             split=args.split,
             fixture_path=fixture_path,
             instance_ids=instance_ids,
-            limit=args.limit,
+            limit=run_count,
         )
         print(f"{'instance_id':<34} repo")
         for item in items:
@@ -133,6 +172,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.evaluate_only:
         if not args.predictions:
             print("--evaluate-only requires --predictions", file=sys.stderr)
+            return 2
+        ready, docker_msg = docker_daemon_ready()
+        if not ready:
+            print(docker_msg, file=sys.stderr)
             return 2
         run_id = args.eval_run_id or f"mango-{int(__import__('time').time())}"
         summary = run_official_evaluation(
@@ -165,7 +208,11 @@ def main(argv: list[str] | None = None) -> int:
             split=args.split,
             fixture_path=fixture_path,
             instance_ids=instance_ids,
-            limit=args.limit,
+            limit=run_count,
+            count=run_count,
+            shuffle=args.shuffle,
+            shuffle_reset=args.shuffle_reset,
+            shuffle_seed=args.shuffle_seed,
             work_root=Path(args.work_root) if args.work_root else None,
             cache_root=Path(args.cache_root) if args.cache_root else None,
             output_dir=output_dir,
@@ -219,11 +266,25 @@ def main(argv: list[str] | None = None) -> int:
             f"({float(payload['pass_rate']) * 100:.1f}%)",
             flush=True,
         )
+    if payload.get("shuffle"):
+        sh = payload["shuffle"]
+        print(
+            f"[Mango SWE-bench] shuffle cycle={sh.get('cycle')} "
+            f"remaining={sh.get('remaining_in_cycle')} done_this_cycle={sh.get('completed_this_cycle')}",
+            flush=True,
+        )
     print(f"[Mango SWE-bench] predictions: {payload['predictions_path']}", flush=True)
     print(f"[Mango SWE-bench] reports in {output_dir.resolve()}", flush=True)
+    harness = payload.get("harness_summary") or {}
+    if args.evaluate and harness.get("skipped"):
+        print(f"[Mango SWE-bench] harness skipped: {harness.get('error')}", file=sys.stderr)
+        return 0
+    if args.evaluate and harness.get("failed"):
+        print(f"[Mango SWE-bench] harness failed: {harness.get('error')}", file=sys.stderr)
+        return 0
     if args.evaluate and payload.get("pass_rate") is None:
         print("[Mango SWE-bench] harness evaluation did not produce resolved scores.", file=sys.stderr)
-    if args.evaluate:
+    if args.evaluate and payload.get("pass_rate") is not None:
         failed = payload["task_count"] - (payload["resolved"] or 0)
         return 0 if failed == 0 and payload["task_count"] > 0 else 1
     return 0

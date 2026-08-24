@@ -57,6 +57,24 @@ You are repeating the same action ({{action}}) and making no progress. Do NOT ca
 # action_loop_blocked
 BLOCKED by the runner: you already did {{action}} with no progress. Do not repeat it. NEXT tool MUST be write_file (full corrected file) or a different edit_file with a NEW old_string copied verbatim from the file.
 
+# action_loop_blocked_patch
+BLOCKED: you already tried {{action}}. Do not re-read or repeat that call. You already have the file contents. NEXT tool MUST be edit_file with a SHORT unique old_string copied verbatim from the file (including whitespace). Do not invent paths. Do not call write_file.
+
+# action_loop_blocked_patch_snippet
+BLOCKED: you already read {{path}}. Do not call read_file again. NEXT tool MUST be edit_file on that path. Copy old_string EXACTLY from this snippet (including whitespace):
+{{snippet}}
+
+# patch_already_applied
+That edit is already on disk ({{path}}). Do not repeat the same old_string. Stop if the fix is complete; otherwise edit a different location.
+
+# edit_fail_reread_patch
+edit_file failed: old_string was not found in {{path}}. Do NOT invent another old_string. Do NOT call write_file. NEXT: read_file path="{{path}}" once, then edit_file with a SHORT unique substring copied verbatim from that read (≤12 lines).
+
+# edit_fail_retry_patch
+edit_file failed again on {{path}}. Your old_string still does not match. Closest lines on disk:
+{{snippet}}
+NEXT tool MUST be edit_file with old_string copied EXACTLY from those lines (whitespace included). No write_file. No re-read loop.
+
 # run.emit_tool
 Do not finish yet. Emit a tool call now (read_file, search_code, or edit_file).
 
@@ -207,27 +225,25 @@ Do NOT use edit_file for ±3-line tweaks. Do NOT rewrite the whole file with wri
 # impl_logic_missing
 Implementation is a SKELETON — core behavior is still missing:
 {{gaps}}
-Do NOT nibble with edit_file (±3 lines) — the runner BLOCKS and reverts those. NEXT tool MUST be insert_lines path="{{path}}" line={{line}} with ALL missing logic in ONE fenced insert (HTTP/API + send/reply + bot.run/entry — at least ~8 lines). Example:
-<tool_call=insert_lines : {"path": "{{path}}", "line": {{line}}>
-```
-    async with aiohttp...
-    await message.channel.send(...)
-bot.run(TOKEN)
-```
-Then the runner re-checks gaps.
+Do NOT nibble with edit_file (±3 lines) — the runner BLOCKS and reverts those.
+NEXT for Discord/API bots: write_file path="{{path}}" COMPLETE file (HTTP + await send + intents.message_content + bot.run).
+NEXT for inventory CLIs: insert_lines path="{{path}}" line={{line}} with ALL missing logic in ONE fenced insert (≥8 lines).
 
 # nibble_edit_blocked
 BLOCKED: tiny edit/insert reverted — core gaps are still open:
 {{gaps}}
-edit_file ±3 lines will never finish this. NEXT tool MUST be insert_lines path="{{path}}" line={{line}} with a LARGE fenced block covering the gaps above (HTTP + send/reply + entry). Do not read the file again first unless you have never seen it.
+edit_file ±3 lines will never finish this.
+NEXT for Discord/API bots: write_file path="{{path}}" with the COMPLETE corrected file.
+NEXT for inventory CLIs: insert_lines path="{{path}}" line={{line}} with a LARGE fenced block covering the gaps above.
 
 # coding_complete
 PHASE=CODE_COMPLETE | NEXT=write_file path="{{path}}" (COMPLETE file: imports + handlers + HTTP/send + entry). Fence the body. Do not plan in thought — emit the tool call.
 
 # coding_extend
-PHASE=CODE_EXTEND | NEXT=insert_lines path="{{path}}" line={{line}} | OPEN:
+PHASE=CODE_EXTEND | OPEN:
 {{gaps}}
-ONE fenced block (≥8 lines) that closes those gaps. No edit_file. No read_file first.
+NEXT for Discord/API bots: write_file path="{{path}}" COMPLETE file closing those gaps.
+NEXT for inventory CLIs: insert_lines path="{{path}}" line={{line}} — ONE fenced block (≥8 lines). No edit_file. No read_file first.
 
 # coding_repair
 PHASE=CODE_REPAIR | NEXT=write_file path="{{path}}" COMPLETE corrected file (fence).
@@ -236,7 +252,8 @@ Syntax broken OR file mashed (duplicate imports / glued comments) — never inse
 # gap_not_closed
 BLOCKED: mutation kept the SAME gaps open — reverted:
 {{gaps}}
-NEXT: insert_lines path="{{path}}" line={{line}} with a LARGER fenced block that actually closes ≥1 gap above.
+NEXT for Discord/API bots: write_file path="{{path}}" with the COMPLETE file that closes ≥1 gap above.
+NEXT for inventory CLIs: insert_lines path="{{path}}" line={{line}} with a LARGER fenced block.
 
 # gap_not_closed_rewrite
 BLOCKED twice with no gap closed — escalate to full rewrite.
@@ -246,7 +263,7 @@ NEXT tool MUST be write_file path="{{path}}" with the COMPLETE corrected file (f
 # hollow_skeleton_blocked
 BLOCKED: hollow skeleton kept on disk ({{min_lines}}+ lines of real logic required for this bot/API goal). Still missing:
 {{gaps}}
-NEXT: insert_lines path="{{path}}" with ALL missing logic in ONE fenced block (HTTP + send/reply + entry). Do not delete/rewrite the skeleton — extend it.
+NEXT tool MUST be write_file path="{{path}}" with the COMPLETE bot (imports + HTTP to LM Studio + await channel.send + intents.message_content + bot.run). Do not thrash with tiny insert_lines.
 
 # impl_complete
 These items are now done — do NOT re-apply the same fixes:
@@ -268,6 +285,9 @@ NEXT: write_file each missing path with complete content (not a stub). For repor
 
 # file_missing_write
 BLOCKED: `{{path}}` does not exist yet — read_file/edit_file cannot open it. NEXT tool MUST be write_file path="{{path}}" with the COMPLETE new content. Do not call read_file on this path again.
+
+# file_missing_search
+BLOCKED: `{{path}}` does not exist in this repo — do NOT invent paths and do NOT call write_file. NEXT tool MUST be search_code or codebase_lookup for the symbol/bug from the issue, then read_file on a REAL hit path.{{hints}}
 
 # file_missing_read_input
 BLOCKED: `{{path}}` does not exist yet. Read existing inputs first: NEXT tool MUST be read_file path="{{next_path}}". After all inputs are read, write_file the missing output.

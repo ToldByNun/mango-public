@@ -1,6 +1,13 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { findRepoRoot, ensureUserRuntimeConfig, runtimeConfigPath, promptsDir, pythonExecutable } from "./paths";
+import {
+  findRepoRoot,
+  ensureUserRuntimeConfig,
+  runtimeConfigPath,
+  promptsDir,
+  pythonExecutable,
+  pythonPackagePaths,
+} from "./paths";
 import type { AgentEvent } from "../shared/events";
 
 type Pending = {
@@ -38,10 +45,15 @@ export class Sidecar {
     const python = pythonExecutable(this.repoRoot);
     const config = this.configPath;
     this.stderrTail = "";
+    const packagePaths = pythonPackagePaths(this.repoRoot);
+    const pathSep = process.platform === "win32" ? ";" : ":";
+    const priorPythonPath = process.env.PYTHONPATH || "";
     const env: Record<string, string> = {
       ...process.env,
       PYTHONUNBUFFERED: "1",
+      // Avoid polluted user site-packages; load packages from the repo via PYTHONPATH.
       PYTHONNOUSERSITE: "1",
+      PYTHONPATH: [...packagePaths, priorPythonPath].filter(Boolean).join(pathSep),
       MANGO_PROMPTS_DIR: promptsDir(this.repoRoot),
       MANGO_RUNTIME_CONFIG: config,
     };
