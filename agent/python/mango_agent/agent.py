@@ -48,6 +48,7 @@ from mango_agent.impl_completeness import (
     required_features,
     summarize_impl_status,
     try_auto_add_entry_point,
+    try_auto_add_message_content_intent,
 )
 from mango_agent.resolved_work import closed_items, merge_resolved
 from mango_agent.work_plan import build_work_plan
@@ -1130,8 +1131,11 @@ class Agent:
                     error="cancelled",
                 )
             if self._timed_out():
+                # Last chance: close sole intents/entry gaps so timeout still
+                # leaves runnable source for harnesses that inspect the file.
+                self._auto_heal_missing_entry_points(engine)
                 return self._result(
-                    final_answer=final_answer,
+                    final_answer=self._write_finish_summary(steps, draft=final_answer),
                     steps=steps,
                     iterations=max(iteration - 1, 0),
                     stop_reason=StopReason.TIMEOUT,
@@ -1985,10 +1989,13 @@ class Agent:
             if not syntax_bad:
                 self._handle_run_tests_results(tool_results, engine)
             self._refresh_impl_completeness(engine)
-            # Heal sole missing entry BEFORE tests — otherwise CLI goals thrash
-            # rewrite/edit forever and never reach write_file(test_*.py)/run_tests.
+            # Heal sole missing entry / Discord intents BEFORE insert thrash —
+            # otherwise CLI goals rewrite forever and Discord bots stall on a
+            # one-line intents fix the model keeps mangling via insert_lines.
             if self._impl_gaps and all(
-                "entry point" in str(gap).lower() for gap in self._impl_gaps
+                "entry point" in str(gap).lower()
+                or "message_content" in str(gap).lower()
+                for gap in self._impl_gaps
             ):
                 if self._auto_heal_missing_entry_points(engine):
                     self._prefer_edit_gaps = False
@@ -2317,22 +2324,33 @@ class Agent:
         )
 
     def _write_finish_summary(self, steps: list[AgentStep], *, draft: str = "") -> str:
+        # Deterministic status first — LLM summary often dumps <think>/meta garbage.
         fallback = self._fallback_summary(steps, draft=draft)
         cleaned = _clean_finish_summary(draft)
         if not self._plan_apis_enabled():
             stub = cleaned.lower().strip()
-            if cleaned and "<tool_call" not in stub and stub not in {
-                "done",
-                "all done.",
-                "all done",
-                "i am done.",
-                "i am done",
-                "i'm done.",
-                "i'm done",
-                "all tests passed.",
-                "all tests passed",
-            }:
+            if (
+                cleaned
+                and _is_good_finish_summary(cleaned)
+                and "{{" not in cleaned
+                and "<tool_call" not in stub
+                and stub
+                not in {
+                    "done",
+                    "all done.",
+                    "all done",
+                    "i am done.",
+                    "i am done",
+                    "i'm done.",
+                    "i'm done",
+                    "all tests passed.",
+                    "all tests passed",
+                }
+            ):
                 return cleaned
+            return fallback
+        # Coding / create goals: never gamble on a second model pass for the user text.
+        if self._require_tools or self._cli_goal or self._integration_goal():
             return fallback
         facts = self._finish_facts(steps)
         try:
@@ -2346,7 +2364,11 @@ class Agent:
             text = _clean_finish_summary(str(getattr(completion, "text", "") or ""))
         except Exception:
             text = ""
-        if _is_good_finish_summary(text) and not _finish_lies_about_tests(text, self._ran_tests_ok):
+        if (
+            _is_good_finish_summary(text)
+            and not _finish_lies_about_tests(text, self._ran_tests_ok)
+            and "{{" not in text
+        ):
             return text
         return fallback
 
@@ -2401,23 +2423,115 @@ class Agent:
         )
 
     def _fallback_summary(self, steps: list[AgentStep], *, draft: str = "") -> str:
+        """Deterministic user-facing status — never leave {{placeholders}} or think dumps."""
         facts = self._finish_facts(steps)
-        files = "the code"
+        files_raw = "no files recorded"
         if "changed_files: " in facts:
-            raw = facts.split("changed_files: ", 1)[1].split("\n", 1)[0].strip()
-            if raw and raw != "no files recorded":
-                files = raw
-        if self._ran_tests_ok or self._last_verification_ok is True:
-            tests = "Tests passed."
-        elif self._run_tests_failures >= _MAX_TEST_FIX_ATTEMPTS:
-            tests = f"Tests still failing after {_MAX_TEST_FIX_ATTEMPTS}+ fix attempts — run stopped at iteration limit."
+            files_raw = facts.split("changed_files: ", 1)[1].split("\n", 1)[0].strip()
+        file_names = [
+            part.strip()
+            for part in files_raw.split(",")
+            if part.strip() and part.strip() != "no files recorded"
+        ]
+        german = bool(re.search(r"(?i)\b(schreib|erstelle|mach|bitte|für|und)\b", self._task or ""))
+        primary = self._primary_impl_path()
+        gaps: list[str] = []
+        compile_ok = True
+        has_http = has_send = has_run = False
+        if primary and Path(primary).is_file():
+            try:
+                source = Path(primary).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source = ""
+            if source:
+                try:
+                    compile(source, primary, "exec")
+                except SyntaxError:
+                    compile_ok = False
+                low = source.lower()
+                has_http = any(
+                    tok in source for tok in ("requests.", "httpx.", "/v1/chat", "aiohttp")
+                )
+                has_send = any(tok in low for tok in (".send(", ".reply("))
+                has_run = "bot.run(" in low or "client.run(" in low
+                gaps = find_impl_gaps(source, self._task or "", path=self._display_path(primary))
+
+        if not file_names:
+            if german:
+                opening = "In diesem Lauf wurde keine Datei geschrieben."
+                body = (
+                    "Der Create-/Implementierungsauftrag ist damit nicht erledigt. "
+                    "Bitte denselben Prompt nochmal senden — der Runner startet frisch."
+                )
+                closing = "Kein Bot-Code liegt im Workspace."
+            else:
+                opening = "No files were written in this run."
+                body = (
+                    "The create/implement goal is unfinished. "
+                    "Re-send the same prompt for a fresh attempt."
+                )
+                closing = "No bot code is in the workspace."
+            return f"{opening}\n\n{body}\n\n{closing}"
+
+        display = ", ".join(file_names)
+        if german:
+            opening = f"Geschrieben: {display}."
         else:
-            tests = "Tests were not run or did not pass."
+            opening = f"Wrote: {display}."
+
+        bullets: list[str] = []
+        if compile_ok:
+            bullets.append("Syntax OK" if not german else "Syntax OK")
+        else:
+            bullets.append("Syntax broken — needs a rewrite" if not german else "Syntax kaputt — Rewrite nötig")
+        if self._integration_goal() or self._cli_goal:
+            bullets.append(
+                ("HTTP/API: " + ("yes" if has_http else "missing"))
+                if not german
+                else ("HTTP/API: " + ("ja" if has_http else "fehlt"))
+            )
+            bullets.append(
+                ("send/reply: " + ("yes" if has_send else "missing"))
+                if not german
+                else ("send/reply: " + ("ja" if has_send else "fehlt"))
+            )
+            bullets.append(
+                ("bot.run/entry: " + ("yes" if has_run else "missing"))
+                if not german
+                else ("bot.run/entry: " + ("ja" if has_run else "fehlt"))
+            )
+        if gaps:
+            shown = "; ".join(str(g).split(": ", 1)[-1] for g in gaps[:3])
+            bullets.append(
+                (f"Still open: {shown}") if not german else (f"Noch offen: {shown}")
+            )
+        elif self._goal_met or (compile_ok and not gaps):
+            bullets.append(
+                "Core gaps closed." if not german else "Kern-Gaps geschlossen."
+            )
+
+        if self._ran_tests_ok or self._last_verification_ok is True:
+            closing = "Tests passed." if not german else "Tests grün."
+        elif self._task_wants_tests:
+            closing = (
+                "Tests were not run or did not pass."
+                if not german
+                else "Tests nicht gelaufen oder nicht grün."
+            )
+        else:
+            closing = (
+                "No test run required for this goal."
+                if not german
+                else "Kein Testlauf für dieses Goal nötig."
+            )
+
+        body = "\n".join(f"- {b}" for b in bullets) if bullets else ""
         draft_line = _clean_finish_summary(draft)
-        if draft_line and not _is_good_finish_summary(draft_line):
-            draft_line = ""
-        draft_block = f"\n{draft_line}\n" if draft_line else "\n"
-        return feedback(files=files, draft=draft_block, tests=tests)
+        if draft_line and _is_good_finish_summary(draft_line) and "{{" not in draft_line:
+            # Prefer our structured status; ignore draft meta.
+            pass
+        parts = [opening, body, closing]
+        return "\n\n".join(p for p in parts if p).strip()
 
     def _result(
         self,
@@ -2773,6 +2887,11 @@ class Agent:
             self._prefer_write_file = True
             self._prefer_insert_lines = False
             self._prefer_edit_gaps = False
+        elif self._needs_full_rewrite():
+            # Mashed / duplicate-import files cannot be rescued with insert_lines.
+            self._prefer_write_file = True
+            self._prefer_insert_lines = False
+            self._prefer_edit_gaps = False
         elif phase is CodingPhase.CODE_COMPLETE:
             self._prefer_write_file = True
             self._prefer_insert_lines = False
@@ -2791,11 +2910,12 @@ class Agent:
             "truncated_write",
             "Tests still",
             "GOAL ALREADY MET",
+            "mashed",
         )
         if any(token in existing for token in hard):
             return
         path_hint, line_hint = self._suggested_insert_hint()
-        if phase is CodingPhase.CODE_REPAIR:
+        if phase is CodingPhase.CODE_REPAIR or self._needs_full_rewrite():
             engine.set_verification_feedback(
                 feedback("coding_repair", path=path_hint or "impl.py")
             )
@@ -2819,11 +2939,19 @@ class Agent:
                 )
             )
 
+    def _needs_full_rewrite(self) -> bool:
+        """Mashed / structurally broken bots cannot be fixed with insert_lines."""
+        for gap in self._impl_gaps or []:
+            g = str(gap).lower()
+            if "mashed" in g or "duplicate import" in g or "glued comment" in g:
+                return True
+        return False
+
     def _resolve_coding_phase(self) -> "CodingPhase":
         """Single source of truth for what the agent must do this turn."""
         return resolve_coding_phase(
             plan_gate_phase=self._plan_gate_phase(),
-            syntax_broken=bool(self._syntax_broken),
+            syntax_broken=bool(self._syntax_broken) or self._needs_full_rewrite(),
             collection_error=bool(
                 self._context is not None
                 and getattr(self._context.state, "verification_collection_error", False)
@@ -2843,6 +2971,8 @@ class Agent:
             return None
         # Phase machine first: syntax beats gaps, gaps beat everything else.
         phase = self._resolve_coding_phase()
+        if self._needs_full_rewrite() and "write_file" in enabled:
+            return "write_file"
         forced = forced_tool_for_phase(phase, enabled)
         if phase is CodingPhase.CODE_REPAIR:
             if not self._tests_uncollectable and self._primary_impl_path():
@@ -3179,7 +3309,12 @@ class Agent:
             names = [name for name in names if name != "run_terminal_command"]
         if self._prefer_read_file and "read_file" in names:
             # Never sole-lock read when core behavior is missing — insert/write first.
-            if self._logic_gaps() or getattr(self, "_prefer_insert_lines", False):
+            if (
+                self._logic_gaps()
+                or getattr(self, "_prefer_insert_lines", False)
+                or self._needs_full_rewrite()
+                or self._prefer_write_file
+            ):
                 pass
             elif self._rename_pair and "rename_symbol" in names:
                 names = ["read_file", "rename_symbol"]
@@ -3755,10 +3890,8 @@ class Agent:
         tool_results: list[ToolResult],
         snapshots: dict[str, str],
     ) -> list[ToolResult]:
-        """Undo tiny patches that leave logic gaps open — they burn iterations."""
+        """Undo tiny patches / mash inserts that leave logic gaps open."""
         pre_logic = list(self._logic_gaps() or [])
-        if not pre_logic and not getattr(self, "_prefer_insert_lines", False):
-            return tool_results
         rewritten: list[ToolResult] = []
         for result in tool_results:
             if not result.success or result.tool_name not in {"edit_file", "insert_lines", "edit_symbol"}:
@@ -3777,6 +3910,9 @@ class Agent:
                     or ""
                 )
             abs_path = self._abs_impl_path(path) if path else ""
+            # Compare against the pre-mutation snapshot — post-write file already
+            # contains the insert and would always look "mashed".
+            prior = snapshots.get(abs_path, "") if abs_path else ""
             lines_added = 0
             if result.tool_name == "insert_lines" and isinstance(result.output, dict):
                 lines_added = int(result.output.get("lines_inserted") or 0)
@@ -3785,37 +3921,76 @@ class Agent:
 
             tiny = lines_added < _MIN_LOGIC_INSERT_LINES
             addresses = self._content_addresses_logic_gaps(content, pre_logic)
-            if result.tool_name == "edit_file" or (tiny and not addresses):
+            mash = self._insert_would_mash_prior(prior, content)
+            nibble = bool(pre_logic or getattr(self, "_prefer_insert_lines", False)) and (
+                result.tool_name == "edit_file" or (tiny and not addresses)
+            )
+            if nibble or mash:
                 if abs_path and abs_path in snapshots:
                     previous = snapshots[abs_path]
                     try:
                         if previous:
                             Path(abs_path).write_text(previous, encoding="utf-8")
-                        elif Path(abs_path).is_file() and not previous:
-                            # New file nibble — leave file but still fail the result.
-                            pass
                     except OSError:
                         pass
                 path_hint, line_hint = self._suggested_insert_hint()
-                self._prefer_insert_lines = True
-                self._prefer_edit_gaps = False
+                if mash:
+                    self._prefer_write_file = True
+                    self._prefer_insert_lines = False
+                    self._prefer_edit_gaps = False
+                    self._prefer_read_file = False
+                    err = feedback("coding_repair", path=path_hint or path)
+                else:
+                    self._prefer_insert_lines = True
+                    self._prefer_edit_gaps = False
+                    err = feedback(
+                        "nibble_edit_blocked",
+                        path=path_hint,
+                        line=str(line_hint),
+                        gaps="\n".join(f"- {gap}" for gap in pre_logic[:6]),
+                    )
                 rewritten.append(
                     ToolResult(
                         success=False,
                         tool_name=result.tool_name,
-                        error=feedback(
-                            "nibble_edit_blocked",
-                            path=path_hint,
-                            line=str(line_hint),
-                            gaps="\n".join(f"- {gap}" for gap in pre_logic[:6]),
-                        ),
+                        error=err,
                         call=call,
-                        metadata={"nibble_rejected": True, "lines_added": lines_added},
+                        metadata={
+                            "nibble_rejected": not mash,
+                            "mash_rejected": mash,
+                            "lines_added": lines_added,
+                        },
                     )
                 )
                 continue
             rewritten.append(result)
         return rewritten
+
+    def _insert_would_mash_prior(self, prior: str, content: str) -> bool:
+        """True when insert_lines dumps another full module into an existing bot file."""
+        if not content:
+            return False
+        # Comment-spam loops (live timeout mode) are not progress.
+        if content.count("# ---") >= 3 or content.count("Discord bot:") >= 3:
+            return True
+        blob = content.lower()
+        looks_full = (
+            ("import discord" in blob or "import requests" in blob)
+            and ("bot.run(" in blob or 'if __name__' in blob)
+        )
+        if not looks_full:
+            return False
+        low = (prior or "").lower()
+        return "import discord" in low or "bot.run(" in low or "discord.client" in low
+
+    def _insert_would_mash(self, abs_path: str, content: str) -> bool:
+        prior = ""
+        if abs_path:
+            try:
+                prior = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                prior = ""
+        return self._insert_would_mash_prior(prior, content)
 
     def _reject_unchanged_gap_mutations(
         self,
@@ -3966,6 +4141,30 @@ class Agent:
             gaps = find_impl_gaps(
                 source, self._task or "", path=self._display_path(abs_path)
             )
+            mashed = any("mashed" in str(g).lower() for g in gaps)
+            if mashed:
+                snaps = getattr(self, "_last_mutation_snapshots", {}) or {}
+                if abs_path in snaps and snaps[abs_path]:
+                    try:
+                        file_path.write_text(snaps[abs_path], encoding="utf-8")
+                    except OSError:
+                        pass
+                self._prefer_write_file = True
+                self._prefer_insert_lines = False
+                self._prefer_read_file = False
+                if rewritten is None:
+                    rewritten = list(tool_results)
+                rewritten[idx] = ToolResult(
+                    success=False,
+                    tool_name=result.tool_name,
+                    error=feedback(
+                        "coding_repair",
+                        path=self._display_path(abs_path),
+                    ),
+                    call=call,
+                    metadata={"mashed_write": True, "line_count": line_count},
+                )
+                continue
             if line_count >= _HOLLOW_SKELETON_MIN_LINES and not gaps:
                 continue
             if not gaps and line_count >= _HOLLOW_SKELETON_MIN_LINES:
@@ -4029,6 +4228,9 @@ class Agent:
                 "httpx.",
                 ".send(",
                 ".reply(",
+                "await ",
+                "async def on_message",
+                "message_content",
                 "bot.run(",
                 "client.run(",
             )
@@ -4693,7 +4895,7 @@ class Agent:
 
 
     def _auto_heal_missing_entry_points(self, engine: ContextEngine) -> bool:
-        """Append entry point when that is the only remaining gap (stops rewrite loops)."""
+        """Append entry point / Discord intents when that is the only remaining gap."""
         healed_any = False
         for abs_path in list(self._impl_python_files()):
             if _looks_like_test_path(abs_path):
@@ -4702,9 +4904,12 @@ class Agent:
                 original = Path(abs_path).read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            healed = try_auto_add_entry_point(
-                original, self._task or "", path=self._display_path(abs_path)
-            )
+            display = self._display_path(abs_path)
+            healed = try_auto_add_entry_point(original, self._task or "", path=display)
+            if not healed or healed == original:
+                healed = try_auto_add_message_content_intent(
+                    original, self._task or "", path=display
+                )
             if not healed or healed == original:
                 continue
             try:
@@ -4713,8 +4918,8 @@ class Agent:
                 continue
             healed_any = True
             self._trace(
-                f"iter {getattr(self, '_current_iteration', 0)} auto-heal entry "
-                f"path={self._display_path(abs_path)}"
+                f"iter {getattr(self, '_current_iteration', 0)} auto-heal "
+                f"path={display}"
             )
         if healed_any:
             self._refresh_impl_completeness(engine)
@@ -5810,6 +6015,13 @@ class Agent:
                     "send/reply",
                     "model output",
                     "message receive",
+                    "mashed",
+                    "async def",
+                    "await",
+                    "message_content",
+                    "add_done_callback",
+                    "fake-async",
+                    "on_message must",
                 )
             ):
                 out.append(str(gap))

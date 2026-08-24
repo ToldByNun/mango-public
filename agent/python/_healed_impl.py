@@ -1,0 +1,71 @@
+import discord
+import requests
+import os
+
+# Discord bot that forwards channel messages to LM Studio (OpenAI-compatible) and posts the reply.
+#
+# Flow:
+#   1. Bot listens for messages in a configured channel (or any channel).
+#   2. For each incoming message, it sends the text to the LM Studio chat-completions endpoint.
+#   3. It waits for the model output and posts it back to the same channel.
+#
+# Configuration via environment variables:
+#   DISCORD_TOKEN      – bot token
+#   LMSTUDIO_URL       – e.g. http://localhost:1234/v1 (default)
+#   LMSTUDIO_MODEL     – model name (default: local-model)
+#   LMSTUDIO_API_KEY   – optional (LM Studio usually uses "none")
+#   CHANNEL_ID         – optional; restrict to a specific channel
+#   MIN_MESSAGE_LEN   – optional; ignore very short messages (default 1)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+LMSTUDIO_URL = os.getenv("LMSTUDIO_URL", "http://localhost:1234/v1")
+LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "local-model")
+LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "none")
+CHANNEL_ID = os.getenv("CHANNEL_ID", None)
+MIN_MESSAGE_LEN = int(os.getenv("MIN_MESSAGE_LEN", "1"))
+
+# ── Discord client ─────────────────────────────────────────────────────────────
+_intents = discord.Intents.default()
+_intents.message_content = True
+bot = discord.Client(intents=_intents)
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore our own messages to avoid loops.
+    if message.author == bot.user:
+        return
+
+    # Optionally restrict to a specific channel.
+    if CHANNEL_ID and message.channel.id != int(CHANNEL_ID):
+        return
+
+    text = message.content.strip()
+    if not text or len(text) < MIN_MESSAGE_LEN:
+        return
+
+    # Send the prompt to LM Studio.
+    try:
+        resp = requests.post(
+            f"{LMSTUDIO_URL}/chat/completions",
+            json={"model": LMSTUDIO_MODEL, "messages": [{"role": "user", "content": text}]},
+            headers={"Authorization": f"Bearer {LMSTUDIO_API_KEY}"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[ERROR] LM Studio call failed: {e}")
+        return
+
+    # Post the reply back to the channel.
+    try:
+        await message.channel.send(reply)
+    except Exception as e:
+        print(f"[ERROR] Failed to post reply: {e}")
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("DISCORD_TOKEN environment variable is required.")
+    bot.run(token)

@@ -66,10 +66,25 @@ def main() -> int:
     print("ELAPSED_S", round(elapsed, 1), flush=True)
     print("TOOL_COUNTS", dict(counts), flush=True)
     print("FINAL_PROMPT_CHARS", getattr(metrics, "final_prompt_chars", None), flush=True)
+    answer = str(getattr(result, "final_answer", "") or "")
+    print("FINAL_ANSWER_BEGIN", flush=True)
+    print(answer, flush=True)
+    print("FINAL_ANSWER_END", flush=True)
     py = sorted(p.name for p in ws.rglob("*.py") if p.is_file())
     print("PY_FILES", py, flush=True)
     if prompts:
         print("PROMPT_CHARS_MAX", max(prompts), flush=True)
+
+    low = answer.lower()
+    if "{{" in answer or "<think" in low or "changed_files:" in low or "re-read the instructions" in low:
+        print("FAIL garbage final_answer", flush=True)
+        return 8
+    if len(answer.strip()) < 40:
+        print("FAIL final_answer too short", flush=True)
+        return 9
+    if not py and "no files" not in low and "keine datei" not in low:
+        print("FAIL final_answer does not admit missing files", flush=True)
+        return 10
 
     # Soft-lock detection: endless ask_epistemic / codebase_lookup without writes.
     writes = counts.get("write_file", 0) + counts.get("edit_file", 0)
@@ -100,9 +115,22 @@ def main() -> int:
 
     bot = next((ws / name for name in py if "discord" in name.lower() or name == "bot.py"), None)
     if bot is None and py:
-        bot = ws / py[0]
+        # Prefer non-test impl modules.
+        non_test = [ws / name for name in py if not name.startswith("test_")]
+        bot = non_test[0] if non_test else ws / py[0]
     if bot is not None and bot.is_file():
+        from mango_agent.impl_completeness import find_impl_gaps
+
         src = bot.read_text(encoding="utf-8", errors="replace")
+        print("SOURCE_PATH", bot, flush=True)
+        print("SOURCE_BEGIN", flush=True)
+        # Windows consoles are often cp1252 — never crash the harness on emoji/dashes.
+        safe = src.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        try:
+            print(safe, flush=True)
+        except UnicodeEncodeError:
+            print(safe.encode("ascii", errors="replace").decode("ascii"), flush=True)
+        print("SOURCE_END", flush=True)
         compile_ok = True
         try:
             compile(src, str(bot), "exec")
@@ -111,15 +139,47 @@ def main() -> int:
             print("FAIL syntax", exc, flush=True)
             return 6
         has_http = any(tok in src for tok in ("requests.", "httpx.", "/v1/chat", "aiohttp"))
-        has_send = any(tok in src for tok in (".send(", ".reply("))
+        has_await_send = bool(
+            __import__("re").search(r"await\s+[^\n]*\.(?:send|reply)\s*\(", src)
+        )
+        has_async_handler = bool(
+            __import__("re").search(r"(?m)^async\s+def\s+on_message\s*\(", src)
+        )
         has_run = "bot.run(" in src or "client.run(" in src
+        has_intent = bool(
+            __import__("re").search(
+                r"(Intents\s*\([^)]*message_content\s*=\s*True)|(?<!Intents\.default)\.\s*message_content\s*=\s*True",
+                src,
+            )
+        )
+        bogus_intent = "Intents.default.message_content" in src
         print(
             "BOT_CHECKS",
-            {"compile": compile_ok, "http": has_http, "send": has_send, "run": has_run},
+            {
+                "compile": compile_ok,
+                "http": has_http,
+                "await_send": has_await_send,
+                "async_on_message": has_async_handler,
+                "run": has_run,
+                "message_content_intent": has_intent and not bogus_intent,
+            },
             flush=True,
         )
-        if not (has_http and has_send and has_run):
-            print("FAIL hollow bot (missing http/send/run)", flush=True)
+        gaps = find_impl_gaps(src, GOAL, path=bot.name)
+        if gaps:
+            print("FAIL source gaps:", flush=True)
+            for gap in gaps:
+                print(f"  - {gap}", flush=True)
+            return 7
+        if not (
+            has_http
+            and has_await_send
+            and has_async_handler
+            and has_run
+            and has_intent
+            and not bogus_intent
+        ):
+            print("FAIL hollow/broken bot wiring", flush=True)
             return 7
 
     if lookups >= 6 and writes == 0:

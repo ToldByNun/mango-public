@@ -250,3 +250,37 @@ def test_finish_summary_strips_think_and_rejects_meta() -> None:
         "to the local LM Studio chat-completions API, and posts the model reply."
     )
     assert _is_good_finish_summary(good) is True
+
+
+def test_fallback_summary_is_concrete_not_placeholders(tmp_path: Path) -> None:
+    target = tmp_path / "discord_bot.py"
+    target.write_text(
+        "import discord\nimport requests\n"
+        "bot = discord.Client(intents=discord.Intents.default())\n"
+        "async def on_message(m):\n"
+        "    r = requests.post('http://localhost:1234/v1/chat/completions', json={})\n"
+        "    await m.channel.send(r.text)\n"
+        "bot.run('t')\n",
+        encoding="utf-8",
+    )
+    agent = Agent(
+        FakeModelRunner(["done"]),
+        max_iterations=2,
+        verification_root=tmp_path,
+        require_tools=True,
+        task_wants_tests=False,
+        tool_registry=create_default_registry(),
+    )
+    agent._task = DISCORD_GOAL
+    agent._cli_goal = True
+    agent._require_tools = True
+    agent._acted_once = True
+    text = agent._fallback_summary([])
+    assert "{{" not in text
+    assert "<think" not in text.lower()
+    assert "discord_bot.py" in text
+    assert "HTTP" in text or "http" in text.lower()
+    out = agent._write_finish_summary([], draft="<think>meta dump about Facts</think>")
+    assert "{{" not in out
+    assert "changed_files" not in out
+    assert "Wrote:" in out or "Geschrieben:" in out or "discord_bot.py" in out

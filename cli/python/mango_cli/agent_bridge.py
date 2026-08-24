@@ -190,7 +190,9 @@ class AgentBridge:
             ),
             require_tools=True,
             plan_apis_first=True,
-            task_wants_tests=True,
+            # Detect from the goal — forcing True made Discord creates burn the
+            # deadline writing hollow test_impl.py instead of finishing the bot.
+            task_wants_tests=None,
             tool_max_tokens=3072,
             thought_max_tokens=thought,
             thinking_level=preset.level,

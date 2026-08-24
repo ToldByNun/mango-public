@@ -230,7 +230,8 @@ PHASE=CODE_EXTEND | NEXT=insert_lines path="{{path}}" line={{line}} | OPEN:
 ONE fenced block (≥8 lines) that closes those gaps. No edit_file. No read_file first.
 
 # coding_repair
-PHASE=CODE_REPAIR | NEXT=write_file path="{{path}}" COMPLETE corrected file (fence). Syntax is broken — never insert_lines/edit_file on a broken file.
+PHASE=CODE_REPAIR | NEXT=write_file path="{{path}}" COMPLETE corrected file (fence).
+Syntax broken OR file mashed (duplicate imports / glued comments) — never insert_lines/edit_file on a broken or mashed file. One clean rewrite only.
 
 # gap_not_closed
 BLOCKED: mutation kept the SAME gaps open — reverted:
@@ -305,6 +306,9 @@ Tests passed but the rename is incomplete: {{old}} is still referenced. {{hint}}
 {{body}}
 
 {{closing}}
+
+# _fallback_summary.legacy
+(unused — Agent._fallback_summary builds the status in code)
 
 # _abort_report
 Stopped after {{failed}} failed verification attempt(s) (max {{max}}).

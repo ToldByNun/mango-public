@@ -217,6 +217,11 @@ LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1/chat/comple
 
 
 class Bot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+
     async def on_message(self, message: discord.Message):
         if message.author == self.user:
             return

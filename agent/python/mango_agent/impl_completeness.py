@@ -323,6 +323,7 @@ def find_impl_gaps(source: str, task: str = "", *, path: str = "") -> list[str]:
         if lang == "python":
             gaps.extend(_python_cli_wiring_gaps(text, task))
             gaps.extend(_bot_entry_gaps(text, task))
+            gaps.extend(_discord_quality_gaps(text, task))
 
     if tree is not None:
         for name in _incomplete_python_defs(tree):
@@ -341,6 +342,72 @@ def _bot_entry_gaps(source: str, task: str) -> list[str]:
     if re.search(r"(?i)\.run\s*\(", source):
         return []
     return ["Missing bot start (`Client.run` / `bot.run` under `__main__`)"]
+
+
+def _discord_quality_gaps(source: str, task: str) -> list[str]:
+    """Structural Discord/LM-Studio wiring bugs that superficial token checks miss."""
+    if not re.search(r"(?i)\bdiscord\b|\bbot\b", task or ""):
+        return []
+    if "discord" not in (source or "").lower():
+        return []
+    gaps: list[str] = []
+    text = source or ""
+
+    # Mashed rewrite / insert collision: duplicate imports or glued comments.
+    if text.count("import discord") >= 2 or text.count("import requests") >= 2:
+        gaps.append(
+            "File looks mashed (duplicate imports) — rewrite ONE clean complete file with write_file"
+        )
+    if re.search(r"#[^\n]{0,60}#\s*---", text):
+        gaps.append(
+            "File looks mashed (glued comments) — rewrite ONE clean complete file with write_file"
+        )
+
+    # Sync message handler cannot await Discord I/O.
+    if re.search(r"(?m)^def\s+on_message\s*\(", text) and not re.search(
+        r"(?m)^async\s+def\s+on_message\s*\(", text
+    ):
+        gaps.append(
+            "on_message must be `async def` (discord.py event) — sync handlers cannot await send"
+        )
+
+    # Fake-async send (the generated anti-pattern).
+    if "add_done_callback" in text and re.search(r"\.send\s*\(", text):
+        gaps.append(
+            "Do not fake-async `.send()` with add_done_callback — use `await channel.send(...)` "
+            "inside `async def on_message`"
+        )
+
+    # Any .send/.reply without await anywhere in the file is almost always wrong for discord.py.
+    if re.search(r"\.(?:send|reply)\s*\(", text) and not re.search(
+        r"await\s+[^\n]*\.(?:send|reply)\s*\(", text
+    ):
+        gaps.append(
+            "Missing `await` on Discord send/reply — handler must `await message.channel.send(...)`"
+        )
+
+    # Reading message.content requires privileged intent on modern discord.py.
+    if "message.content" in text:
+        has_kw = bool(re.search(r"Intents\s*\([^)]*message_content\s*=\s*True", text))
+        has_assign = bool(re.search(r"(?<!Intents\.default)\.\s*message_content\s*=\s*True", text))
+        bogus = bool(re.search(r"Intents\.default\.message_content\s*=", text))
+        if bogus or not (has_kw or has_assign):
+            gaps.append(
+                "Enable `intents.message_content = True` on the Intents instance passed to "
+                "Client (not `Intents.default.message_content = True`)"
+            )
+
+    # Event registration: assigning sync function to bot.on_message is a smell when
+    # @bot.event async def is the correct pattern — flag if on_message is sync assign.
+    if re.search(r"\.on_message\s*=\s*on_message\b", text) and re.search(
+        r"(?m)^def\s+on_message\s*\(", text
+    ):
+        gaps.append(
+            "Register the handler with `@bot.event` / `async def on_message` — "
+            "do not assign a sync function to bot.on_message"
+        )
+
+    return gaps
 
 
 def _incomplete_python_defs(tree: ast.AST) -> list[str]:
@@ -371,6 +438,49 @@ def try_auto_add_entry_point(source: str, task: str = "", *, path: str = "") -> 
         "\nif __name__ == \"__main__\":\n"
         "    raise SystemExit(main())\n"
     )
+
+
+def try_auto_add_message_content_intent(source: str, task: str = "", *, path: str = "") -> str | None:
+    """If the only open Discord gap is message_content intent, inject it."""
+    if not re.search(r"(?i)\bdiscord\b", task or ""):
+        return None
+    text = source or ""
+    gaps = find_impl_gaps(text, task, path=path)
+    if not gaps:
+        return None
+    if not all("message_content" in g.lower() for g in gaps):
+        return None
+    # Strip bogus Intents.default.message_content = ... lines first.
+    text = re.sub(
+        r"(?m)^[ \t]*discord\.Intents\.default\.message_content\s*=\s*True\s*\n?",
+        "",
+        text,
+    )
+    # bot = discord.Client(intents=discord.Intents.default())
+    pat = re.compile(
+        r"^([ \t]*)(\w+)\s*=\s*discord\.Client\(\s*intents\s*=\s*discord\.Intents\.default\(\)\s*\)\s*$",
+        re.M,
+    )
+    match = pat.search(text)
+    if match:
+        indent, name = match.group(1), match.group(2)
+        block = (
+            f"{indent}_intents = discord.Intents.default()\n"
+            f"{indent}_intents.message_content = True\n"
+            f"{indent}{name} = discord.Client(intents=_intents)"
+        )
+        return pat.sub(block, text, count=1)
+    # intents = discord.Intents.default()
+    assign = re.compile(
+        r"^([ \t]*)(\w+)\s*=\s*discord\.Intents\.default\(\)\s*$",
+        re.M,
+    )
+    m = assign.search(text)
+    if m:
+        indent, var = m.group(1), m.group(2)
+        if f"{var}.message_content" not in text:
+            return text[: m.end()] + f"\n{indent}{var}.message_content = True" + text[m.end() :]
+    return None
 
 
 def _entry_gaps(source: str, *, path: str = "", goal: str = "") -> list[str]:
