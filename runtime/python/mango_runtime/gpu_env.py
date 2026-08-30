@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from mango_runtime.cuda_env import cuda_bin_dirs, ensure_cuda_on_path, list_ggml_backends
@@ -12,34 +13,73 @@ __all__ = [
     "detect_gpu_backend",
     "ensure_cuda_on_path",
     "gpu_install_hint",
+    "has_backend_dll",
     "has_cuda_backend",
     "has_gpu_backend",
     "list_ggml_backends",
     "prepare_gpu_environment",
     "apply_backend_env",
+    "backend_lib_dirs",
 ]
 
 
-def _backend_libs_dir() -> Path | None:
+def backend_lib_dirs() -> list[Path]:
+    """Directories that may contain ggml-*.dll / .so next to llama.cpp."""
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path | None) -> None:
+        if path is None or not path.is_dir():
+            return
+        key = str(path.resolve()).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(path)
+
     try:
         from llama_cpp import llama_cpp
     except ImportError:
-        return None
-    lib = getattr(llama_cpp, "_lib", None)
-    lib_path = getattr(lib, "_name", None) if lib is not None else None
-    if not lib_path:
-        return None
-    return Path(lib_path).parent
+        llama_cpp = None  # type: ignore[assignment]
+
+    if llama_cpp is not None:
+        lib = getattr(llama_cpp, "_lib", None)
+        lib_path = getattr(lib, "_name", None) if lib is not None else None
+        if lib_path:
+            _add(Path(lib_path).parent)
+        pkg_file = getattr(llama_cpp, "__file__", None)
+        if pkg_file:
+            pkg_dir = Path(pkg_file).resolve().parent
+            _add(pkg_dir / "lib")
+            _add(pkg_dir)
+            # Newer wheels also drop native libs under site-packages/bin.
+            _add(pkg_dir.parent / "bin")
+
+    for entry in sys.path:
+        root = Path(entry)
+        _add(root / "llama_cpp" / "lib")
+        _add(root / "bin")
+
+    return dirs
 
 
-def _has_backend_dll(name: str) -> bool:
-    root = _backend_libs_dir()
-    if root is None:
-        return False
-    for ext in (".dll", ".so", ".dylib"):
-        if (root / f"ggml-{name}{ext}").is_file():
-            return True
+def _backend_libs_dir() -> Path | None:
+    dirs = backend_lib_dirs()
+    return dirs[0] if dirs else None
+
+
+def has_backend_dll(name: str) -> bool:
+    """True if ggml-<name>.dll/.so/.dylib exists in any llama.cpp lib dir."""
+    needle = f"ggml-{name}"
+    for root in backend_lib_dirs():
+        for ext in (".dll", ".so", ".dylib"):
+            if (root / f"{needle}{ext}").is_file():
+                return True
     return False
+
+
+# Back-compat alias used by older call sites / scripts.
+_has_backend_dll = has_backend_dll
 
 
 def detect_gpu_backend() -> str | None:
@@ -48,12 +88,9 @@ def detect_gpu_backend() -> str | None:
     for preferred in ("cuda", "vulkan", "hip", "metal"):
         if any(preferred in name for name in names):
             return preferred
-    if _has_backend_dll("cuda"):
-        return "cuda"
-    if _has_backend_dll("vulkan"):
-        return "vulkan"
-    if _has_backend_dll("hip"):
-        return "hip"
+    for preferred in ("cuda", "vulkan", "hip"):
+        if has_backend_dll(preferred):
+            return preferred
     return None
 
 
@@ -70,6 +107,17 @@ def prepare_gpu_environment() -> str | None:
     backend = detect_gpu_backend()
     if backend == "cuda":
         ensure_cuda_on_path()
+    elif backend == "vulkan":
+        # Ensure the llama.cpp lib dir (ggml-vulkan.dll) is searchable for deps.
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        lower = {p.lower() for p in parts}
+        prepend: list[str] = []
+        for directory in backend_lib_dirs():
+            path = str(directory)
+            if path.lower() not in lower:
+                prepend.append(path)
+        if prepend:
+            os.environ["PATH"] = os.pathsep.join(prepend + parts)
     return backend
 
 
@@ -85,7 +133,8 @@ def apply_backend_env(backend: str | None) -> None:
 
 def gpu_install_hint() -> str:
     return (
-        "Install a GPU wheel: pip install llama-cpp-python "
+        "Install a GPU wheel: pip install llama-cpp-python --force-reinstall "
         "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan "
-        "(AMD/Intel) or .../whl/cu124 (NVIDIA)."
+        "(AMD/Intel) or .../whl/cu124 (NVIDIA). "
+        "Or run runtime/scripts/install_llama_cpp_vulkan.bat"
     )

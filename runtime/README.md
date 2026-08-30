@@ -51,10 +51,29 @@ Environment overrides:
 
 ## GPU (Vulkan / AMD)
 
-Packaged builds use the llama-cpp-python **Vulkan** wheel for AMD/Intel. CUDA-style
-Q4_0 KV-cache + flash attention is known to corrupt tokens on many AMD GPUs, so
-Mango automatically switches Vulkan/HIP loads to **F16 KV** and disables flash
-attention. NVIDIA CUDA keeps the faster Q4 path.
+Packaged builds default to the llama-cpp-python **Vulkan** wheel so AMD/Intel
+GPUs actually offload layers. Older installers preferred the CPU wheel first,
+which always succeeded and left `n_gpu_layers` forced to 0 at runtime.
+
+CUDA-style Q4_0 KV-cache + flash attention is known to corrupt tokens on many
+AMD GPUs, so Mango automatically switches Vulkan/HIP loads to **F16 KV** and
+disables flash attention. NVIDIA CUDA builds (`-GpuBackend cuda`) keep the
+faster Q4 path.
+
+Dev / already-installed AMD fix:
+
+```powershell
+# venv
+.\runtime\scripts\install_llama_cpp_vulkan.bat
+
+# or packaged Mango python:
+& "$env:LOCALAPPDATA\Programs\Mango\resources\mango\python\python.exe" -m pip install `
+  "llama-cpp-python>=0.3.0" --force-reinstall --prefer-binary `
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
+```
+
+Then restart Mango. Settings → Hardware should show `gpu backend: vulkan`.
+
 
 ## Usage
 

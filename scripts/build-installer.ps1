@@ -2,6 +2,9 @@
 # Build a Windows NSIS installer for Mango (Electron + portable Python sidecar).
 # Usage:
 #   .\scripts\build-installer.ps1
+#   .\scripts\build-installer.ps1 -GpuBackend vulkan   # default: AMD/Intel/NVIDIA via Vulkan
+#   .\scripts\build-installer.ps1 -GpuBackend cuda     # NVIDIA CUDA wheel (cu124)
+#   .\scripts\build-installer.ps1 -GpuBackend cpu      # CPU-only (no GPU offload)
 #   .\scripts\build-installer.ps1 -SkipSidecar   # UI-only package (needs system Python)
 #   .\scripts\build-installer.ps1 -Publish       # upload GitHub Release (needs GH_TOKEN)
 #   .\build.cmd
@@ -9,7 +12,9 @@ param(
     [switch]$SkipSidecar,
     [switch]$Publish,
     [string]$Version = "",
-    [string]$PythonVersion = "3.12.8"
+    [string]$PythonVersion = "3.12.8",
+    [ValidateSet("vulkan", "cuda", "cpu")]
+    [string]$GpuBackend = "vulkan"
 )
 
 $ErrorActionPreference = "Stop"
@@ -143,7 +148,7 @@ if (-not $SkipSidecar) {
     }
     Write-Host "  python: $py"
 
-    Write-Host "Installing Mango packages into portable Python (CPU llama-cpp wheel) ..."
+    Write-Host "Installing Mango packages into portable Python (GPU backend=$GpuBackend) ..."
     & $py -m pip install --upgrade pip wheel setuptools
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -153,25 +158,37 @@ if (-not $SkipSidecar) {
     & $py -m pip install "PyYAML>=6.0"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    # Official CPU wheels are on abetlen's index (PyPI often has only sdists for Windows).
-    $cpuIndex = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
-    Write-Host "  pip install llama-cpp-python (CPU wheel index) ..."
-    & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $cpuIndex --prefer-binary
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "CPU wheel index failed; trying Vulkan wheel (AMD/Intel/NVIDIA) ..."
-        $vulkanIndex = "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
-        & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $vulkanIndex --prefer-binary
+    # Prebuilt wheels: https://abetlen.github.io/llama-cpp-python/whl/
+    # Default is Vulkan so AMD/Intel actually get GPU offload. A CPU-first install
+    # always "succeeds" and ships a sidecar that never touches the GPU.
+    $llamaIndexes = @{
+        vulkan = "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
+        cuda   = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+        cpu    = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
     }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Vulkan wheel index failed; trying CUDA wheel index (needs NVIDIA drivers on target) ..."
-        $cudaIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
-        & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $cudaIndex --prefer-binary
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "ERROR: could not install llama-cpp-python wheels." -ForegroundColor Red
-            Write-Host "Install Visual Studio Build Tools and retry, or pre-install a wheel manually."
-            exit $LASTEXITCODE
+    $fallbackOrder = switch ($GpuBackend) {
+        "vulkan" { @("vulkan", "cpu") }
+        "cuda"   { @("cuda", "vulkan", "cpu") }
+        default  { @("cpu") }
+    }
+    $llamaInstalled = $false
+    foreach ($kind in $fallbackOrder) {
+        $index = $llamaIndexes[$kind]
+        Write-Host "  pip install llama-cpp-python ($kind wheel) ..."
+        & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $index --prefer-binary --force-reinstall --no-cache-dir
+        if ($LASTEXITCODE -eq 0) {
+            $llamaInstalled = $true
+            $GpuBackend = $kind
+            break
         }
+        Write-Host "  $kind wheel failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
     }
+    if (-not $llamaInstalled) {
+        Write-Host "ERROR: could not install llama-cpp-python wheels." -ForegroundColor Red
+        Write-Host "Install Visual Studio Build Tools and retry, or pre-install a wheel manually."
+        exit 1
+    }
+    Write-Host "  llama-cpp-python backend selected: $GpuBackend"
 
     $packages = @(
         (Join-Path $Root "runtime\python"),
@@ -190,8 +207,28 @@ if (-not $SkipSidecar) {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
+    # mango-runtime depends on llama-cpp-python and may have pulled a CPU/PyPI
+    # build. Re-pin the GPU wheel so AMD/Intel actually get ggml-vulkan.dll.
+    $pinIndex = $llamaIndexes[$GpuBackend]
+    Write-Host "  re-pin llama-cpp-python ($GpuBackend) ..."
+    & $py -m pip install "llama-cpp-python>=0.3.0" --extra-index-url $pinIndex --prefer-binary --force-reinstall --no-cache-dir
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     Write-Host "Smoke-testing portable sidecar import ..."
-    & $py -c "import yaml, llama_cpp, mango_agent, mango_runtime, mango_tools; from mango_runtime.config import load_config_file; print('sidecar-ok', getattr(llama_cpp, '__version__', '?'), getattr(yaml, '__version__', '?'))"
+    $smoke = @"
+import yaml, llama_cpp, mango_agent, mango_runtime, mango_tools
+from mango_runtime.config import load_config_file
+from mango_runtime.gpu_env import detect_gpu_backend, has_backend_dll
+print('sidecar-ok', getattr(llama_cpp, '__version__', '?'), getattr(yaml, '__version__', '?'))
+print('gpu-detect', detect_gpu_backend())
+want = '$GpuBackend'
+if want in ('vulkan', 'cuda', 'hip') and not has_backend_dll(want):
+    raise SystemExit(f'missing ggml-{want} DLL after $GpuBackend install')
+if want == 'cpu' and has_backend_dll('vulkan'):
+    print('note: vulkan DLL present on cpu build')
+print('gpu-dll-ok', want)
+"@
+    & $py -c $smoke
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
     Write-Host "SkipSidecar: installer will use system Python on PATH" -ForegroundColor Yellow

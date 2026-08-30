@@ -236,6 +236,12 @@ class ModelRunner:
             n_gpu_layers = 0
         elif backend:
             print(f"[mango] gpu backend={backend}", file=sys.stderr, flush=True)
+        if n_gpu_layers == 0:
+            print(
+                "[mango] n_gpu_layers=0 — weights stay on CPU (GPU will stay idle)",
+                file=sys.stderr,
+                flush=True,
+            )
         kwargs = self._loader.llama_kwargs(backend=backend)
         kwargs["n_gpu_layers"] = n_gpu_layers
         n_threads = kwargs.pop("n_threads", None)
