@@ -178,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             print(docker_msg, file=sys.stderr)
             return 2
         run_id = args.eval_run_id or f"mango-{int(__import__('time').time())}"
+        out_dir = Path(args.output_dir)
         summary = run_official_evaluation(
             predictions_path=Path(args.predictions),
             dataset_name=args.dataset,
@@ -186,13 +187,24 @@ def main(argv: list[str] | None = None) -> int:
             model_name=args.model_name,
             max_workers=args.eval_workers,
             instance_ids=instance_ids,
-            report_dir=Path(args.output_dir),
+            report_dir=out_dir,
         )
         print(
             f"[Mango SWE-bench] resolved {summary['resolved_count']}/{summary['total']} "
             f"({float(summary.get('pass_rate') or 0) * 100:.1f}%)",
             flush=True,
         )
+        from mango_agent.benchmark.swebench.evaluate import merge_harness_into_report
+        from mango_agent.benchmark.swebench.report import write_swebench_reports
+
+        latest = out_dir / "latest.json"
+        if merge_harness_into_report(latest, summary) is not None:
+            try:
+                payload = json.loads(latest.read_text(encoding="utf-8"))
+                write_swebench_reports(payload, out_dir, stamped=False)
+                print(f"[Mango SWE-bench] updated {latest}", flush=True)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[Mango SWE-bench] could not refresh latest.md: {exc}", file=sys.stderr)
         return 0 if summary.get("resolved_count") == summary.get("total") and summary.get("total") else 1
 
     from mango_runtime import ModelRunner

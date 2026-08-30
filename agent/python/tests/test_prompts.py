@@ -25,6 +25,10 @@ def test_system_prompts_load_from_markdown() -> None:
     assert "One short thought" in DEFAULT_SYSTEM_PROMPT
     assert "GitHub issue" in SWE_BENCH_SYSTEM_PROMPT
     assert "old_string" in SWE_BENCH_SYSTEM_PROMPT
+    swe = load_system_prompt("swebench")
+    assert "Docker" in swe or "docker" in swe.lower()
+    assert "run_tests" in swe.lower() or "FAIL_TO_PASS" in swe or "pytest" in swe.lower()
+    assert "Re-run the relevant failing tests" not in swe
     assert "API Agent" in EPISTEMIC_SYSTEM_PROMPT or "epistemic" in EPISTEMIC_SYSTEM_PROMPT.lower()
     assert "usage brief" in EPISTEMIC_SYSTEM_PROMPT.lower() or "usage" in EPISTEMIC_SYSTEM_PROMPT.lower()
     assert load_system_prompt("agent_v2") == DEFAULT_SYSTEM_PROMPT

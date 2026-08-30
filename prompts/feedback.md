@@ -104,7 +104,13 @@ No successful edit yet. Apply a minimal edit_file fix or read_file first.
 # run.readonly_no_impl
 Those searches did not locate the implementation. Search package/src modules (not testing/ or test_*.py), then edit_file with old_string copied verbatim from that file.
 
+# readonly_no_impl
+Those searches did not locate the implementation. Search package/src modules (not testing/ or test_*.py), then edit_file with old_string copied verbatim from that file.
+
 # run.readonly_edit_now
+You have only inspected the repo. Apply a minimal edit_file fix now. Use a short unique old_string and new_string; do not rewrite whole files.
+
+# readonly_edit_now
 You have only inspected the repo. Apply a minimal edit_file fix now. Use a short unique old_string and new_string; do not rewrite whole files.
 
 # _note_plan_progress.declare

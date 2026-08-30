@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from mango_agent.benchmark.swebench.types import SweBenchOutcome
+from mango_agent.benchmark.swebench.workspace import _normalize_patch_text
 
 
 def prediction_record(outcome: SweBenchOutcome, *, model_name: str) -> dict[str, str]:
+    patch = outcome.model_patch or ""
+    if patch.strip():
+        patch = _normalize_patch_text(patch)
     return {
         "instance_id": outcome.instance_id,
-        "model_patch": outcome.model_patch or "",
+        "model_patch": patch,
         "model_name_or_path": model_name,
     }
 

@@ -15,7 +15,13 @@ from mango_agent.benchmark.swebench.baseline import (
     load_baseline_config,
     render_comparison,
 )
-from mango_agent.benchmark.swebench.evaluate import docker_available, docker_daemon_ready, swebench_installed
+from mango_agent.benchmark.swebench.evaluate import (
+    count_predictions,
+    docker_available,
+    docker_daemon_ready,
+    merge_harness_into_report,
+    swebench_installed,
+)
 from mango_agent.benchmark.swebench.shuffle import pick_shuffled_instances, shuffle_state_path, validate_count
 from mango_agent.benchmark.swebench.instances import (
     DEFAULT_DATASET,
@@ -29,7 +35,12 @@ from mango_agent.benchmark.swebench.predictions import load_predictions, predict
 from mango_agent.benchmark.swebench.report import render_swebench_markdown, write_swebench_reports
 from mango_agent.benchmark.swebench.runner import build_suite_payload, run_instance, run_swebench
 from mango_agent.benchmark.swebench.types import SweBenchOutcome
-from mango_agent.benchmark.swebench.workspace import build_goal, collect_model_patch, prepare_instance_workspace
+from mango_agent.benchmark.swebench.workspace import (
+    build_goal,
+    collect_model_patch,
+    prepare_instance_workspace,
+    _normalize_patch_text,
+)
 from test_agent_loop import FakeModelRunner
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -241,11 +252,123 @@ def test_run_instance_produces_patch_with_fake_runner(tmp_path: Path, capsys) ->
     )
     assert outcome.patch_nonempty is True
     assert outcome.success is True
+    assert outcome.stop_reason == "completed"
     assert "mathutil.py" in outcome.model_patch
     assert outcome.tool_calls_by_name.get("edit_file", 0) >= 1
+    assert outcome.tool_calls_by_name.get("run_tests", 0) == 0
+    assert (outcome.extra or {}).get("patch_applies_cleanly") is True
     logged = capsys.readouterr().err
     assert "tool=edit_file" in logged
     assert "iter 1/" in logged
+
+
+def test_run_instance_empty_patch_is_not_success(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    commit = _init_repo(source)
+    instance = SweBenchInstance(
+        data={
+            "instance_id": "local__empty",
+            "repo": "mango/demo",
+            "base_commit": commit,
+            "problem_statement": "Fix add().",
+        },
+        local_repo_path=str(source),
+    )
+    workspace = tmp_path / "run_empty"
+    # Prose only — no tools, no diff.
+    runner = FakeModelRunner(["I looked at the issue and it is already fine.", "done"])
+    outcome = run_instance(
+        instance,
+        workspace,
+        runner,
+        limits=__import__("mango_agent.types", fromlist=["AgentLimits"]).AgentLimits(max_iterations=4),
+    )
+    assert outcome.patch_nonempty is False
+    assert outcome.success is False
+    assert "empty patch" in (outcome.error or "").lower() or outcome.stop_reason != "completed"
+
+
+def test_build_goal_points_at_docker_not_local_pytest() -> None:
+    instance = SweBenchInstance(
+        data={
+            "instance_id": "x",
+            "repo": "a/b",
+            "base_commit": "abc",
+            "problem_statement": "Bug.",
+            "FAIL_TO_PASS": '["test_foo"]',
+        }
+    )
+    goal = build_goal(instance)
+    assert "test_foo" in goal
+    assert "Docker" in goal or "docker" in goal.lower() or "FAIL_TO_PASS" in goal or "stop" in goal.lower()
+    assert "Re-run the relevant failing tests" not in goal
+
+
+def test_collect_model_patch_normalizes_lf(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    _init_repo(source)
+    target = source / "mathutil.py"
+    text = target.read_text(encoding="utf-8")
+    target.write_text(text.replace("return f'{a}{b}'", "return a + b"), encoding="utf-8")
+    patch = collect_model_patch(source)
+    assert patch
+    assert "\r" not in patch
+    assert patch.endswith("\n")
+    from mango_agent.benchmark.swebench.workspace import patch_applies_cleanly
+
+    assert patch_applies_cleanly(source, patch) is True
+
+
+def test_patch_mode_finish_after_edit_without_run_tests(tmp_path: Path) -> None:
+    """Regression: task_wants_tests must not block SWE-bench finish after a good edit."""
+    from mango_agent import Agent, StopReason
+    from mango_agent.benchmark.swebench.workspace import SWE_BENCH_DISABLED_TOOLS
+    from mango_tools import create_default_registry
+
+    _init_repo(tmp_path)
+
+    read = (
+        '<tool_call=read_file : '
+        + json.dumps({"path": "mathutil.py"})
+        + ">"
+    )
+    edit = (
+        '<tool_call=edit_file : '
+        + json.dumps(
+            {
+                "path": "mathutil.py",
+                "old_string": "return f'{a}{b}'",
+                "new_string": "return a + b",
+            }
+        )
+        + ">"
+    )
+    runner = FakeModelRunner([read, edit, "Fixed add()."])
+    agent = Agent(
+        runner,
+        max_iterations=6,
+        verification_root=tmp_path,
+        codeintel_root=tmp_path,
+        require_tools=True,
+        task_wants_tests=False,
+        disabled_tools=SWE_BENCH_DISABLED_TOOLS,
+        tool_registry=create_default_registry(),
+        use_tool_grammar=True,
+    )
+    assert "write_file" in agent._disabled_tools
+    result = agent.run(
+        "Fix the following GitHub issue in this repository.\n\n"
+        "add() concatenates instead of adding.\n\n"
+        "Make the minimal code changes needed to resolve the issue."
+    )
+    assert agent._patch_repo_mode()
+    assert agent._impl_mutated_once
+    assert result.stop_reason == StopReason.COMPLETED
+    assert "run_tests" not in {
+        call.name for step in result.steps for call in step.tool_calls
+    }
 
 
 def test_run_swebench_with_local_fixture_and_fake_runner(tmp_path: Path) -> None:
@@ -383,6 +506,61 @@ def test_evaluate_helpers_report_optional_deps() -> None:
     assert isinstance(msg, str)
 
 
+def test_count_predictions_json_and_jsonl(tmp_path: Path) -> None:
+    json_path = tmp_path / "predictions.json"
+    json_path.write_text(
+        json.dumps(
+            [
+                {"instance_id": "a", "model_patch": "", "model_name_or_path": "m"},
+                {"instance_id": "b", "model_patch": "x", "model_name_or_path": "m"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert count_predictions(json_path) == 2
+    assert count_predictions(json_path, nonempty_only=True) == 1
+    jsonl = tmp_path / "predictions.jsonl"
+    jsonl.write_text(
+        '{"instance_id":"a"}\n{"instance_id":"b","model_patch":"diff"}\n',
+        encoding="utf-8",
+    )
+    assert count_predictions(jsonl) == 2
+    assert count_predictions(jsonl, nonempty_only=True) == 1
+
+
+def test_merge_harness_into_report(tmp_path: Path) -> None:
+    report = {
+        "task_count": 2,
+        "patch_count": 1,
+        "resolved": None,
+        "pass_rate": None,
+        "instances": [
+            {"instance_id": "a__1", "resolved": None, "success": False},
+            {"instance_id": "b__2", "resolved": None, "success": False},
+        ],
+    }
+    path = tmp_path / "latest.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    merge_harness_into_report(
+        path,
+        {
+            "run_id": "mango-test",
+            "resolved_count": 1,
+            "total": 2,
+            "pass_rate": 0.5,
+            "instances": [
+                {"instance_id": "a__1", "resolved": True},
+                {"instance_id": "b__2", "resolved": False},
+            ],
+        },
+    )
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["resolved"] == 1
+    assert updated["pass_rate"] == 0.5
+    assert updated["instances"][0]["resolved"] is True
+    assert updated["instances"][1]["resolved"] is False
+
+
 def test_shuffle_deck_no_repeats_until_cycle_complete(tmp_path: Path) -> None:
     pool = [
         SweBenchInstance.from_official(
@@ -441,6 +619,26 @@ def test_validate_count_rejects_out_of_range() -> None:
     with pytest.raises(ValueError, match="<= 300"):
         validate_count(301, dataset_name=DEFAULT_DATASET, split="test")
     assert validate_count(10, dataset_name=DEFAULT_DATASET, split="test") == 10
+
+
+def test_normalize_patch_text_forces_lf_and_stable_mode() -> None:
+    raw = "diff --git a/x.py b/x.py\r\nindex abc..def 100755\r\nold mode 100755\r\nnew mode 100644\r\n"
+    out = _normalize_patch_text(raw)
+    assert "\r" not in out
+    assert "index abc..def 100644" in out
+    assert "old mode" not in out
+
+
+def test_windows_harness_write_text_uses_lf(tmp_path: Path) -> None:
+    from mango_agent.benchmark.swebench.harness_winfix import apply_windows_harness_fixes
+
+    apply_windows_harness_fixes()
+    patch = tmp_path / "patch.diff"
+    patch.write_text("line1\nline2\n")
+    assert b"\r" not in patch.read_bytes()
+    script = tmp_path / "eval.sh"
+    script.write_text("#!/bin/bash\nset -e\n")
+    assert b"\r" not in script.read_bytes()
 
 
 @pytest.mark.swebench_live

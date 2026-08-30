@@ -1,0 +1,287 @@
+{
+  "run_id": "mango-1788000748",
+  "model_name": "mango-local",
+  "log_root": "logs\\run_evaluation\\mango-1788000748\\mango-local",
+  "completed": 39,
+  "resolved_count": 0,
+  "applied_count": 36,
+  "pass_rate": 0.0,
+  "instances": [
+    {
+      "instance_id": "astropy__astropy-14365",
+      "resolved": false,
+      "applied": false,
+      "infra_failure": false,
+      "status": "apply_failed"
+    },
+    {
+      "instance_id": "astropy__astropy-14995",
+      "resolved": false,
+      "applied": false,
+      "infra_failure": false,
+      "status": "apply_failed"
+    },
+    {
+      "instance_id": "astropy__astropy-6938",
+      "resolved": false,
+      "applied": false,
+      "infra_failure": false,
+      "status": "apply_failed"
+    },
+    {
+      "instance_id": "django__django-10914",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11019",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11179",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11283",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11422",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11620",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-11815",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-12286",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-12453",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-12700",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-12856",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-12915",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13028",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13033",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13220",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13230",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13321",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13448",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13590",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13660",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13710",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-13933",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14017",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14382",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14580",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14608",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14672",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-14855",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-15061",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-15781",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-15789",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-15851",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-15996",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-16255",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-16379",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-16400",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    }
+  ],
+  "expected": 109,
+  "updated_at": 1788001071.964931,
+  "done": true
+}

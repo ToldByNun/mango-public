@@ -1,0 +1,63 @@
+{
+  "run_id": "mango-1788022261",
+  "model_name": "mango-local",
+  "log_root": "logs\\run_evaluation\\mango-1788022261\\mango-local",
+  "completed": 7,
+  "resolved_count": 1,
+  "applied_count": 6,
+  "pass_rate": 0.1429,
+  "instances": [
+    {
+      "instance_id": "astropy__astropy-12907",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "django__django-10914",
+      "resolved": true,
+      "applied": true,
+      "infra_failure": false,
+      "status": "RESOLVED"
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-18869",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "psf__requests-1963",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-11143",
+      "resolved": false,
+      "applied": false,
+      "infra_failure": false,
+      "status": "apply_failed"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-10297",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    },
+    {
+      "instance_id": "sympy__sympy-20590",
+      "resolved": false,
+      "applied": true,
+      "infra_failure": false,
+      "status": "not_resolved"
+    }
+  ],
+  "expected": 7,
+  "updated_at": 1788022330.0536845,
+  "done": true
+}

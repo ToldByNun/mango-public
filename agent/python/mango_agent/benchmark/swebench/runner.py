@@ -18,6 +18,7 @@ from mango_agent.benchmark.swebench.workspace import (
     build_goal,
     cleanup_instance_workspace,
     collect_model_patch,
+    patch_applies_cleanly,
     prepare_instance_workspace,
 )
 from mango_agent.orchestrator import Orchestrator
@@ -61,7 +62,10 @@ def run_instance(
             thought_max_tokens=thought_max_tokens,
             tool_max_tokens=tool_max_tokens,
             require_tools=True,
-            task_wants_tests=True,
+            # Official Docker harness grades FAIL_TO_PASS; local pytest burns the
+            # budget on missing deps and blocks finish after a good edit.
+            task_wants_tests=False,
+            plan_apis_first=False,
             verbose=verbose,
             disabled_tools=SWE_BENCH_DISABLED_TOOLS,
             system_prompt=SWE_BENCH_SYSTEM_PROMPT,
@@ -82,6 +86,12 @@ def run_instance(
     verify_runs = metrics.verification_runs if metrics else 0
     verify_fails = metrics.verification_failures if metrics else 0
     patch_ok = bool(patch.strip())
+    # A finished agent run without a git diff is not a successful SWE-bench attempt.
+    if error is None and not patch_ok:
+        error = "No non-empty git diff after agent run (empty patch)."
+        if stop == StopReason.COMPLETED.value:
+            stop = StopReason.ERROR.value
+    applies = bool(patch_ok and patch_applies_cleanly(root, patch))
     tool_names = dict(metrics.tool_calls_by_name) if metrics else {}
     trace = []
     if agent_result is not None:
@@ -135,7 +145,11 @@ def run_instance(
         verification_failures=verify_fails,
         error=error or (agent_result.error if agent_result else None),
         tool_calls_by_name=tool_names,
-        extra={"trace": trace, "failure_bucket": failure_bucket},
+        extra={
+            "trace": trace,
+            "failure_bucket": failure_bucket,
+            "patch_applies_cleanly": applies if patch_ok else False,
+        },
     )
 
 

@@ -19,7 +19,14 @@ class WorkspaceError(Exception):
 
 
 SWE_BENCH_DISABLED_TOOLS = frozenset(
-    {"run_terminal_command", "write_file"}
+    {
+        "run_terminal_command",
+        "write_file",
+        # Local pytest/deps are not the SWE-bench grade path — Docker eval is.
+        "run_tests",
+        # Epistemic installs thrash small models away from locate→edit.
+        "ask_epistemic",
+    }
 )
 
 
@@ -128,12 +135,141 @@ def configure_git_identity(root: Path) -> None:
 
 
 def collect_model_patch(root: Path) -> str:
-    diff = _run_git(["diff", "--no-color", "HEAD"], cwd=root, check=False)
-    patch = (diff.stdout or "").strip()
-    if patch:
-        return patch
-    cached = _run_git(["diff", "--no-color", "--cached", "HEAD"], cwd=root, check=False)
-    return (cached.stdout or "").strip()
+    """Return a source-focused git diff for the official harness.
+
+    Prefer tracked Python/source paths so accidental junk files do not pollute
+    the prediction. Fall back to the full tree diff if needed.
+    """
+    root = Path(root)
+    source_globs = (
+        "*.py",
+        "*.pyi",
+        "*.pyx",
+        "*.pxd",
+        "*.c",
+        "*.cc",
+        "*.cpp",
+        "*.h",
+        "*.hpp",
+        "*.rs",
+        "*.go",
+        "*.js",
+        "*.ts",
+        "*.tsx",
+        "*.jsx",
+        "*.java",
+        "*.rb",
+        "*.php",
+    )
+    for pathspecs in (source_globs, ()):
+        args = ["diff", "--no-color", "HEAD"]
+        if pathspecs:
+            args.extend(["--", *pathspecs])
+        diff = _run_git(args, cwd=root, check=False)
+        patch = _strip_test_paths_from_diff((diff.stdout or "").strip())
+        if patch:
+            return _normalize_patch_text(patch)
+        cached_args = ["diff", "--no-color", "--cached", "HEAD"]
+        if pathspecs:
+            cached_args.extend(["--", *pathspecs])
+        cached = _run_git(cached_args, cwd=root, check=False)
+        patch = _strip_test_paths_from_diff((cached.stdout or "").strip())
+        if patch:
+            return _normalize_patch_text(patch)
+    return ""
+
+
+def _strip_test_paths_from_diff(patch: str) -> str:
+    """Drop hunks that only touch test files (harness grades production code)."""
+    if not patch.strip():
+        return ""
+    import re
+
+    chunks = re.split(r"(?=^diff --git )", patch, flags=re.M)
+    kept: list[str] = []
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        # "diff --git a/foo.py b/foo.py"
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)\n", chunk)
+        path = (m.group(2) if m else "").replace("\\", "/").lower()
+        if any(
+            part in path
+            for part in (
+                "/tests/",
+                "/test/",
+                "/testing/",
+                "conftest.py",
+                "/test_",
+            )
+        ) or path.startswith("test_") or "/test_" in path or path.endswith("_test.py"):
+            continue
+        # also basename test_*.py
+        base = path.rsplit("/", 1)[-1]
+        if base.startswith("test_") or base.endswith("_test.py"):
+            continue
+        kept.append(chunk)
+    return "".join(kept).strip()
+
+
+def _normalize_patch_text(patch: str) -> str:
+    """Normalize a git diff for the official harness ``git apply``.
+
+    Windows/worktree mode bits (100755 vs 100644) often make ``git apply`` fail
+    inside Linux eval containers even when ``patch(1)`` would succeed — SWE-bench
+    then marks ``patch_successfully_applied: false``.
+    """
+    import re
+
+    text = patch.replace("\r\n", "\n").replace("\r", "\n")
+    # Drop explicit mode-change hunks.
+    text = re.sub(r"(?m)^old mode \d+\nnew mode \d+\n", "", text)
+    # Force a stable mode on index lines: "index abc..def 100755" -> "... 100644"
+    text = re.sub(
+        r"(?m)^(index [0-9a-f]+\.\.[0-9a-f]+)(?: \d+)?$",
+        r"\1 100644",
+        text,
+    )
+    # "new file mode 100755" / "deleted file mode ..."
+    text = re.sub(r"(?m)^(new file mode|deleted file mode) \d+$", r"\1 100644", text)
+    text = text.strip()
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def patch_applies_cleanly(root: Path, patch: str) -> bool:
+    """True when the working-tree diff reverses cleanly (i.e. matched HEAD→WT).
+
+    The agent already applied edits in-tree; ``git apply --check`` against the
+    dirty tree would fail. ``--reverse --check`` validates the hunk matches.
+    """
+    if not (patch or "").strip():
+        return False
+    root = Path(root)
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+        suffix=".diff",
+        delete=False,
+    ) as handle:
+        handle.write(patch if patch.endswith("\n") else patch + "\n")
+        tmp = Path(handle.name)
+    try:
+        check = _run_git(
+            ["apply", "--reverse", "--check", str(tmp)],
+            cwd=root,
+            check=False,
+        )
+        return check.returncode == 0
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def cleanup_instance_workspace(
@@ -202,9 +338,10 @@ def build_goal(instance: SweBenchInstance) -> str:
         [
             "",
             "Make the minimal code changes needed to resolve the issue.",
-            "Use search_code / read_file to find the bug, then edit_file or edit_symbol to apply a small patch.",
-            "If the exact library/API behavior is unclear, use ask_epistemic before editing.",
-            "Do not rewrite whole files. Re-run the relevant failing tests before finalizing.",
+            "Order: search_code or codebase_lookup → read_file on the implementation → "
+            "one small edit_file (exact old_string from that read).",
+            "Do not rewrite whole files. Do not edit tests first.",
+            "After the patch parses (syntax OK), stop — the official Docker harness grades FAIL_TO_PASS.",
         ]
     )
     return "\n".join(parts).strip()

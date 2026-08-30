@@ -2345,6 +2345,11 @@ class Agent:
         if self._plan_mode:
             # Plan runs deliver a markdown plan in the chat: no impl gates apply.
             return self._acted_once or not self._require_tools
+        # SWE-bench: never finish without a real mutation (Docker grades the diff).
+        if self._patch_repo_mode():
+            if self._syntax_broken:
+                return False
+            return bool(self._impl_mutated_once)
         # Create/implement must land at least one mutating write/edit before finish.
         if (
             self._require_tools
@@ -3946,7 +3951,8 @@ class Agent:
         if not isinstance(path, str) or not path.strip():
             return None
         if _looks_like_test_path(path) and not self._goal_mentions_test_file(path):
-            if not self._impl_mutated_once:
+            # Patch-mode (SWE-bench): never mutate tests — Docker grades FAIL_TO_PASS.
+            if self._patch_repo_mode() or not self._impl_mutated_once:
                 return feedback("blocked_edit_test_first")
         abs_path = self._abs_impl_path(path)
         file_exists = Path(abs_path).is_file()
@@ -5304,6 +5310,24 @@ class Agent:
 
     def _mark_goal_met_if_ready(self, engine: ContextEngine | None = None) -> bool:
         if self._goal_met:
+            return True
+        # SWE-bench / patch repos: a successful mutation is enough — Docker grades
+        # FAIL_TO_PASS. Do not wait for local pytest (usually missing deps).
+        if self._patch_repo_mode():
+            if self._syntax_broken or not self._impl_mutated_once:
+                return False
+            if not self._goal_is_met():
+                return False
+            self._goal_met = True
+            self._prefer_edit_gaps = False
+            self._prefer_insert_lines = False
+            self._prefer_write_file = False
+            self._prefer_read_file = False
+            self._forced_read_path = ""
+            self._action_loop_force_write = False
+            self._action_loop_force_edit = False
+            if engine is not None:
+                engine.set_verification_feedback(feedback("goal_met_stop"))
             return True
         # Hard gate: a goal that asks for tests is NEVER met while pytest has not
         # gone green this run — hollow test files must not latch completion.
