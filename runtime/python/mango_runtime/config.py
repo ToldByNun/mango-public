@@ -1,14 +1,55 @@
 from __future__ import annotations
 
+import importlib
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from mango_runtime.types import RuntimeConfig
 
 DEFAULT_CONFIG_NAMES = ("config.yaml", "config.yml")
+
+
+def _import_yaml() -> Any:
+    """Return the PyYAML module, installing it into this interpreter if missing."""
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        return yaml
+    except ModuleNotFoundError:
+        pass
+
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "PyYAML>=6.0"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+            creationflags=flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ModuleNotFoundError(
+            "PyYAML is required but missing, and auto-install failed. "
+            f'Run: "{sys.executable}" -m pip install PyYAML'
+        ) from exc
+
+    importlib.invalidate_caches()
+    sys.modules.pop("yaml", None)
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        return yaml
+    except ModuleNotFoundError as exc:
+        detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        raise ModuleNotFoundError(
+            "PyYAML is required but missing. "
+            f'Run: "{sys.executable}" -m pip install PyYAML'
+            + (f" ({detail})" if detail else "")
+        ) from exc
 
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path:
@@ -59,6 +100,7 @@ def load_config_file(path: str | Path, *, require_model: bool = True) -> Runtime
             "Copy config.example.yaml to config.yaml and set model.path."
         )
 
+    yaml = _import_yaml()
     with config_path.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
 
@@ -92,6 +134,7 @@ def load_config(path: str | Path | None = None) -> RuntimeConfig:
 def save_config(path: str | Path, config: RuntimeConfig) -> None:
     config_path = Path(path).expanduser().resolve()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml = _import_yaml()
     payload = config_to_dict(config)
     text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
     tmp = config_path.with_suffix(".yaml.tmp")

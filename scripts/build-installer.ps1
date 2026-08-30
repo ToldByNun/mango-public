@@ -147,6 +147,12 @@ if (-not $SkipSidecar) {
     & $py -m pip install --upgrade pip wheel setuptools
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    # Required by mango_runtime.config — install explicitly so a missed transitive
+    # dep cannot ship a sidecar that crashes on `import yaml`.
+    Write-Host "  pip install PyYAML ..."
+    & $py -m pip install "PyYAML>=6.0"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     # Official CPU wheels are on abetlen's index (PyPI often has only sdists for Windows).
     $cpuIndex = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
     Write-Host "  pip install llama-cpp-python (CPU wheel index) ..."
@@ -185,7 +191,7 @@ if (-not $SkipSidecar) {
     }
 
     Write-Host "Smoke-testing portable sidecar import ..."
-    & $py -c "import llama_cpp, mango_agent, mango_runtime, mango_tools; print('sidecar-ok', getattr(llama_cpp, '__version__', '?'))"
+    & $py -c "import yaml, llama_cpp, mango_agent, mango_runtime, mango_tools; from mango_runtime.config import load_config_file; print('sidecar-ok', getattr(llama_cpp, '__version__', '?'), getattr(yaml, '__version__', '?'))"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
     Write-Host "SkipSidecar: installer will use system Python on PATH" -ForegroundColor Yellow

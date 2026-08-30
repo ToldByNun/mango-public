@@ -46,6 +46,15 @@ Environment overrides:
 
 - `MANGO_GGUF_MODEL_PATH` — overrides `model.path`
 - `MANGO_RUNTIME_CONFIG` — path to alternate config
+- `MANGO_VULKAN_ALLOW_QKV=1` — keep Q4 KV + flash-attn on Vulkan (can garble on AMD)
+- `MANGO_VULKAN_FLASH_ATTN=1` — enable flash-attn with F16 KV on Vulkan
+
+## GPU (Vulkan / AMD)
+
+Packaged builds use the llama-cpp-python **Vulkan** wheel for AMD/Intel. CUDA-style
+Q4_0 KV-cache + flash attention is known to corrupt tokens on many AMD GPUs, so
+Mango automatically switches Vulkan/HIP loads to **F16 KV** and disables flash
+attention. NVIDIA CUDA keeps the faster Q4 path.
 
 ## Usage
 

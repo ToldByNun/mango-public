@@ -236,16 +236,24 @@ class ModelRunner:
             n_gpu_layers = 0
         elif backend:
             print(f"[mango] gpu backend={backend}", file=sys.stderr, flush=True)
-        kwargs = self._loader.llama_kwargs()
+        kwargs = self._loader.llama_kwargs(backend=backend)
         kwargs["n_gpu_layers"] = n_gpu_layers
         n_threads = kwargs.pop("n_threads", None)
         if n_threads is not None:
             kwargs["n_threads"] = n_threads
         apply_backend_env(backend)
+        if backend in {"vulkan", "hip"} and kwargs.get("type_v") == 1:
+            print(
+                "[mango] vulkan/hip safe KV: type_k/v=f16 flash_attn="
+                f"{kwargs.get('flash_attn')} (avoids AMD FA+Q4 garbled output)",
+                file=sys.stderr,
+                flush=True,
+            )
         print(
             f"[mango] loading {self._loader.model_path.name} "
             f"(n_ctx={kwargs.get('n_ctx')} n_batch={kwargs.get('n_batch')} "
             f"n_ubatch={kwargs.get('n_ubatch')} flash_attn={kwargs.get('flash_attn')} "
+            f"type_k={kwargs.get('type_k')} type_v={kwargs.get('type_v')} "
             f"n_gpu_layers={kwargs.get('n_gpu_layers')}) ...",
             file=sys.stderr,
             flush=True,

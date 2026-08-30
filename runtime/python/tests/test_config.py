@@ -108,10 +108,36 @@ def test_llama_kwargs_use_windowed_swa_cache(tmp_path: Path) -> None:
     gguf = tmp_path / "gemma4.gguf"
     gguf.write_bytes(b"GGUF")
     loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(gguf), n_ctx=16384, n_batch=512)))
-    kwargs = loader.llama_kwargs()
+    kwargs = loader.llama_kwargs(backend="cuda")
     assert kwargs["swa_full"] is False
-    # 2 = GGML_TYPE_Q4_0: half the KV-cache VRAM of Q8_0.
+    # 2 = GGML_TYPE_Q4_0: half the KV-cache VRAM of Q8_0 (CUDA-safe).
     assert kwargs["type_k"] == 2
     assert kwargs["type_v"] == 2
+    assert kwargs["flash_attn"] is True
     assert kwargs["n_ctx"] == 16384
     assert kwargs["last_n_tokens_size"] >= 256
+
+
+def test_llama_kwargs_vulkan_uses_f16_kv(tmp_path: Path) -> None:
+    from mango_runtime.types import ModelConfig, RuntimeConfig
+
+    gguf = tmp_path / "gemma4.gguf"
+    gguf.write_bytes(b"GGUF")
+    loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(gguf), n_ctx=16384, n_batch=512)))
+    kwargs = loader.llama_kwargs(backend="vulkan")
+    # 1 = GGML_TYPE_F16 — quantized V + FA garbles output on AMD Vulkan.
+    assert kwargs["type_k"] == 1
+    assert kwargs["type_v"] == 1
+    assert kwargs["flash_attn"] is False
+
+
+def test_llama_kwargs_hip_uses_f16_kv(tmp_path: Path) -> None:
+    from mango_runtime.types import ModelConfig, RuntimeConfig
+
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"GGUF")
+    loader = GGUFLoader(RuntimeConfig(model=ModelConfig(path=str(gguf))))
+    kwargs = loader.llama_kwargs(backend="hip")
+    assert kwargs["type_k"] == 1
+    assert kwargs["type_v"] == 1
+    assert kwargs["flash_attn"] is False
