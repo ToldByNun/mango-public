@@ -6,6 +6,8 @@ Repo: [github.com/ToldByNun/mango-public](https://github.com/ToldByNun/mango-pub
 
 A 12B local model cannot afford Aider-style repo maps or long framework essays. GUI prompts are short; GBNF and the executor enforce the workflow. `ask_epistemic` returns a deterministic usage card for known stdlib (no nested generate, so the main KV cache stays intact). Unknown libraries still get one isolated summarize turn.
 
+**Roblox Studio:** see [`apps/roblox-studio/README.md`](apps/roblox-studio/README.md) — local plugin + `mango-studio-host` on localhost (DataModel tools, `mode=roblox`).
+
 Visual Docker/WASM sandboxing in the GUI is not built yet.
 
 ## Architecture

@@ -60,6 +60,13 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "run_terminal_command": ("command",),
     "measure": ("command",),
     "run_tests": (),
+    "rbx_tree": (),
+    "rbx_sel": (),
+    "rbx_read": ("path",),
+    "rbx_edit": ("path", "old", "new"),
+    "rbx_create": ("parent", "class_name"),
+    "rbx_prop": ("property_name",),
+    "rbx_delete": ("path",),
 }
 
 

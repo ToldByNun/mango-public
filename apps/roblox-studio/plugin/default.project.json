@@ -1,0 +1,9 @@
+{
+  "name": "MangoPlugin",
+  "tree": {
+    "$className": "Folder",
+    "MangoPlugin": {
+      "$path": "src/MangoPlugin.luau"
+    }
+  }
+}

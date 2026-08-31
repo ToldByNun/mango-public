@@ -313,6 +313,7 @@ class AgentServer:
                 "ask": "[Ask]",
                 "debug": "[Debug]",
                 "refactor": "[Refactor]",
+                "roblox": "[Roblox]",
             }.get(mode, "")
             if mode_prefix and not title.startswith(mode_prefix):
                 title = f"{mode_prefix} {title}"
@@ -455,6 +456,56 @@ class AgentServer:
                     thinking_level=preset.level,
                     agent_mode="debug",
                 )
+            elif mode == "roblox":
+                from mango_tools.implementations.roblox_tools import register_roblox_tools
+
+                orch = Orchestrator(
+                    self._runner,
+                    workspace=workspace,
+                    limits=AgentLimits(
+                        max_iterations=20,
+                        max_runtime_seconds=900,
+                        max_prompt_chars=24_000,
+                        max_reasoning_cycles=preset.max_reasoning_cycles,
+                        max_epistemic_iterations=4,
+                    ),
+                    max_tokens=4096,
+                    on_event=self._on_agent_event,
+                    system_prompt=load_system_prompt("roblox"),
+                    require_tools=True,
+                    plan_apis_first=False,
+                    task_wants_tests=False,
+                    thought_max_tokens=effective_thought,
+                    tool_max_tokens=2048,
+                    thinking_level=preset.level,
+                    agent_mode="roblox",
+                    disabled_tools=frozenset(
+                        {
+                            "write_file",
+                            "edit_file",
+                            "edit_symbol",
+                            "insert_lines",
+                            "delete_file",
+                            "rename_symbol",
+                            "run_tests",
+                            "run_terminal_command",
+                            "measure",
+                            "declare_apis",
+                            "ask_epistemic",
+                            "research_codebase",
+                            "codebase_lookup",
+                            "package_source_lookup",
+                            "doc_lookup",
+                            "web_research",
+                            # Force Studio tools; filesystem is empty shadow workspace.
+                            "read_file",
+                            "list_dir",
+                            "glob_files",
+                            "search_code",
+                        }
+                    ),
+                )
+                register_roblox_tools(orch.agent.tool_registry)
             else:
                 orch = Orchestrator(
                     self._runner,
