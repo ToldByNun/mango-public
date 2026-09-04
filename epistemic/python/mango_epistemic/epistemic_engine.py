@@ -25,7 +25,7 @@ class EpistemicEngine:
         *,
         web_backend: Callable[[str], Any] | None = None,
         max_iterations: int = 8,
-        auto_install: bool = True,
+        auto_install: bool = False,
     ) -> None:
         self._model_runner = model_runner
         self._web_backend = web_backend
@@ -46,6 +46,7 @@ class EpistemicEngine:
         *,
         libraries: list[str] | None = None,
         deadline: float | None = None,
+        addon_system_prompt: str | None = None,
     ) -> EpistemicResult:
         blob = question
         extra = " ".join(str(item) for item in (libraries or []) if str(item).strip())
@@ -75,6 +76,7 @@ class EpistemicEngine:
                 web_backend=self._web_backend,
                 max_iterations=min(self._max_iterations, 2),
                 on_event=None,
+                addon_system_prompt=addon_system_prompt,
             )
             run = sub.run(question, cards=cards, deadline=deadline)
             self.last_subagent_steps = getattr(run, "iterations", 0)
@@ -109,19 +111,25 @@ class EpistemicEngine:
         cards: list[dict[str, Any]],
         libraries: list[str],
     ) -> dict[str, Any] | None:
-        if not self._auto_install:
-            return None
         roots = missing_import_roots(cards)
         for lib in libraries:
             root = str(lib or "").split(".", 1)[0].strip()
             if root and root not in roots:
-                # Declared third-party that still isn't importable.
                 from mango_epistemic.install_deps import can_import, resolve_pip_name
 
                 if resolve_pip_name(root) and not can_import(root):
                     roots.append(root)
         if not roots:
             return None
+        if not self._auto_install:
+            return {
+                "ok": False,
+                "installed": [],
+                "failed": roots,
+                "command": None,
+                "hint": "call install_packages or web_research/fetch_url for online docs",
+                "packages": roots,
+            }
         info = ensure_packages(roots)
         if self.on_event is not None and info.get("command"):
             try:
@@ -143,26 +151,45 @@ def register_ask_epistemic(
     engine: EpistemicEngine | None = None,
     max_iterations: int = 8,
     get_deadline: Callable[[], float | None] | None = None,
+    auto_install: bool = False,
 ) -> EpistemicEngine:
     engine = engine or EpistemicEngine(
         model_runner,
         web_backend=web_backend,
         max_iterations=max_iterations,
+        auto_install=auto_install,
     )
 
     def _ask(question: str, _context: dict[str, Any] | None = None) -> dict[str, Any]:
         libs = []
+        task_prompt = ""
         if isinstance(_context, dict):
             raw = _context.get("declared_libraries") or []
             if isinstance(raw, list):
                 libs = [str(item) for item in raw if str(item).strip()]
+            task_prompt = str(_context.get("task_prompt") or "").strip()
         deadline = get_deadline() if get_deadline else None
-        result = engine.ask_epistemic(question, libraries=libs, deadline=deadline)
+        result = engine.ask_epistemic(
+            question,
+            libraries=libs,
+            deadline=deadline,
+            addon_system_prompt=task_prompt or None,
+        )
         data = result.to_compact_dict()
         if result.looked_up:
             data["looked_up"] = list(result.looked_up)
         install = engine.last_install
-        if isinstance(install, dict) and install.get("command"):
+        if isinstance(install, dict) and install.get("hint"):
+            pkgs = ", ".join(str(x) for x in (install.get("packages") or install.get("failed") or []))
+            note = (
+                f"Packages not installed locally: {pkgs or 'unknown'}. "
+                f"{install.get('hint')}"
+            )
+            details = str(data.get("details") or "").strip()
+            data["details"] = f"{note}\n\n{details}".strip() if details else note
+            data["needs_install"] = list(install.get("packages") or install.get("failed") or [])
+            data["install_ok"] = False
+        elif isinstance(install, dict) and install.get("command"):
             data["install_command"] = install.get("command")
             data["installed"] = list(install.get("installed") or [])
             data["failed"] = list(install.get("failed") or [])
@@ -187,12 +214,15 @@ def register_ask_epistemic(
             or "no module named" in err_blob
             or "install failed" in err_blob
         )
-        if import_miss:
+        if import_miss and not data.get("needs_install"):
             raise ValueError(
                 "Package still missing after install attempt. "
                 "Install failed or wrong PyPI name. "
                 f"Tried: {data.get('install_command') or 'pip install <pkg>'}."
             )
+        if data.get("needs_install") and not useful:
+            # Soft miss: tell the agent to install or fetch docs (no raise → fail-open path).
+            return data
         if not useful and data.get("exists") is not False:
             raise ValueError(
                 "API research returned no usage brief. "

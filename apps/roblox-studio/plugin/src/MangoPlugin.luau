@@ -2,9 +2,9 @@
 	Mango — local Roblox Studio plugin
 	Talks to mango-studio-host on http://127.0.0.1:17880 (long-poll).
 
-	Install: copy this file to
-	  %LOCALAPPDATA%\Roblox\Plugins\MangoPlugin.luau
-	or use Install-StudioPlugin.ps1, then restart Studio.
+	Install: use Install-StudioPlugin.ps1 / MangoStudio.cmd
+	(copies as MangoPlugin.lua — Studio ignores .luau in PluginsDir).
+	Then fully quit and reopen Studio.
 ]]
 
 local HttpService = game:GetService("HttpService")
@@ -28,9 +28,15 @@ local state = {
 	eventSince = 0,
 	pollActive = false,
 	eventActive = false,
-	pendingConfirm = nil, -- { requestId, summary, resolve }
+	pendingConfirm = nil,
 	transcript = {},
 	confirmPropThreshold = 1,
+	models = {},
+	modelPath = "",
+	modelLabel = "No model",
+	pickerOpen = false,
+	thinkingOpen = false,
+	thinkingLevel = plugin:GetSetting("MangoThinkingLevel") or "off",
 }
 
 local function baseUrl()
@@ -384,102 +390,207 @@ local function executeTool(tool, args)
 	return { ok = false, error = "unknown_tool", tool = tool }
 end
 
--- ─── UI ────────────────────────────────────────────────────────────
+-- ─── UI (Mango Electron composer look) ─────────────────────────────
+
+-- Tokens from apps/electron/src/renderer/src/styles/tokens.css
+local C = {
+	surface0 = Color3.fromRGB(14, 13, 12), -- #0e0d0c
+	surface1 = Color3.fromRGB(22, 20, 18), -- #161412
+	surface2 = Color3.fromRGB(28, 26, 24), -- #1c1a18
+	surface3 = Color3.fromRGB(37, 34, 31), -- #25221f
+	border = Color3.fromRGB(46, 42, 38), -- #2e2a26
+	text = Color3.fromRGB(245, 242, 237), -- #f5f2ed
+	muted = Color3.fromRGB(168, 159, 148), -- #a89f94
+	dim = Color3.fromRGB(122, 114, 104), -- #7a7268
+	accent = Color3.fromRGB(232, 148, 58), -- #e8943a
+	accentOn = Color3.fromRGB(26, 18, 8), -- #1a1208
+	ok = Color3.fromRGB(61, 186, 110),
+	warn = Color3.fromRGB(229, 162, 58),
+	danger = Color3.fromRGB(232, 93, 76),
+}
+
+local function corner(parent, px)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, px or 8)
+	c.Parent = parent
+	return c
+end
+
+local function pad(parent, t, r, b, l)
+	local p = Instance.new("UIPadding")
+	p.PaddingTop = UDim.new(0, t or 0)
+	p.PaddingRight = UDim.new(0, r or t or 0)
+	p.PaddingBottom = UDim.new(0, b or t or 0)
+	p.PaddingLeft = UDim.new(0, l or r or t or 0)
+	p.Parent = parent
+	return p
+end
 
 local toolbar = plugin:CreateToolbar("Mango")
 local button = toolbar:CreateButton("Mango", "Open Mango agent panel", "")
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
 	Enum.InitialDockState.Right,
-	false, -- initially enabled
 	false,
-	420,
-	560,
-	320,
-	400
+	false,
+	440,
+	620,
+	340,
+	420
 )
 local widget = plugin:CreateDockWidgetPluginGui("MangoAgent", widgetInfo)
 widget.Title = "Mango"
 
 local root = Instance.new("Frame")
 root.Size = UDim2.fromScale(1, 1)
-root.BackgroundColor3 = Color3.fromRGB(30, 30, 32)
+root.BackgroundColor3 = C.surface0
 root.BorderSizePixel = 0
 root.Parent = widget
 
-local function mkLabel(parent, text, y, h)
-	local l = Instance.new("TextLabel")
-	l.BackgroundTransparency = 1
-	l.Position = UDim2.new(0, 8, 0, y)
-	l.Size = UDim2.new(1, -16, 0, h or 18)
-	l.Font = Enum.Font.Gotham
-	l.TextSize = 13
-	l.TextXAlignment = Enum.TextXAlignment.Left
-	l.TextColor3 = Color3.fromRGB(220, 220, 220)
-	l.Text = text
-	l.Parent = parent
-	return l
-end
+-- Header
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 36)
+header.BackgroundColor3 = C.surface1
+header.BorderSizePixel = 0
+header.Parent = root
 
-local statusLabel = mkLabel(root, "Host: checking…", 8, 20)
-statusLabel.TextColor3 = Color3.fromRGB(180, 180, 100)
+local headerRule = Instance.new("Frame")
+headerRule.Size = UDim2.new(1, 0, 0, 1)
+headerRule.Position = UDim2.new(0, 0, 1, -1)
+headerRule.BackgroundColor3 = C.border
+headerRule.BorderSizePixel = 0
+headerRule.Parent = header
 
+local brandDot = Instance.new("Frame")
+brandDot.Size = UDim2.fromOffset(10, 10)
+brandDot.Position = UDim2.new(0, 14, 0.5, -5)
+brandDot.BackgroundColor3 = C.accent
+brandDot.BorderSizePixel = 0
+brandDot.Parent = header
+corner(brandDot, 3)
+
+local brandLabel = Instance.new("TextLabel")
+brandLabel.BackgroundTransparency = 1
+brandLabel.Position = UDim2.new(0, 32, 0, 0)
+brandLabel.Size = UDim2.new(0, 80, 1, 0)
+brandLabel.Font = Enum.Font.GothamBold
+brandLabel.TextSize = 14
+brandLabel.TextXAlignment = Enum.TextXAlignment.Left
+brandLabel.TextColor3 = C.text
+brandLabel.Text = "Mango"
+brandLabel.Parent = header
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.BackgroundTransparency = 1
+statusLabel.Position = UDim2.new(0, 100, 0, 0)
+statusLabel.Size = UDim2.new(1, -112, 1, 0)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 12
+statusLabel.TextXAlignment = Enum.TextXAlignment.Right
+statusLabel.TextColor3 = C.dim
+statusLabel.Text = "Host: checking…"
+statusLabel.Parent = header
+
+-- Transcript
 local transcript = Instance.new("ScrollingFrame")
-transcript.Position = UDim2.new(0, 8, 0, 36)
-transcript.Size = UDim2.new(1, -16, 1, -160)
-transcript.BackgroundColor3 = Color3.fromRGB(22, 22, 24)
+transcript.Position = UDim2.new(0, 0, 0, 36)
+transcript.Size = UDim2.new(1, 0, 1, -158)
+transcript.BackgroundColor3 = C.surface0
 transcript.BorderSizePixel = 0
-transcript.ScrollBarThickness = 6
+transcript.ScrollBarThickness = 4
+transcript.ScrollBarImageColor3 = C.border
 transcript.CanvasSize = UDim2.new(0, 0, 0, 0)
+transcript.AutomaticCanvasSize = Enum.AutomaticSize.Y
 transcript.Parent = root
+pad(transcript, 12, 14, 8, 14)
 
 local transcriptLayout = Instance.new("UIListLayout")
-transcriptLayout.Padding = UDim.new(0, 4)
+transcriptLayout.Padding = UDim.new(0, 8)
+transcriptLayout.SortOrder = Enum.SortOrder.LayoutOrder
 transcriptLayout.Parent = transcript
 
+-- Confirm strip (above composer)
 local confirmFrame = Instance.new("Frame")
 confirmFrame.Visible = false
-confirmFrame.Position = UDim2.new(0, 8, 1, -150)
-confirmFrame.Size = UDim2.new(1, -16, 0, 56)
-confirmFrame.BackgroundColor3 = Color3.fromRGB(60, 40, 20)
+confirmFrame.AnchorPoint = Vector2.new(0, 1)
+confirmFrame.Position = UDim2.new(0, 12, 1, -130)
+confirmFrame.Size = UDim2.new(1, -24, 0, 52)
+confirmFrame.BackgroundColor3 = Color3.fromRGB(48, 32, 18)
 confirmFrame.BorderSizePixel = 0
+confirmFrame.ZIndex = 8
 confirmFrame.Parent = root
-confirmFrame.ZIndex = 5
+corner(confirmFrame, 10)
+pad(confirmFrame, 8, 10, 8, 10)
 
-local confirmLabel = mkLabel(confirmFrame, "Confirm?", 4, 24)
-confirmLabel.Size = UDim2.new(1, -16, 0, 24)
+local confirmLabel = Instance.new("TextLabel")
+confirmLabel.BackgroundTransparency = 1
+confirmLabel.Size = UDim2.new(1, -170, 1, 0)
+confirmLabel.Font = Enum.Font.Gotham
+confirmLabel.TextSize = 12
+confirmLabel.TextXAlignment = Enum.TextXAlignment.Left
+confirmLabel.TextYAlignment = Enum.TextYAlignment.Center
 confirmLabel.TextWrapped = true
-confirmLabel.ZIndex = 6
+confirmLabel.TextColor3 = C.text
+confirmLabel.Text = "Confirm?"
+confirmLabel.ZIndex = 9
+confirmLabel.Parent = confirmFrame
 
 local allowBtn = Instance.new("TextButton")
-allowBtn.Size = UDim2.new(0, 80, 0, 22)
-allowBtn.Position = UDim2.new(0, 8, 0, 30)
+allowBtn.AnchorPoint = Vector2.new(1, 0.5)
+allowBtn.Position = UDim2.new(1, -88, 0.5, 0)
+allowBtn.Size = UDim2.fromOffset(72, 28)
 allowBtn.Text = "Allow"
 allowBtn.Font = Enum.Font.GothamBold
 allowBtn.TextSize = 12
-allowBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 60)
-allowBtn.TextColor3 = Color3.new(1, 1, 1)
+allowBtn.BackgroundColor3 = C.ok
+allowBtn.TextColor3 = C.accentOn
+allowBtn.AutoButtonColor = true
+allowBtn.ZIndex = 9
 allowBtn.Parent = confirmFrame
-allowBtn.ZIndex = 6
+corner(allowBtn, 8)
 
 local denyBtn = Instance.new("TextButton")
-denyBtn.Size = UDim2.new(0, 80, 0, 22)
-denyBtn.Position = UDim2.new(0, 96, 0, 30)
+denyBtn.AnchorPoint = Vector2.new(1, 0.5)
+denyBtn.Position = UDim2.new(1, -8, 0.5, 0)
+denyBtn.Size = UDim2.fromOffset(72, 28)
 denyBtn.Text = "Deny"
 denyBtn.Font = Enum.Font.GothamBold
 denyBtn.TextSize = 12
-denyBtn.BackgroundColor3 = Color3.fromRGB(140, 40, 40)
+denyBtn.BackgroundColor3 = C.danger
 denyBtn.TextColor3 = Color3.new(1, 1, 1)
+denyBtn.AutoButtonColor = true
+denyBtn.ZIndex = 9
 denyBtn.Parent = confirmFrame
-denyBtn.ZIndex = 6
+corner(denyBtn, 8)
+
+-- Composer bar (screenshot match)
+local composerWrap = Instance.new("Frame")
+composerWrap.AnchorPoint = Vector2.new(0, 1)
+composerWrap.Position = UDim2.new(0, 12, 1, -12)
+composerWrap.Size = UDim2.new(1, -24, 0, 108)
+composerWrap.BackgroundTransparency = 1
+composerWrap.Parent = root
+
+local composerBar = Instance.new("Frame")
+composerBar.Size = UDim2.fromScale(1, 1)
+composerBar.BackgroundColor3 = C.surface2
+composerBar.BorderSizePixel = 0
+composerBar.Parent = composerWrap
+corner(composerBar, 16)
+
+local composerStroke = Instance.new("UIStroke")
+composerStroke.Color = C.border
+composerStroke.Thickness = 1
+composerStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+composerStroke.Parent = composerBar
 
 local composer = Instance.new("TextBox")
-composer.Position = UDim2.new(0, 8, 1, -90)
-composer.Size = UDim2.new(1, -16, 0, 50)
-composer.BackgroundColor3 = Color3.fromRGB(40, 40, 44)
-composer.TextColor3 = Color3.fromRGB(230, 230, 230)
-composer.PlaceholderText = "Ask Mango to edit this Place…"
-composer.PlaceholderColor3 = Color3.fromRGB(120, 120, 120)
+composer.BackgroundTransparency = 1
+composer.Position = UDim2.new(0, 14, 0, 10)
+composer.Size = UDim2.new(1, -28, 1, -48)
+composer.TextColor3 = C.text
+composer.PlaceholderText = "Ask Mango to build, fix, or explain..."
+composer.PlaceholderColor3 = C.dim
 composer.Text = ""
 composer.TextXAlignment = Enum.TextXAlignment.Left
 composer.TextYAlignment = Enum.TextYAlignment.Top
@@ -487,60 +598,553 @@ composer.ClearTextOnFocus = false
 composer.MultiLine = true
 composer.TextWrapped = true
 composer.Font = Enum.Font.Gotham
-composer.TextSize = 13
-composer.Parent = root
+composer.TextSize = 14
+composer.Parent = composerBar
 
-local sendBtn = Instance.new("TextButton")
-sendBtn.Position = UDim2.new(0, 8, 1, -34)
-sendBtn.Size = UDim2.new(0, 80, 0, 26)
-sendBtn.Text = "Send"
-sendBtn.Font = Enum.Font.GothamBold
-sendBtn.TextSize = 13
-sendBtn.BackgroundColor3 = Color3.fromRGB(50, 100, 180)
-sendBtn.TextColor3 = Color3.new(1, 1, 1)
-sendBtn.Parent = root
+local footer = Instance.new("Frame")
+footer.AnchorPoint = Vector2.new(0, 1)
+footer.Position = UDim2.new(0, 8, 1, -8)
+footer.Size = UDim2.new(1, -16, 0, 32)
+footer.BackgroundTransparency = 1
+footer.Parent = composerBar
+
+local plusBtn = Instance.new("TextButton")
+plusBtn.Size = UDim2.fromOffset(28, 28)
+plusBtn.Position = UDim2.new(0, 0, 0.5, -14)
+plusBtn.BackgroundTransparency = 1
+plusBtn.Text = "+"
+plusBtn.Font = Enum.Font.Gotham
+plusBtn.TextSize = 20
+plusBtn.TextColor3 = C.dim
+plusBtn.AutoButtonColor = true
+plusBtn.Parent = footer
+
+-- Thinking strength chip (opens slider popup)
+local THINK_LEVELS = {
+	{ id = "off", label = "Off", desc = "Just go" },
+	{ id = "think", label = "Think", desc = "A beat longer" },
+	{ id = "deep", label = "Deep", desc = "Take the long way" },
+	{ id = "max", label = "Max", desc = "Leave no stone" },
+}
+
+local function thinkingIndex(id)
+	for i, row in ipairs(THINK_LEVELS) do
+		if row.id == id then
+			return i
+		end
+	end
+	return 1
+end
+
+local function thinkingMeta(id)
+	return THINK_LEVELS[thinkingIndex(id)]
+end
+
+-- Normalize persisted value
+do
+	local ok = false
+	for _, row in ipairs(THINK_LEVELS) do
+		if row.id == state.thinkingLevel then
+			ok = true
+			break
+		end
+	end
+	if not ok then
+		state.thinkingLevel = "off"
+	end
+end
+
+local thinkChip = Instance.new("TextButton")
+thinkChip.Position = UDim2.new(0, 30, 0.5, -14)
+thinkChip.Size = UDim2.fromOffset(28, 28)
+thinkChip.BackgroundTransparency = 1
+thinkChip.Text = "◈"
+thinkChip.Font = Enum.Font.Gotham
+thinkChip.TextSize = 14
+thinkChip.TextColor3 = C.dim
+thinkChip.AutoButtonColor = true
+thinkChip.Parent = footer
+
+local function refreshThinkChip()
+	local on = state.thinkingLevel ~= "off"
+	thinkChip.TextColor3 = on and C.accent or C.dim
+	local meta = thinkingMeta(state.thinkingLevel)
+	thinkChip.Text = on and "◆" or "◇"
+end
+refreshThinkChip()
+
+-- Model picker trigger (screenshot: logo + label + chevron)
+local modelChip = Instance.new("TextButton")
+modelChip.Position = UDim2.new(0, 60, 0.5, -14)
+modelChip.Size = UDim2.fromOffset(148, 28)
+modelChip.BackgroundTransparency = 1
+modelChip.Text = ""
+modelChip.AutoButtonColor = false
+modelChip.Parent = footer
+
+local mangoMark = Instance.new("Frame")
+mangoMark.Size = UDim2.fromOffset(16, 16)
+mangoMark.Position = UDim2.new(0, 2, 0.5, -8)
+mangoMark.BackgroundColor3 = C.accent
+mangoMark.BorderSizePixel = 0
+mangoMark.Parent = modelChip
+corner(mangoMark, 4)
+
+local mangoMarkLetter = Instance.new("TextLabel")
+mangoMarkLetter.BackgroundTransparency = 1
+mangoMarkLetter.Size = UDim2.fromScale(1, 1)
+mangoMarkLetter.Font = Enum.Font.GothamBold
+mangoMarkLetter.TextSize = 10
+mangoMarkLetter.TextColor3 = C.accentOn
+mangoMarkLetter.Text = "M"
+mangoMarkLetter.Parent = mangoMark
+
+local modelLabel = Instance.new("TextLabel")
+modelLabel.BackgroundTransparency = 1
+modelLabel.Position = UDim2.new(0, 22, 0, 0)
+modelLabel.Size = UDim2.new(1, -36, 1, 0)
+modelLabel.Font = Enum.Font.Gotham
+modelLabel.TextSize = 12
+modelLabel.TextXAlignment = Enum.TextXAlignment.Left
+modelLabel.TextColor3 = C.muted
+modelLabel.Text = "No model"
+modelLabel.Parent = modelChip
+
+local modelChevron = Instance.new("TextLabel")
+modelChevron.BackgroundTransparency = 1
+modelChevron.AnchorPoint = Vector2.new(1, 0)
+modelChevron.Position = UDim2.new(1, 0, 0, 0)
+modelChevron.Size = UDim2.fromOffset(14, 28)
+modelChevron.Font = Enum.Font.Gotham
+modelChevron.TextSize = 10
+modelChevron.TextColor3 = C.dim
+modelChevron.Text = "▾"
+modelChevron.Parent = modelChip
+
+-- Dropdown menu (above composer)
+local modelMenu = Instance.new("ScrollingFrame")
+modelMenu.Visible = false
+modelMenu.AnchorPoint = Vector2.new(0, 1)
+modelMenu.Position = UDim2.new(0, 12, 1, -128)
+modelMenu.Size = UDim2.new(1, -24, 0, 180)
+modelMenu.BackgroundColor3 = C.surface3
+modelMenu.BorderSizePixel = 0
+modelMenu.ScrollBarThickness = 4
+modelMenu.ZIndex = 20
+modelMenu.CanvasSize = UDim2.new(0, 0, 0, 0)
+modelMenu.AutomaticCanvasSize = Enum.AutomaticSize.Y
+modelMenu.Parent = root
+corner(modelMenu, 12)
+local modelMenuStroke = Instance.new("UIStroke")
+modelMenuStroke.Color = C.border
+modelMenuStroke.Thickness = 1
+modelMenuStroke.Parent = modelMenu
+pad(modelMenu, 6, 6, 6, 6)
+
+local modelMenuLayout = Instance.new("UIListLayout")
+modelMenuLayout.Padding = UDim.new(0, 2)
+modelMenuLayout.SortOrder = Enum.SortOrder.LayoutOrder
+modelMenuLayout.Parent = modelMenu
+
+local offlineHint = Instance.new("TextLabel")
+offlineHint.BackgroundTransparency = 1
+offlineHint.Position = UDim2.new(0, 214, 0, 0)
+offlineHint.Size = UDim2.new(1, -300, 1, 0)
+offlineHint.Font = Enum.Font.Gotham
+offlineHint.TextSize = 11
+offlineHint.TextXAlignment = Enum.TextXAlignment.Left
+offlineHint.TextYAlignment = Enum.TextYAlignment.Center
+offlineHint.TextColor3 = C.warn
+offlineHint.Text = ""
+offlineHint.Parent = footer
+
+-- Thinking slider popup
+local thinkPopup = Instance.new("Frame")
+thinkPopup.Visible = false
+thinkPopup.AnchorPoint = Vector2.new(0, 1)
+thinkPopup.Position = UDim2.new(0, 12, 1, -128)
+thinkPopup.Size = UDim2.fromOffset(248, 118)
+thinkPopup.BackgroundColor3 = C.surface2
+thinkPopup.BorderSizePixel = 0
+thinkPopup.ZIndex = 25
+thinkPopup.Parent = root
+corner(thinkPopup, 14)
+local thinkPopupStroke = Instance.new("UIStroke")
+thinkPopupStroke.Color = C.border
+thinkPopupStroke.Thickness = 1
+thinkPopupStroke.Parent = thinkPopup
+pad(thinkPopup, 12, 14, 12, 14)
+
+local thinkTitle = Instance.new("TextLabel")
+thinkTitle.BackgroundTransparency = 1
+thinkTitle.Size = UDim2.new(1, 0, 0, 16)
+thinkTitle.Font = Enum.Font.GothamBold
+thinkTitle.TextSize = 12
+thinkTitle.TextXAlignment = Enum.TextXAlignment.Left
+thinkTitle.TextColor3 = C.text
+thinkTitle.Text = "Thinking · Off"
+thinkTitle.ZIndex = 26
+thinkTitle.Parent = thinkPopup
+
+local thinkDesc = Instance.new("TextLabel")
+thinkDesc.BackgroundTransparency = 1
+thinkDesc.Position = UDim2.new(0, 0, 0, 16)
+thinkDesc.Size = UDim2.new(1, 0, 0, 16)
+thinkDesc.Font = Enum.Font.Gotham
+thinkDesc.TextSize = 11
+thinkDesc.TextXAlignment = Enum.TextXAlignment.Left
+thinkDesc.TextColor3 = C.dim
+thinkDesc.Text = "Just go"
+thinkDesc.ZIndex = 26
+thinkDesc.Parent = thinkPopup
+
+local trackWrap = Instance.new("TextButton")
+trackWrap.BackgroundTransparency = 1
+trackWrap.Position = UDim2.new(0, 0, 0, 42)
+trackWrap.Size = UDim2.new(1, 0, 0, 28)
+trackWrap.Text = ""
+trackWrap.AutoButtonColor = false
+trackWrap.ZIndex = 26
+trackWrap.Parent = thinkPopup
+
+local track = Instance.new("Frame")
+track.AnchorPoint = Vector2.new(0, 0.5)
+track.Position = UDim2.new(0, 0, 0.5, 0)
+track.Size = UDim2.new(1, 0, 0, 12)
+track.BorderSizePixel = 0
+track.BackgroundColor3 = C.accent
+track.ZIndex = 26
+track.Parent = trackWrap
+corner(track, 6)
+
+local trackGrad = Instance.new("UIGradient")
+trackGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 18, 12)),
+	ColorSequenceKeypoint.new(0.4, Color3.fromRGB(61, 42, 24)),
+	ColorSequenceKeypoint.new(0.72, Color3.fromRGB(168, 106, 40)),
+	ColorSequenceKeypoint.new(1, C.accent),
+})
+trackGrad.Parent = track
+
+local trackDash = Instance.new("Frame")
+trackDash.AnchorPoint = Vector2.new(0, 0.5)
+trackDash.Position = UDim2.new(0, 8, 0.5, 0)
+trackDash.Size = UDim2.new(1, -16, 0, 1)
+trackDash.BackgroundColor3 = Color3.fromRGB(12, 10, 8)
+trackDash.BackgroundTransparency = 0.35
+trackDash.BorderSizePixel = 0
+trackDash.ZIndex = 27
+trackDash.Parent = track
+
+-- Approximate dashed look with short ticks
+for i = 0, 11 do
+	local tick = Instance.new("Frame")
+	tick.Size = UDim2.new(0, 4, 1, 0)
+	tick.Position = UDim2.new(i / 11, 0, 0, 0)
+	tick.BackgroundColor3 = Color3.fromRGB(12, 10, 8)
+	tick.BackgroundTransparency = (i % 2 == 0) and 0.25 or 1
+	tick.BorderSizePixel = 0
+	tick.ZIndex = 28
+	tick.Parent = trackDash
+end
+
+local knob = Instance.new("Frame")
+knob.AnchorPoint = Vector2.new(0.5, 0.5)
+knob.Position = UDim2.new(0, 0, 0.5, 0)
+knob.Size = UDim2.fromOffset(18, 18)
+knob.BackgroundColor3 = C.accent
+knob.BorderSizePixel = 0
+knob.ZIndex = 29
+knob.Parent = trackWrap
+corner(knob, 9)
+local knobStroke = Instance.new("UIStroke")
+knobStroke.Color = Color3.fromRGB(240, 192, 120)
+knobStroke.Thickness = 2
+knobStroke.Parent = knob
+
+local labelRow = Instance.new("Frame")
+labelRow.BackgroundTransparency = 1
+labelRow.Position = UDim2.new(0, 0, 0, 74)
+labelRow.Size = UDim2.new(1, 0, 0, 20)
+labelRow.ZIndex = 26
+labelRow.Parent = thinkPopup
+
+local labelButtons = {}
+for i, row in ipairs(THINK_LEVELS) do
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0.25, -2, 1, 0)
+	btn.Position = UDim2.new((i - 1) * 0.25, 1, 0, 0)
+	btn.BackgroundTransparency = 1
+	btn.Font = Enum.Font.Gotham
+	btn.TextSize = 10
+	btn.TextColor3 = C.dim
+	btn.Text = row.label
+	btn.ZIndex = 27
+	btn.AutoButtonColor = true
+	btn.Parent = labelRow
+	labelButtons[i] = btn
+end
+
+local function setThinkingLevel(id, persist)
+	local meta = thinkingMeta(id)
+	state.thinkingLevel = meta.id
+	if persist ~= false then
+		plugin:SetSetting("MangoThinkingLevel", state.thinkingLevel)
+	end
+	thinkTitle.Text = "Thinking · " .. meta.label
+	thinkDesc.Text = meta.desc
+	local idx = thinkingIndex(state.thinkingLevel)
+	local t = (idx - 1) / math.max(1, #THINK_LEVELS - 1)
+	knob.Position = UDim2.new(t, 0, 0.5, 0)
+	local on = state.thinkingLevel ~= "off"
+	knob.BackgroundColor3 = on and C.accent or Color3.fromRGB(26, 18, 8)
+	knobStroke.Color = on and Color3.fromRGB(240, 192, 120) or C.accent
+	for i, btn in ipairs(labelButtons) do
+		btn.TextColor3 = (i == idx) and C.accent or C.dim
+	end
+	refreshThinkChip()
+end
+setThinkingLevel(state.thinkingLevel, false)
+
+local function setThinkingOpen(open)
+	state.thinkingOpen = open and true or false
+	thinkPopup.Visible = state.thinkingOpen
+	if open then
+		state.pickerOpen = false
+		modelMenu.Visible = false
+		modelChevron.Text = "▾"
+	end
+end
+
+local function levelFromX(x)
+	local abs = track.AbsolutePosition.X
+	local w = track.AbsoluteSize.X
+	if w <= 0 then
+		return state.thinkingLevel
+	end
+	local t = math.clamp((x - abs) / w, 0, 1)
+	local idx = math.clamp(math.floor(t * (#THINK_LEVELS - 1) + 0.5) + 1, 1, #THINK_LEVELS)
+	return THINK_LEVELS[idx].id
+end
+
+local draggingThink = false
+trackWrap.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingThink = true
+		setThinkingLevel(levelFromX(input.Position.X), true)
+	end
+end)
+trackWrap.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingThink = false
+	end
+end)
+trackWrap.InputChanged:Connect(function(input)
+	if draggingThink and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		setThinkingLevel(levelFromX(input.Position.X), true)
+	end
+end)
+
+for i, btn in ipairs(labelButtons) do
+	btn.MouseButton1Click:Connect(function()
+		setThinkingLevel(THINK_LEVELS[i].id, true)
+	end)
+end
+
+local micBtn = Instance.new("TextButton")
+micBtn.AnchorPoint = Vector2.new(1, 0.5)
+micBtn.Position = UDim2.new(1, -40, 0.5, 0)
+micBtn.Size = UDim2.fromOffset(28, 28)
+micBtn.BackgroundTransparency = 1
+micBtn.Text = "🎙"
+micBtn.Font = Enum.Font.Gotham
+micBtn.TextSize = 14
+micBtn.TextColor3 = C.dim
+micBtn.AutoButtonColor = true
+micBtn.Parent = footer
 
 local cancelBtn = Instance.new("TextButton")
-cancelBtn.Position = UDim2.new(0, 96, 1, -34)
-cancelBtn.Size = UDim2.new(0, 80, 0, 26)
-cancelBtn.Text = "Cancel"
-cancelBtn.Font = Enum.Font.Gotham
-cancelBtn.TextSize = 13
-cancelBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-cancelBtn.TextColor3 = Color3.new(1, 1, 1)
-cancelBtn.Parent = root
+cancelBtn.AnchorPoint = Vector2.new(1, 0.5)
+cancelBtn.Position = UDim2.new(1, -40, 0.5, 0)
+cancelBtn.Size = UDim2.fromOffset(28, 28)
+cancelBtn.BackgroundColor3 = C.surface3
+cancelBtn.Text = "■"
+cancelBtn.Font = Enum.Font.GothamBold
+cancelBtn.TextSize = 10
+cancelBtn.TextColor3 = C.danger
+cancelBtn.Visible = false
+cancelBtn.AutoButtonColor = true
+cancelBtn.ZIndex = 2
+cancelBtn.Parent = footer
+corner(cancelBtn, 14)
 
-local offlineHint = mkLabel(root, "", 1, -34)
-offlineHint.Position = UDim2.new(0, 188, 1, -34)
-offlineHint.Size = UDim2.new(1, -196, 0, 26)
-offlineHint.TextSize = 11
-offlineHint.TextColor3 = Color3.fromRGB(180, 120, 80)
-offlineHint.Text = ""
+local sendBtn = Instance.new("TextButton")
+sendBtn.AnchorPoint = Vector2.new(1, 0.5)
+sendBtn.Position = UDim2.new(1, 0, 0.5, 0)
+sendBtn.Size = UDim2.fromOffset(32, 32)
+sendBtn.BackgroundColor3 = C.accent
+sendBtn.Text = "↑"
+sendBtn.Font = Enum.Font.GothamBold
+sendBtn.TextSize = 16
+sendBtn.TextColor3 = C.accentOn
+sendBtn.AutoButtonColor = true
+sendBtn.Parent = footer
+corner(sendBtn, 16)
+
+local function setModelLabel(label)
+	state.modelLabel = label or "No model"
+	modelLabel.Text = state.modelLabel
+end
+
+local function clearModelMenu()
+	for _, child in ipairs(modelMenu:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+end
+
+local function setPickerOpen(open)
+	state.pickerOpen = open
+	modelMenu.Visible = open
+	modelChevron.Text = open and "▴" or "▾"
+	if open then
+		setThinkingOpen(false)
+	end
+end
+
+local function selectModel(path, label)
+	if not path or path == "" then
+		return
+	end
+	setPickerOpen(false)
+	if path == state.modelPath then
+		return
+	end
+	appendLine("Switching model → " .. tostring(label), C.dim)
+	local ok, data = httpJson("POST", "/v1/settings", { model_path = path })
+	if not ok then
+		appendLine("Model switch failed: " .. tostring(data), C.danger)
+		return
+	end
+	state.modelPath = path
+	setModelLabel(label or (data and data.model_name) or path)
+	appendLine("Model set: " .. state.modelLabel, C.ok)
+end
+
+local function rebuildModelMenu()
+	clearModelMenu()
+	if #state.models == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.BackgroundTransparency = 1
+		empty.Size = UDim2.new(1, 0, 0, 28)
+		empty.Font = Enum.Font.Gotham
+		empty.TextSize = 12
+		empty.TextColor3 = C.dim
+		empty.Text = "No GGUF models found"
+		empty.ZIndex = 21
+		empty.Parent = modelMenu
+		return
+	end
+	for i, m in ipairs(state.models) do
+		local row = Instance.new("TextButton")
+		row.Size = UDim2.new(1, 0, 0, 30)
+		row.BackgroundColor3 = (m.path == state.modelPath) and Color3.fromRGB(48, 40, 28) or C.surface3
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = true
+		row.Text = ""
+		row.LayoutOrder = i
+		row.ZIndex = 21
+		row.Parent = modelMenu
+		corner(row, 8)
+
+		local mark = Instance.new("Frame")
+		mark.Size = UDim2.fromOffset(14, 14)
+		mark.Position = UDim2.new(0, 8, 0.5, -7)
+		mark.BackgroundColor3 = C.accent
+		mark.BorderSizePixel = 0
+		mark.ZIndex = 22
+		mark.Parent = row
+		corner(mark, 3)
+
+		local lbl = Instance.new("TextLabel")
+		lbl.BackgroundTransparency = 1
+		lbl.Position = UDim2.new(0, 28, 0, 0)
+		lbl.Size = UDim2.new(1, -36, 1, 0)
+		lbl.Font = Enum.Font.Gotham
+		lbl.TextSize = 12
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.TextColor3 = C.text
+		lbl.Text = m.label or m.path
+		lbl.ZIndex = 22
+		lbl.Parent = row
+
+		local path, label = m.path, m.label
+		row.MouseButton1Click:Connect(function()
+			selectModel(path, label)
+		end)
+	end
+end
+
+local function refreshModels()
+	local ok, data = httpJson("GET", "/v1/models")
+	if not ok or type(data) ~= "table" then
+		return
+	end
+	state.models = data.models or {}
+	local current = data.current or ""
+	if current ~= "" then
+		state.modelPath = current
+		local found = nil
+		for _, m in ipairs(state.models) do
+			if m.path == current then
+				found = m.label
+				break
+			end
+		end
+		setModelLabel(found or current:match("([^/\\]+)%.gguf$") or current)
+	elseif #state.models > 0 then
+		setModelLabel(state.models[1].label)
+		state.modelPath = state.models[1].path
+	end
+	if state.pickerOpen then
+		rebuildModelMenu()
+	end
+end
+
+local function setBusyUi(busy)
+	state.busy = busy
+	cancelBtn.Visible = busy
+	micBtn.Visible = not busy
+	sendBtn.Visible = not busy
+	if busy then
+		sendBtn.BackgroundColor3 = C.dim
+	else
+		sendBtn.BackgroundColor3 = C.accent
+	end
+end
 
 local function appendLine(text, color)
 	local line = Instance.new("TextLabel")
 	line.BackgroundTransparency = 1
-	line.Size = UDim2.new(1, -8, 0, 0)
+	line.Size = UDim2.new(1, -4, 0, 0)
 	line.AutomaticSize = Enum.AutomaticSize.Y
-	line.Font = Enum.Font.Code
-	line.TextSize = 12
+	line.Font = Enum.Font.Gotham
+	line.TextSize = 13
 	line.TextXAlignment = Enum.TextXAlignment.Left
 	line.TextYAlignment = Enum.TextYAlignment.Top
 	line.TextWrapped = true
-	line.TextColor3 = color or Color3.fromRGB(200, 200, 200)
+	line.TextColor3 = color or C.muted
 	line.Text = text
 	line.Parent = transcript
 	task.defer(function()
-		transcript.CanvasSize = UDim2.new(0, 0, 0, transcriptLayout.AbsoluteContentSize.Y + 8)
 		transcript.CanvasPosition = Vector2.new(0, math.max(0, transcriptLayout.AbsoluteContentSize.Y))
 	end)
 end
 
 local function setStatus(text, color)
 	statusLabel.Text = text
-	if color then
-		statusLabel.TextColor3 = color
-	end
+	statusLabel.TextColor3 = color or C.dim
 end
 
 local function selectionContext()
@@ -676,14 +1280,14 @@ local function pollEventsLoop()
 					elseif name == "agent.error" then
 						appendLine("Error: " .. tostring(payload.text or payload.error), Color3.fromRGB(220, 100, 100))
 					elseif name == "agent.stopped" then
-						state.busy = false
+						setBusyUi(false)
 						setStatus(
-							state.online and "Host: online" or "Host: offline",
-							state.online and Color3.fromRGB(120, 200, 120) or Color3.fromRGB(200, 120, 80)
+							state.online and "online" or "offline",
+							state.online and C.ok or C.warn
 						)
 					elseif name == "agent.started" then
-						state.busy = true
-						setStatus("Host: running…", Color3.fromRGB(100, 160, 220))
+						setBusyUi(true)
+						setStatus("running…", C.accent)
 					end
 				end
 			else
@@ -698,14 +1302,16 @@ local function refreshHealth()
 	if ok and data and data.status == "ok" then
 		state.online = true
 		offlineHint.Text = ""
-		local sid = data.sidecar and "sidecar ok" or "sidecar down"
+		local sid = data.sidecar and "sidecar" or "no sidecar"
 		local model = data.model_loaded and " · model" or ""
-		setStatus(("Host: online (%s%s)"):format(sid, model), Color3.fromRGB(120, 200, 120))
+		setStatus(("%s%s"):format(sid, model), C.ok)
+		composerStroke.Color = C.border
 		return true
 	end
 	state.online = false
-	setStatus("Host: offline", Color3.fromRGB(200, 120, 80))
-	offlineHint.Text = "Start mango-studio-host"
+	setStatus("offline", C.warn)
+	offlineHint.Text = "Start host"
+	composerStroke.Color = C.warn
 	return false
 end
 
@@ -714,45 +1320,96 @@ local function sendGoal()
 	if not goal or goal:match("^%s*$") then
 		return
 	end
-	if not refreshHealth() then
-		appendLine("Cannot send — host offline. Run: python -m mango_studio_host", Color3.fromRGB(220, 140, 80))
+	if state.busy then
 		return
 	end
-	appendLine("You: " .. goal, Color3.fromRGB(230, 230, 230))
+	if not refreshHealth() then
+		appendLine("Host offline — run MangoStudio.cmd", C.warn)
+		return
+	end
+	appendLine("You: " .. goal, C.text)
 	composer.Text = ""
-	state.busy = true
+	setBusyUi(true)
 	local ok, data = httpJson("POST", "/v1/run", {
 		session_id = state.sessionId,
 		goal = goal,
 		mode = "roblox",
-		thinking_level = "off",
+		thinking_level = state.thinkingLevel or "off",
 		selection = selectionContext(),
 	})
 	if not ok then
-		state.busy = false
-		appendLine("Run failed: " .. tostring(data), Color3.fromRGB(220, 100, 100))
+		setBusyUi(false)
+		appendLine("Run failed: " .. tostring(data), C.danger)
 		return
 	end
-	setStatus("Host: running…", Color3.fromRGB(100, 160, 220))
+	setStatus("running…", C.accent)
 end
 
 sendBtn.MouseButton1Click:Connect(sendGoal)
+composer.FocusLost:Connect(function(enter)
+	if enter and composer.Text ~= "" and not state.busy then
+		-- FocusLost enterPressed varies by Studio version
+	end
+end)
+
 cancelBtn.MouseButton1Click:Connect(function()
 	httpJson("POST", "/v1/cancel", {})
-	state.busy = false
-	appendLine("(cancelled)", Color3.fromRGB(180, 180, 100))
+	setBusyUi(false)
+	appendLine("(cancelled)", C.warn)
+end)
+
+plusBtn.MouseButton1Click:Connect(function()
+	local sel = selectionContext()
+	if sel then
+		appendLine("Context: " .. sel:gsub("\n", ", "), C.dim)
+	else
+		appendLine("Select instances in Explorer to attach as context.", C.dim)
+	end
+end)
+
+modelChip.MouseButton1Click:Connect(function()
+	if state.busy then
+		return
+	end
+	if not state.online then
+		appendLine("Host offline — start MangoStudio.cmd first", C.warn)
+		return
+	end
+	setThinkingOpen(false)
+	if state.pickerOpen then
+		setPickerOpen(false)
+		return
+	end
+	refreshModels()
+	rebuildModelMenu()
+	setPickerOpen(true)
+end)
+
+thinkChip.MouseButton1Click:Connect(function()
+	if state.busy then
+		return
+	end
+	setPickerOpen(false)
+	setThinkingOpen(not state.thinkingOpen)
+end)
+
+micBtn.MouseButton1Click:Connect(function()
+	appendLine("Voice input isn’t available in the Studio plugin yet.", C.dim)
 end)
 
 button.Click:Connect(function()
 	widget.Enabled = not widget.Enabled
 	if widget.Enabled then
 		refreshHealth()
+		refreshModels()
 		pollStudioLoop()
 		pollEventsLoop()
+	else
+		setPickerOpen(false)
+		setThinkingOpen(false)
 	end
 end)
 
--- Health tick
 task.spawn(function()
 	while true do
 		if widget.Enabled then
@@ -762,4 +1419,4 @@ task.spawn(function()
 	end
 end)
 
-appendLine("Mango Studio plugin ready. Start mango-studio-host, then Send a goal.", Color3.fromRGB(140, 160, 180))
+appendLine("Mango ready. Start the host, pick a model, then ask it to build, fix, or explain.", C.dim)

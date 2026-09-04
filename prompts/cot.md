@@ -9,29 +9,34 @@ Context snapshot:
 Previous thought:
 {{prior}}
 
-═══════════════════════════════════════
-CoT CYCLE (single)
-═══════════════════════════════════════
-This is an isolated reasoning cycle. Prefer crisp sentences: observation → diagnosis → next tool.
-CoT JSON output stays JSON-only below.
+<cot_cycle>
+Isolated reasoning. Crisp: observation → diagnosis → next tool.
+Reply JSON only. Sampler forces JSON. No prose. No tool_call tag.
+MUST set next_action to one concrete tool + one concrete target.
+"thought" MUST be natural-language diagnosis (not a copy of next_action).
+Do NOT assume you already know APIs or that packages are installed — re-verify.
+</cot_cycle>
 
-You pick the NEXT tool. Reply with JSON only. The sampler forces JSON. No prose. No tool_call tag.
+<priority>
+First match wins:
+1. Syntax/parse failure in snapshot → write_file COMPLETE on that path ONLY. NEVER insert/edit on broken file. NEVER ask_epistemic for SyntaxError.
+2. Snapshot says BLOCKED / missing packages / needs install → next_action MUST be install_packages OR ask_epistemic OR web_research/fetch_url. NEVER restate the blocker. NEVER write_file until gate clears.
+3. Need understanding → research_codebase (local) or ask_epistemic (third-party).
+4. New file needs third-party not declared → declare_apis (max 5 import names). Stdlib skips this.
+5. Declared third-party but no bind_task_prompt yet → bind_task_prompt (MUST mention install_packages + confirm/permission).
+6. Declared + bound but no usage brief → ask_epistemic.
+7. Packages missing / needs_install → install_packages (confirm) OR web_research/fetch_url. NEVER silent pip.
+8. Else: skeleton exists with gaps → insert_lines (fenced, 8+ lines). New file → write_file. Never ±3 edit_file when handlers/HTTP/send missing.
+</priority>
 
-MUST set next_action to one concrete tool and one concrete target.
-The JSON field "thought" MUST be natural-language diagnosis (not a copy of next_action).
-
-Priority (first match wins):
-1. Snapshot shows a syntax / parse failure → write_file COMPLETE file on that path ONLY. NEVER insert_lines/edit_file on a broken file. NEVER ask_epistemic. Syntax is not an API question.
-2. Need workspace/API understanding → research_codebase (local files) or ask_epistemic (third-party libs).
-3. New file that uses a third-party library not yet declared → declare_apis for those names (pandas, numpy, requests, …). Stdlib does not need this.
-4. Third-party libraries declared but ask_epistemic has not returned a usage brief → ask_epistemic.
-5. Else: if a skeleton file exists and gaps remain → insert_lines (fenced block, 8+ lines of real logic). If new file → write_file. Never ±3-line edit_file when handlers/HTTP/send are missing.
-
-NEVER:
-- Retry a failed edit with the same old_string.
-- Call ask_epistemic to "fix" a SyntaxError.
-- Call ask_epistemic for argparse/csv/pathlib/json.
-- Forward raw CoT intermediates to tools — only compressed conclusions matter for action.
+<never>
+- Retry failed edit with same old_string
+- ask_epistemic to "fix" SyntaxError
+- ask_epistemic for argparse/csv/pathlib/json
+- Skip bind_task_prompt / install permission for third-party deps
+- Thought loops that only restate "write_file was blocked"
+- Assume third-party APIs from memory
+</never>
 
 {{schema}}
 {{mode_hint}}

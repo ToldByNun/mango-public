@@ -31,6 +31,7 @@ class ApiSubAgent:
         max_tokens: int | None = 768,
         max_prompt_chars: int = 16_000,
         on_event: Any | None = None,
+        addon_system_prompt: str | None = None,
     ) -> None:
         self._model_runner = model_runner
         self._web_backend = web_backend
@@ -38,6 +39,7 @@ class ApiSubAgent:
         self._max_tokens = max_tokens
         self._max_prompt_chars = max_prompt_chars
         self._on_event = on_event
+        self._addon_system_prompt = (addon_system_prompt or "").strip()
         self.last_run: Any = None
 
     def run(
@@ -55,10 +57,16 @@ class ApiSubAgent:
         goal = _GOAL.replace("{question}", question.strip()).replace(
             "{cards}", card_text or "(no source loaded)"
         )
+        system = EPISTEMIC_SYSTEM_PROMPT
+        if self._addon_system_prompt:
+            system = (
+                f"{system}\n\n<continuation_system_prompt>\n"
+                f"{self._addon_system_prompt}\n</continuation_system_prompt>"
+            )
         sub = Agent(
             self._model_runner,
             tool_registry=ToolRegistry(),
-            system_prompt=EPISTEMIC_SYSTEM_PROMPT,
+            system_prompt=system,
             max_iterations=min(self._max_iterations, 2),
             max_tokens=self._max_tokens,
             max_prompt_chars=self._max_prompt_chars,

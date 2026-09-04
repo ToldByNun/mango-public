@@ -96,9 +96,31 @@ def run_terminal_command(
     shell: bool = True,
     _context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run a shell command and capture stdout/stderr."""
+    """Run a shell command and capture stdout/stderr (requires UI confirm)."""
     if not command.strip():
         raise ValueError("command must not be empty")
+
+    from mango_tools.confirm_gate import request_confirm
+
+    preview = command.strip()
+    if len(preview) > 180:
+        preview = preview[:177] + "…"
+    allowed = request_confirm(
+        summary=f"Run shell command: {preview}",
+        kind="shell",
+        detail=command.strip(),
+    )
+    if not allowed:
+        return {
+            "command": command,
+            "cwd": cwd,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "user_denied",
+            "timed_out": False,
+            "ok": False,
+            "error": "user_denied",
+        }
 
     cancelled = (_context or {}).get("_cancelled")
 
@@ -118,5 +140,6 @@ def run_terminal_command(
     return {
         "command": command,
         "cwd": str(workdir) if workdir else None,
+        "confirmed": True,
         **result,
     }

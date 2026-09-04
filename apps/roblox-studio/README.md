@@ -16,6 +16,10 @@ Script edits use **`rbx_edit` only** (search/replace, unique match). No full-sou
 
 ## Setup (Windows)
 
+**One double-click:** [`MangoStudio.cmd`](MangoStudio.cmd) installs the local plugin and starts the host. Leave that window open while you use Mango in Studio.
+
+From repo root you can also run `bin\mango-studio.cmd`.
+
 ### 1. Host
 
 From the Mango repo (with your usual agent venv / PYTHONPATH):
@@ -47,7 +51,7 @@ Or use the helper scripts in this folder:
 .\Install-StudioPlugin.ps1
 ```
 
-Restarts Studio (or reload plugins). Enable the **Mango** toolbar button. Accept the HTTP permission prompt for `http://127.0.0.1:17880`.
+Installs as **`MangoPlugin.lua`** (Studio does **not** load `.luau` from the Plugins folder). **Fully quit and reopen Studio**, then use the **Mango** toolbar button under the Plugins tab. Accept the HTTP permission prompt for `http://127.0.0.1:17880`.
 
 Also enable **Game Settings → Security → Allow HTTP Requests** if prompted.
 
@@ -76,9 +80,10 @@ Configure the same `runtime/config.yaml` / `~/.mango/runtime/config.yaml` GGUF p
 
 ```
 apps/roblox-studio/
+  MangoStudio.cmd            # install plugin + start host
   plugin/src/MangoPlugin.luau
   host/python/mango_studio_host/
-  Install-StudioPlugin.ps1
-  Start-StudioHost.ps1
+  Install-StudioPlugin.cmd
+  Start-StudioHost.cmd
   curated/roblox_api_cards.md
 ```

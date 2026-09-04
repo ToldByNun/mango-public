@@ -49,6 +49,9 @@ async function ensureSidecar(): Promise<Sidecar> {
       modelLoaded = false;
     } else if (event.event === "model.loaded") {
       modelLoaded = true;
+    } else if (event.event === "agent.confirm") {
+      void handleAgentConfirm(event);
+      return;
     }
     send("agent:event", event);
   });
@@ -56,6 +59,44 @@ async function ensureSidecar(): Promise<Sidecar> {
   const health = await sidecar.request("health", {});
   sidecarToolsFingerprint = String(health.run_tests_sha256_12 ?? "");
   return sidecar;
+}
+
+async function handleAgentConfirm(event: AgentEvent): Promise<void> {
+  const payload = event.payload || {};
+  const requestId = String(payload.request_id || "");
+  const summary = String(payload.summary || "Allow privileged action?");
+  const detail = String(payload.detail || "").trim();
+  const kind = String(payload.kind || "shell");
+  if (!requestId || !sidecar?.running) return;
+  const result = await dialog.showMessageBox(mainWindow ?? undefined, {
+    type: "warning",
+    buttons: ["Allow", "Deny"],
+    defaultId: 1,
+    cancelId: 1,
+    title: kind === "pip" ? "Install packages?" : "Run command?",
+    message: summary,
+    detail: detail || undefined,
+    noLink: true,
+  });
+  const allowed = result.response === 0;
+  try {
+    await sidecar.request("confirm", { request_id: requestId, allowed }, 30_000);
+  } catch (err) {
+    console.error("[sidecar] confirm reply failed", err);
+  }
+  send("agent:event", {
+    event: "agent.tool",
+    session_id: event.session_id,
+    payload: {
+      id: `confirm-${requestId}`,
+      name: kind === "pip" ? "install_packages" : "run_terminal_command",
+      title: allowed ? `Allowed: ${summary}` : `Denied: ${summary}`,
+      body: detail || undefined,
+      console: true,
+      ok: allowed,
+      streaming: false,
+    },
+  });
 }
 
 function sessionsPath(): string {

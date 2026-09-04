@@ -258,6 +258,38 @@ def test_run_chained_cumulative_visibility_and_summary_only() -> None:
     assert len(seen) == 3
 
 
+def test_run_chained_early_stops_on_echo() -> None:
+    from mango_cot import CoTEngine
+
+    # Step 2 paraphrases step 1 → chain should abort before step 3, then summarize.
+    runner = FakeRunner(
+        outputs=[
+            '{"thought":"write_file blocked because discord and aiohttp were not installed yet","next_action":"write_file","known_facts":["blocked"]}',
+            '{"thought":"The core blocker remains that write_file was blocked because discord and aiohttp were not installed","next_action":"write_file","known_facts":["blocked"]}',
+            '{"thought":"SHOULD_NOT_RUN","next_action":"write_file","known_facts":["x"]}',
+            '{"summary":"Call install_packages now","next_action":"install_packages","verify_plan":["confirm"]}',
+        ]
+    )
+    engine = CoTEngine("Discord bot")
+    summary = engine.run_chained(
+        runner,
+        steps=3,
+        force_next_tools=["install_packages", "ask_epistemic"],
+    )
+    # 2 steps attempted + summarize (step 3 skipped after echo)
+    assert len(runner.prompts) == 3
+    assert "install_packages" in summary.lower() or "NEXT" in summary
+
+
+def test_near_duplicate_detects_paraphrase() -> None:
+    from mango_cot.cot_engine import _near_duplicate
+
+    a = "write_file was blocked because third-party dependencies discord aiohttp were not installed"
+    b = "The core blocker remains that write_file was blocked because third-party dependencies discord aiohttp were not installed"
+    assert _near_duplicate(b, [a]) is True
+    assert _near_duplicate("totally different next step about reading bot.py", [a]) is False
+
+
 def test_chain_summary_drops_schema_placeholders() -> None:
     from mango_cot.cot_engine import _chain_step_text, _chain_summary_text
 

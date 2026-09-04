@@ -81,6 +81,25 @@ class AgentServer:
         # last mutation after agent.stopped.
         self._undo_history: dict[str, set[str]] = {}
         self._undo_workspace: dict[str, str] = {}
+        try:
+            from mango_tools.confirm_gate import set_confirm_emitter
+
+            set_confirm_emitter(self._emit_confirm)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[mango] confirm gate unavailable: {exc}", file=sys.stderr, flush=True)
+
+    def _emit_confirm(self, event: str, payload: dict[str, Any]) -> None:
+        self.emit(event, payload)
+
+    def _confirm(self, params: dict[str, Any]) -> dict[str, Any]:
+        from mango_tools.confirm_gate import resolve_confirm
+
+        request_id = str(params.get("request_id") or "").strip()
+        allowed = bool(params.get("allowed"))
+        if not request_id:
+            raise ServeError("confirm requires request_id")
+        ok = resolve_confirm(request_id, allowed)
+        return {"ok": ok, "request_id": request_id, "allowed": allowed}
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any]:
         method = str(message.get("method") or "")
@@ -110,6 +129,8 @@ class AgentServer:
             return self._continue_stall()
         if method == "undo_last_mutation":
             return self._undo_last_mutation()
+        if method == "confirm":
+            return self._confirm(params)
         if method == "shutdown":
             return self._begin_shutdown()
         raise ServeError(f"unknown method {method}")
@@ -457,7 +478,10 @@ class AgentServer:
                     agent_mode="debug",
                 )
             elif mode == "roblox":
+                from mango_tools.implementations.knowledge_tools import register_knowledge_tools
+                from mango_tools.implementations.lookup_playbook import register_lookup_playbook
                 from mango_tools.implementations.roblox_tools import register_roblox_tools
+                from mango_tools.implementations.rbx_api import register_rbx_api
 
                 orch = Orchestrator(
                     self._runner,
@@ -497,7 +521,6 @@ class AgentServer:
                             "package_source_lookup",
                             "doc_lookup",
                             "web_research",
-                            # Force Studio tools; filesystem is empty shadow workspace.
                             "read_file",
                             "list_dir",
                             "glob_files",
@@ -506,7 +529,13 @@ class AgentServer:
                     ),
                 )
                 register_roblox_tools(orch.agent.tool_registry)
+                register_rbx_api(orch.agent.tool_registry)
+                register_lookup_playbook(orch.agent.tool_registry)
+                register_knowledge_tools(orch.agent.tool_registry)
             else:
+                from mango_tools.implementations.knowledge_tools import register_knowledge_tools
+                from mango_tools.implementations.lookup_playbook import register_lookup_playbook
+
                 orch = Orchestrator(
                     self._runner,
                     workspace=workspace,
@@ -528,6 +557,8 @@ class AgentServer:
                     thinking_level=preset.level,
                     agent_mode="agent",
                 )
+                register_lookup_playbook(orch.agent.tool_registry)
+                register_knowledge_tools(orch.agent.tool_registry)
             self._current_agent = orch.agent
             result = orch.run(goal)
             self.emit(

@@ -2,34 +2,31 @@
 Mode: CHAIN_STEP thought_{{step}} / {{steps}}
 Verify-first strength: {{verify_level}}
 
-═══════════════════════════════════════
-CoT PROTOCOL (this step)
-═══════════════════════════════════════
-You are thought_{{step}} in a multi-step Chain-of-Thought.
+<cot_step>
+You are thought_{{step}} of {{steps}}. Output JSON only.
 
 Rules:
-• thought_1: free opening analysis of the Goal — what is asked, what matters, first hypotheses.
-• thought_2..n: MUST build on ALL prior thoughts below (not only the last one). Deepen, correct,
-  challenge, or refine earlier ideas. Do not ignore earlier steps.
-• Never write tool XML. Never claim you already edited files.
+• thought_1: diagnose Goal + name ONE concrete next tool+target. Do NOT assume APIs/deps are known — re-check with tools.
+• thought_2..n: MUST add a NEW fact OR change next_action. NEVER paraphrase prior thoughts.
+• FORBIDDEN phrases to recycle: "write_file was blocked", "deps were not installed", "declare_apis succeeded", "building on thoughts".
+• If prior already stated a blocker: next_action MUST advance the protocol (install_packages / ask_epistemic / web_research / fetch_url / write_file) — do not restate the blocker.
+• Never write tool XML. Never claim files were already edited.
 • Stay in the Goal's language.
+</cot_step>
 
 Goal:
 {{goal}}
 
-Prior thoughts (cumulative — build on ALL of them):
+Prior thoughts (do NOT copy — advance past them):
 {{prior_steps}}
 
 Workspace snapshot:
 {{snapshot}}
 
-Focus for this step:
-Understand → Inspect → Decide next concrete move → How to verify.
-Do NOT claim the task is finished. Prefer the next diagnosis or action.
 {{verify_hint}}
 
-Reply with JSON only:
+Reply JSON only:
 {"thought":"string","next_action":"string","known_facts":["string"]}
 
-"thought" = natural-language reasoning that explicitly references prior thoughts when step > 1.
-"next_action" = one concrete next move (tool + target, or "summarize" if this is the last step).
+"thought" = ≤2 short sentences of NEW reasoning.
+"next_action" = one concrete tool + target (different from prior next_action when step > 1).

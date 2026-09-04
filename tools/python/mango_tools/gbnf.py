@@ -57,6 +57,10 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "ask_epistemic": ("question",),
     "research_codebase": ("question",),
     "declare_apis": ("libraries",),
+    "bind_task_prompt": ("prompt",),
+    "install_packages": ("packages",),
+    "web_research": ("query",),
+    "fetch_url": ("url",),
     "run_terminal_command": ("command",),
     "measure": ("command",),
     "run_tests": (),
@@ -67,6 +71,11 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "rbx_create": ("parent", "class_name"),
     "rbx_prop": ("property_name",),
     "rbx_delete": ("path",),
+    "rbx_api": ("query",),
+    "lookup_playbook": ("query",),
+    "project_brief": (),
+    "rag_search": ("query",),
+    "vault_open": ("name",),
 }
 
 

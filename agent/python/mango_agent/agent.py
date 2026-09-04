@@ -103,7 +103,25 @@ _PLAN_READONLY = frozenset(
         "glob_files",
     }
 )
-_PLAN_ALLOWED = _PLAN_READONLY | {"declare_apis", "ask_epistemic", "research_codebase"}
+_PLAN_ALLOWED = _PLAN_READONLY | {
+    "declare_apis",
+    "bind_task_prompt",
+    "ask_epistemic",
+    "research_codebase",
+    "install_packages",
+    "web_research",
+    "fetch_url",
+    "lookup_playbook",
+    "project_brief",
+    "rag_search",
+    "vault_open",
+}
+# Sole tool allowed per bootstrap phase (GBNF hard-lock — model cannot see write/edit yet).
+_BOOTSTRAP_SOLE_TOOL = {
+    "declare": "declare_apis",
+    "epistemic": "ask_epistemic",
+    "install": "install_packages",
+}
 _PLAN_RECOVERY_CORE = _PLAN_ALLOWED
 _PROTOCOL_MODES = frozenset({"ask", "plan", "debug", "refactor", "agent", "work", "epistemic_codebase"})
 _TEST_ONLY_LIBS = frozenset(
@@ -247,9 +265,10 @@ _UNFINISHED_ANSWER = re.compile(
     r")\b"
 )
 _CONCURRENCY_IMPL = re.compile(
-    r"\b(threading|asyncio|concurrent\.futures|multiprocessing)\b|"
+    r"\b(threading|concurrent\.futures|multiprocessing)\b|"
     r"\b(Lock|RLock|Semaphore|Event|Condition|Barrier|ThreadPoolExecutor|ProcessPoolExecutor)\s*\("
 )
+# asyncio alone (Discord bots) is NOT a design-review trigger — only shared-lock patterns.
 _CONCURRENCY_TEST = re.compile(
     r"\b(ThreadPoolExecutor|ProcessPoolExecutor|threading\.Thread|concurrent\.futures|"
     r"asyncio\.(gather|wait|run)|Barrier|Thread\s*\()"
@@ -379,6 +398,8 @@ class Agent:
                 web_backend=epistemic_web_backend,
                 max_iterations=self._limits.max_epistemic_iterations,
                 get_deadline=lambda: self._deadline,
+                # Pip installs go through install_packages (UI confirm), not silent pip.
+                auto_install=False,
             )
             try:
                 from mango_epistemic.codebase_research import register_research_codebase
@@ -463,8 +484,12 @@ class Agent:
         self._epistemic_once = False
         self._epistemic_failures = 0
         self._declared_libraries: list[str] = []
+        self._task_prompt_bound = False
+        self._task_prompt_text = ""
+        self._install_resolved = False
         if enable_declare_apis:
             self._register_declare_apis()
+            self._wire_bind_task_prompt()
         self._idle_tool_retries = 0
         self._readonly_iters = 0
         self._stall_key = ""
@@ -598,8 +623,21 @@ class Agent:
             if not names:
                 raise ValueError(
                     "libraries must be a comma-separated list of library or API names, "
-                    'e.g. "pandas, argparse, pathlib"'
+                    'e.g. "discord, httpx" (max 5, only what you will import)'
                 )
+            # Prefer libraries mentioned in the goal when the model dumps a kitchen sink.
+            goal_hits = set(self._goal_third_party_libs())
+            if len(names) > 3 and goal_hits:
+                narrowed = [n for n in names if n.lower().replace(" ", "-") in goal_hits or n.lower() in goal_hits]
+                # also match discord.py → discord
+                if not narrowed:
+                    narrowed = [
+                        n
+                        for n in names
+                        if any(g in n.lower() or n.lower() in g for g in goal_hits)
+                    ]
+                if narrowed:
+                    names = narrowed[:5]
             self._declared_libraries = names
             self._apis_declared_once = True
             return {"ok": True, "libraries": names}
@@ -616,6 +654,40 @@ class Agent:
             },
             required=["libraries"],
         )
+
+    def _wire_bind_task_prompt(self) -> None:
+        """Ensure bind_task_prompt can store into this Agent instance."""
+        try:
+            from mango_tools.implementations.bind_task_prompt import register_bind_task_prompt
+
+            register_bind_task_prompt(self._registry)
+        except Exception:
+            pass
+
+    def _store_task_prompt(self, text: str, libs: list[str] | None = None) -> None:
+        self._task_prompt_text = str(text or "").strip()
+        self._task_prompt_bound = bool(self._task_prompt_text)
+        if libs:
+            # Keep declared libs in sync if bind lists them and declare was sparse.
+            for name in libs:
+                key = str(name).strip()
+                if key and key not in self._declared_libraries:
+                    self._declared_libraries.append(key)
+
+    def _effective_system_prompt(self, base: str | None = None) -> str:
+        body = (base or self._system_prompt or "").strip()
+        addon = (self._task_prompt_text or "").strip()
+        if not addon:
+            return body
+        return f"{body}\n\n<continuation_system_prompt>\n{addon}\n</continuation_system_prompt>"
+
+    def _ensure_default_task_prompt(self) -> None:
+        if self._task_prompt_bound:
+            return
+        from mango_tools.implementations.bind_task_prompt import default_task_prompt
+
+        libs = self._non_stdlib_declared() or self._goal_third_party_libs()
+        self._store_task_prompt(default_task_prompt(libs), libs)
 
     def _should_reset_cache(self, iteration: int) -> bool:
         """A5: reuse KV prefix on follow-up iterations when enabled."""
@@ -658,6 +730,7 @@ class Agent:
         return self._goal_third_party_libs()
 
     def _plan_gate_phase(self) -> str | None:
+        """Deterministic bootstrap: declare → ask_epistemic → install? → write unlocked."""
         if not self._plan_apis_enabled():
             return None
         needed = self._libraries_needing_research()
@@ -667,7 +740,52 @@ class Agent:
             return "declare"
         if self._registry.has("ask_epistemic") and not self._epistemic_once:
             return "epistemic"
+        if not self._install_resolved and self._libs_missing_import():
+            return "install"
         return None
+
+    def _libs_missing_import(self) -> list[str]:
+        """Declared third-party roots that are not importable in this Python."""
+        try:
+            from mango_epistemic.install_deps import can_import
+        except ImportError:
+            return []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for name in self._non_stdlib_declared() or self._goal_third_party_libs():
+            root = self._library_root(name)
+            if not root or root in seen:
+                continue
+            seen.add(root)
+            try:
+                ok = can_import(root)
+            except Exception:
+                ok = False
+            if not ok:
+                missing.append(root)
+        return missing
+
+    def _cot_force_next_tools(self, engine: ContextEngine | None = None) -> list[str]:
+        """Concrete tools CoT must advance to — kills 'write was blocked' echo loops."""
+        phase = self._plan_gate_phase()
+        if phase == "declare":
+            return ["declare_apis"]
+        if phase == "epistemic":
+            return ["ask_epistemic"]
+        if phase == "install":
+            return ["install_packages"]
+        feedback = ""
+        if engine is not None:
+            feedback = str(getattr(engine.state, "verification_feedback", "") or "").lower()
+        if any(k in feedback for k in ("needs_install", "install_packages", "packages missing", "missing locally")):
+            return ["install_packages", "write_file"]
+        if "blocked" in feedback and self._non_stdlib_declared():
+            if not self._epistemic_once:
+                return ["ask_epistemic"]
+            if not self._install_resolved:
+                return ["install_packages"]
+            return ["write_file"]
+        return []
 
     def _create_impl_goal(self) -> bool:
         """True for greenfield create/implement (bots, CLIs, scripts) — not repo patches."""
@@ -688,6 +806,8 @@ class Agent:
             return
         self._epistemic_once = True
         self._apis_declared_once = True
+        self._install_resolved = True
+        self._ensure_default_task_prompt()
         needed = (
             ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries())
             or "the declared libraries"
@@ -756,10 +876,50 @@ class Agent:
             if result.tool_name == "declare_apis":
                 libs = ", ".join(self._impl_declared_libraries() or self._declared_libraries) or "the declared libraries"
                 if self._libraries_needing_research():
+                    # Auto-bind install+permission lock — do not burn a turn on bind_task_prompt.
+                    self._ensure_default_task_prompt()
+                    try:
+                        engine._state.system_prompt = self._effective_system_prompt()
+                    except Exception:
+                        pass
                     engine.set_verification_feedback(feedback("declare", libs=libs))
                 else:
                     self._epistemic_once = True
+                    self._install_resolved = True
+                    self._task_prompt_bound = True
                     engine.set_verification_feedback(feedback("stdlib_ok", libs=libs))
+            elif result.tool_name == "bind_task_prompt":
+                output = result.output if isinstance(result.output, dict) else {}
+                if output.get("bound") or output.get("ok"):
+                    self._task_prompt_bound = True
+                    preview = str(output.get("prompt_preview") or self._task_prompt_text or "")[:200]
+                    try:
+                        engine._state.system_prompt = self._effective_system_prompt()
+                    except Exception:
+                        pass
+                    engine.set_verification_feedback(
+                        feedback("task_prompt_bound", preview=preview or "task lock bound")
+                    )
+            elif result.tool_name == "install_packages":
+                output = result.output if isinstance(result.output, dict) else {}
+                if output.get("ok") and (output.get("installed") or not self._libs_missing_import()):
+                    self._install_resolved = True
+                    engine.set_verification_feedback(
+                        feedback(
+                            "missing_dependency_installed",
+                            pkgs=", ".join(str(x) for x in (output.get("installed") or self._non_stdlib_declared() or [])),
+                            command=str(output.get("command") or ""),
+                        )
+                    )
+                elif output.get("error") == "user_denied":
+                    # User denied pip — unlock write; model may use stdlib/web docs.
+                    self._install_resolved = True
+                    engine.set_verification_feedback(
+                        feedback("install_denied", pkgs=", ".join(self._libs_missing_import() or self._non_stdlib_declared()) or "packages")
+                    )
+                elif output.get("ok"):
+                    # ensure_packages no-op / already present
+                    self._install_resolved = True
             elif result.tool_name == "ask_epistemic":
                 call = getattr(result, "call", None)
                 arguments = getattr(call, "arguments", None) if call is not None else None
@@ -772,42 +932,73 @@ class Agent:
                     or usable_api_signature(output.get("signature"))
                 )
                 blob = f"{output.get('details') or ''} {output.get('error') or ''}".lower()
-                import_miss = output.get("exists") is False and (
-                    "import failed" in blob
-                    or "no module named" in blob
-                    or "install failed" in blob
-                    or output.get("install_ok") is False
+                needs_install = bool(output.get("needs_install"))
+                missing = self._libs_missing_import()
+                import_miss = needs_install or bool(missing) or (
+                    output.get("exists") is False
+                    and (
+                        "import failed" in blob
+                        or "no module named" in blob
+                        or "install failed" in blob
+                        or "packages not installed" in blob
+                        or output.get("install_ok") is False
+                    )
                 )
-                if import_miss:
-                    useful = False
-                elif not useful and output.get("exists") is False and "attribute failed" in blob:
-                    useful = True
-                if useful and self._epistemic_covers_plan(question, output) and not import_miss:
+                # Usage brief can succeed while packages are still missing locally.
+                if useful and self._epistemic_covers_plan(question, output):
                     self._epistemic_once = True
                     self._apis_declared_once = True
                     self._epistemic_failures = 0
+                    if missing or needs_install:
+                        self._install_resolved = False
+                        pkg_label = ", ".join(
+                            str(x) for x in (output.get("needs_install") or missing)
+                        ) or ", ".join(self._non_stdlib_declared())
+                        engine.set_verification_feedback(
+                            feedback("needs_install_packages", pkgs=pkg_label)
+                        )
+                    else:
+                        self._install_resolved = True
+                        engine.set_verification_feedback(feedback("epistemic_ok"))
+                elif not useful and output.get("exists") is False and "attribute failed" in blob:
+                    self._epistemic_once = True
+                    self._install_resolved = not bool(missing)
                     engine.set_verification_feedback(feedback("epistemic_ok"))
                 else:
                     self._epistemic_failures = int(getattr(self, "_epistemic_failures", 0) or 0) + 1
                     needed = ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries()) or "the declared libraries"
-                    # Soft-lock forever is the Discord-bot thrash. After two failed
-                    # lookups/installs, clear the gate and let the model write.
                     if self._epistemic_failures >= 2:
                         self._epistemic_once = True
                         self._apis_declared_once = True
-                        engine.set_verification_feedback(
-                            feedback("epistemic_give_up", needed=needed)
-                        )
-                    elif import_miss or (
+                        # Still require install if imports missing.
+                        if missing:
+                            self._install_resolved = False
+                            engine.set_verification_feedback(
+                                feedback("needs_install_packages", pkgs=", ".join(missing))
+                            )
+                        else:
+                            self._install_resolved = True
+                            self._ensure_default_task_prompt()
+                            engine.set_verification_feedback(
+                                feedback("epistemic_give_up", needed=needed)
+                            )
+                    elif import_miss or needs_install or (
                         output.get("install_command") and not output.get("install_ok", True)
                     ):
-                        pkgs = output.get("failed") or output.get("installed") or []
+                        self._epistemic_once = True  # brief attempted; next sole tool = install
+                        self._install_resolved = False
+                        pkgs = (
+                            output.get("needs_install")
+                            or missing
+                            or output.get("failed")
+                            or output.get("installed")
+                            or []
+                        )
                         pkg_label = ", ".join(str(x) for x in pkgs) if isinstance(pkgs, list) else needed
                         engine.set_verification_feedback(
                             feedback(
-                                "install_failed",
+                                "needs_install_packages",
                                 pkgs=pkg_label or needed,
-                                command=str(output.get("install_command") or f"pip install {needed}"),
                             )
                         )
                     else:
@@ -958,7 +1149,7 @@ class Agent:
 
         engine = ContextEngine(
             task,
-            system_prompt=system_prompt or self._system_prompt,
+            system_prompt=self._effective_system_prompt(system_prompt or self._system_prompt),
             tool_instruction=tool_call_instruction(),
             tools=[]
             if self._plan_apis_first
@@ -1012,6 +1203,9 @@ class Agent:
         self._epistemic_failures = 0
         self._research_done = set()
         self._declared_libraries = []
+        self._task_prompt_bound = False
+        self._task_prompt_text = ""
+        self._install_resolved = False
         self._idle_tool_retries = 0
         self._readonly_iters = 0
         self._stall_key = ""
@@ -1255,6 +1449,16 @@ class Agent:
                 )
                 # chain_steps + 1 summarize call (do not shadow AgentStep list `steps`)
                 n_chain = min(self._thinking.chain_steps, max(0, chain_budget - 1))
+                force_tools = self._cot_force_next_tools(engine)
+                # Blocker / install pending: short CoT — long chains just echo the blocker.
+                if force_tools:
+                    n_chain = min(n_chain, 2)
+                feedback_blob = str(getattr(engine.state, "verification_feedback", "") or "").lower()
+                if any(
+                    k in feedback_blob
+                    for k in ("blocked", "install_packages", "needs install", "missing")
+                ):
+                    n_chain = min(n_chain, 1) if force_tools else min(n_chain, 2)
                 if n_chain > 0:
                     cycle_started = time.monotonic()
                     hint = verify_hint_for(self._thinking.verify_strength)
@@ -1262,6 +1466,14 @@ class Agent:
                         hint = (
                             (hint + " ") if hint else ""
                         ) + "Prior verification failed. Focus on Fix → Verify again."
+                    if force_tools:
+                        hint = (
+                            (hint + " ") if hint else ""
+                        ) + (
+                            "Do NOT restate blockers. next_action MUST be one of: "
+                            + ", ".join(force_tools)
+                            + "."
+                        )
 
                     def _on_chain_step(step_i: int, text: str) -> None:
                         visible, _ = self._visible_thought(_human_part(text))
@@ -1282,6 +1494,7 @@ class Agent:
                             max_tokens=self._thinking.cot_extended,
                             on_step=_on_chain_step,
                             should_cancel=self._cancelled,
+                            force_next_tools=force_tools or None,
                         )
                     except Exception as exc:  # noqa: BLE001
                         self._trace(f"iter {iteration} chained cot failed: {exc}")
@@ -1300,6 +1513,8 @@ class Agent:
                     summary = final_summary or compress_reasoning_state(
                         cot.state, max_chars=summary_limit
                     )
+                    if force_tools and not any(t in summary.lower() for t in force_tools):
+                        summary = f"NEXT TOOL MUST be {force_tools[0]}.\n{summary}".strip()
                     if self._thinking.verify_strength >= 1:
                         vf = verify_hint_for(self._thinking.verify_strength)
                         if vf:
@@ -1308,6 +1523,7 @@ class Agent:
                     self._trace(
                         f"iter {iteration} chained cot steps={n_chain}"
                         f" level={self._thinking.level}"
+                        f" force={force_tools!r}"
                         f" summary={summary.replace(chr(10), ' ')[:220]!r}"
                     )
                     if final_summary:
@@ -3100,8 +3316,12 @@ class Agent:
             return "edit_file"
         if not self._require_tools:
             return None
-        # Plan/API gate owns the turn — never sole-force write/edit until declare+epistemic clear.
-        if self._plan_gate_phase() is not None:
+        # Bootstrap sole-tool lock: model cannot emit write/edit until declare→epistemic→install done.
+        phase = self._plan_gate_phase()
+        if phase is not None:
+            sole = _BOOTSTRAP_SOLE_TOOL.get(phase)
+            if sole and sole in enabled:
+                return sole
             return None
         if self._patch_repo_mode():
             if self._prefer_read_file and self._forced_read_path and "read_file" in enabled:
@@ -3276,9 +3496,11 @@ class Agent:
 
         phase = self._plan_gate_phase()
         if phase == "declare":
-            _add("declare_apis", "ask_epistemic", "research_codebase", "read_file", "search_code")
+            _add("declare_apis")
         elif phase == "epistemic":
-            _add("ask_epistemic", "research_codebase", "read_file", "search_code")
+            _add("ask_epistemic")
+        elif phase == "install":
+            _add("install_packages")
         elif self._resolve_coding_phase() in CODING_PHASES:
             # Attention on code: the phase dictates the single next mutation tool.
             coding = self._resolve_coding_phase()
@@ -3633,26 +3855,15 @@ class Agent:
             names = ["write_file", *[name for name in names if name != "write_file"]]
         phase = self._plan_gate_phase()
         if phase == "declare" and "declare_apis" in names:
-            names = [
-                "declare_apis",
-                *[
-                    name
-                    for name in names
-                    if name in {"ask_epistemic", "research_codebase"} or name in _PLAN_READONLY
-                ],
-            ]
+            names = ["declare_apis"]
         elif phase == "epistemic" and "ask_epistemic" in names:
-            ordered = ["ask_epistemic", "research_codebase"]
-            ordered.extend(name for name in names if name in _PLAN_READONLY)
-            seen: set[str] = set()
-            names = []
-            for name in ordered:
-                if name not in seen and name in set(self._enabled_registry_names()):
-                    seen.add(name)
-                    names.append(name)
+            names = ["ask_epistemic"]
+        elif phase == "install" and "install_packages" in names:
+            names = ["install_packages"]
         if (
             self._plan_apis_enabled()
             and self._epistemic_once
+            and self._install_resolved
             and not self._acted_once
             and "write_file" in names
         ):
@@ -4705,6 +4916,9 @@ class Agent:
                 )
                 if phase == "declare":
                     err = feedback("blocked_declare")
+                elif phase == "install":
+                    libs = ", ".join(self._libs_missing_import() or self._non_stdlib_declared()) or "packages"
+                    err = feedback("blocked_install", libs=libs)
                 else:
                     libs = ", ".join(self._plan_coverage_libraries() or self._impl_declared_libraries()) or "the declared libraries"
                     err = feedback("blocked_epistemic", libs=libs)
@@ -5387,7 +5601,8 @@ class Agent:
         # ask_epistemic is how fail-open (2 install misses) clears the Discord lock.
         if call.name == "ask_epistemic" and self._plan_gate_phase() == "epistemic":
             return None
-
+        if call.name == "install_packages" and self._plan_gate_phase() == "install":
+            return None
         # Green pytest already proved tests — repeating run_tests is the wordstats loop.
         if call.name == "run_tests" and (
             getattr(self, "_pytest_green", False) or self._ran_tests_ok
@@ -5683,6 +5898,10 @@ class Agent:
         tool_results: list[ToolResult],
         snapshots: dict[str, str],
     ) -> None:
+        # Greenfield Discord/CLI bots: asyncio alone is not a lock-design problem.
+        # Arming review forced endless read→edit thrash on correct bots.
+        if self._create_impl_goal() or self._greenfield_run:
+            return
         for abs_path in self._mutated_python_paths(tool_results):
             if _looks_like_test_path(abs_path):
                 continue
@@ -5806,18 +6025,26 @@ class Agent:
 
     def _ensure_missing_deps(self, modules: list[str]) -> dict[str, Any]:
         try:
-            from mango_epistemic.install_deps import ensure_packages
+            from mango_tools.implementations.install_packages import install_packages
         except ImportError:
             return {"ok": False, "installed": [], "failed": list(modules), "command": None}
-        info = ensure_packages(modules)
-        if info.get("command"):
+        info = install_packages(", ".join(modules))
+        if info.get("error") == "user_denied":
+            return {
+                "ok": False,
+                "installed": [],
+                "failed": list(modules),
+                "command": None,
+                "error": "user_denied",
+            }
+        if info.get("command") or info.get("confirmed"):
             pkgs = info.get("installed") or info.get("failed") or modules
             label = ", ".join(str(x) for x in pkgs)
             self._emit(
                 agent_events.TOOL,
                 {
                     "id": f"tool-pip-dep-{self._run_id}-{self._current_iteration}",
-                    "name": "run_terminal_command",
+                    "name": "install_packages",
                     "title": (
                         f"Installed {label}"
                         if info.get("ok") and info.get("installed")
@@ -6968,6 +7195,9 @@ class Agent:
         impl = self._plan_coverage_libraries()
         if impl:
             ctx["declared_libraries"] = impl
+        ctx["_bind_task_prompt"] = self._store_task_prompt
+        if self._task_prompt_text:
+            ctx["task_prompt"] = self._task_prompt_text
         if self._grounded_edits_enabled():
             ctx["require_grounded_edits"] = True
             ctx["files_read"] = tuple(self._files_read)
@@ -7166,6 +7396,8 @@ class Agent:
                 "search_code",
                 "codebase_lookup",
                 "run_terminal_command",
+                "install_packages",
+                "fetch_url",
                 "measure",
                 "ask_epistemic",
                 "declare_apis",
@@ -7717,17 +7949,28 @@ def _parse_libraries(raw: str) -> list[str]:
         # Strip parentheticals: "requests (for LM Studio HTTP API)" → "requests"
         name = re.sub(r"\([^)]*\)", "", part).strip().strip("'\"")
         name = re.sub(r"\s+", " ", name).strip()
-        if not name:
+        # Drop truncated junk from model spam: "rich-", "http-"
+        if name.endswith(("-", "_", ".")) or len(name) < 2:
+            continue
+        name = name.rstrip("-_. ")
+        if not name or len(name) < 2:
+            continue
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_.+-]*$", name):
             continue
         # Normalize pip-style names that are not import names.
         key = name.lower().replace(" ", "-")
         if key == "discord.py":
             name = "discord"
             key = "discord"
+        if key in {"dotenv"}:
+            name = "python-dotenv"
+            key = "python-dotenv"
         if key in seen:
             continue
         seen.add(key)
         names.append(name)
+        if len(names) >= 5:
+            break
     return names
 
 

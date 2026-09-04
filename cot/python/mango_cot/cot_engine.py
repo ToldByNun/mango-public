@@ -160,23 +160,35 @@ class CoTEngine:
         max_tokens: int = 256,
         on_step: Callable[[int, str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        force_next_tools: list[str] | None = None,
     ) -> str:
         """Cumulative CoT chain: step N sees steps 1..N-1; final call summarizes for the main agent.
 
         Returns the final summary string only (never the raw step dump).
+        Early-stops when steps paraphrase each other (SLM echo loops).
         """
         n = max(0, int(steps))
         if n <= 0:
             return ""
 
         step_texts: list[str] = []
+        next_actions: list[str] = []
         snapshot = _context_snapshot(context_state) if context_state is not None else "(no context yet)"
         level = str(verify_level or "think")
+        forced = [str(x).strip() for x in (force_next_tools or []) if str(x).strip()]
+        echo_streak = 0
 
         for index in range(1, n + 1):
             if should_cancel is not None and should_cancel():
                 break
             prior = _format_prior_steps(step_texts)
+            step_hint = _chain_step_hint(
+                base_hint=verify_hint or "",
+                step_index=index,
+                prior_texts=step_texts,
+                prior_actions=next_actions,
+                force_next_tools=forced,
+            )
             prompt = render_system_prompt(
                 "cot_chain_step",
                 marker=REASONING_MARKER,
@@ -186,7 +198,7 @@ class CoTEngine:
                 goal=self.state.goal,
                 prior_steps=prior,
                 snapshot=snapshot,
-                verify_hint=verify_hint or "",
+                verify_hint=step_hint,
             )
             completion = model_runner.complete(
                 prompt,
@@ -200,21 +212,33 @@ class CoTEngine:
             raw = str(getattr(completion, "text", completion) or "")
             payload = parse_reasoning_payload(raw)
             text = _chain_step_text(payload, raw)
-            # A repeated step adds nothing and would push the real content out of
-            # the next step's prompt.
-            fresh = bool(text) and text not in step_texts
+            action = _as_text(payload.get("next_action"))
+            # Exact or near-duplicate steps add nothing — abort the echo loop.
+            fresh = bool(text) and text not in step_texts and not _near_duplicate(text, step_texts)
+            action_fresh = bool(action) and action.lower() not in {a.lower() for a in next_actions}
             if fresh:
                 step_texts.append(text)
+                if action:
+                    next_actions.append(action)
+                echo_streak = 0
+            else:
+                echo_streak += 1
             self._cycle_counter += 1
             self.trace.add(
                 need=ReasoningNeed.EXTENDED,
                 prompt=prompt,
                 raw=raw,
-                summary=text[:240],
+                summary=(text or raw)[:240],
                 cycle=self._cycle_counter,
             )
             if on_step is not None and fresh:
                 on_step(index, text)
+            # Two echo steps in a row (or same next_action thrice) → stop burning tokens.
+            if echo_streak >= 1 and index >= 2:
+                break
+            if not action_fresh and index >= 2 and len(next_actions) >= 2:
+                if next_actions[-1].lower() == next_actions[-2].lower():
+                    break
 
         if not step_texts:
             return ""
@@ -223,11 +247,19 @@ class CoTEngine:
             return _one_line(step_texts[-1], 400)
 
         all_steps = _format_prior_steps(step_texts)
+        summarize_hint = ""
+        if forced:
+            summarize_hint = (
+                " next_action MUST be exactly one of: "
+                + ", ".join(forced[:4])
+                + ". Do NOT restate blockers."
+            )
         summary_prompt = render_system_prompt(
             "cot_chain_summarize",
             marker=REASONING_MARKER,
             goal=self.state.goal,
             all_steps=all_steps,
+            summarize_hint=summarize_hint,
         )
         completion = model_runner.complete(
             summary_prompt,
@@ -241,6 +273,12 @@ class CoTEngine:
         raw = str(getattr(completion, "text", completion) or "")
         payload = parse_reasoning_payload(raw)
         summary = _chain_summary_text(payload, step_texts)
+        # If summarize also echoed a blocker without a tool, inject forced next.
+        if forced and not _mentions_any_tool(summary, forced):
+            summary = (
+                f"{summary} | next={forced[0]}" if summary else f"next={forced[0]}"
+            ).strip()
+            self.state.next_action = forced[0]
         self._cycle_counter += 1
         self.trace.add(
             need=ReasoningNeed.EXTENDED,
@@ -251,6 +289,8 @@ class CoTEngine:
         )
         if summary:
             self.state.next_action = _as_text(payload.get("next_action")) or self.state.next_action
+            if forced and not _mentions_any_tool(self.state.next_action, forced):
+                self.state.next_action = forced[0]
             self.state.append_unique("cycle_summaries", [summary], cap=8)
             facts = _as_str_list(payload.get("verify_plan"))
             if facts:
@@ -265,6 +305,69 @@ def _format_prior_steps(steps: list[str]) -> str:
     for i, text in enumerate(steps, start=1):
         lines.append(f"[CoT{i}] {_one_line(text, 600)}")
     return "\n".join(lines)
+
+
+def _tokenize(text: str) -> set[str]:
+    return {tok for tok in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split() if len(tok) > 2}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _near_duplicate(text: str, prior: list[str], *, threshold: float = 0.72) -> bool:
+    tokens = _tokenize(text)
+    if len(tokens) < 6:
+        return False
+    for prev in prior:
+        if _jaccard(tokens, _tokenize(prev)) >= threshold:
+            return True
+    return False
+
+
+def _mentions_any_tool(text: str, tools: list[str]) -> bool:
+    low = (text or "").lower()
+    return any(t.lower() in low for t in tools)
+
+
+def _chain_step_hint(
+    *,
+    base_hint: str,
+    step_index: int,
+    prior_texts: list[str],
+    prior_actions: list[str],
+    force_next_tools: list[str],
+) -> str:
+    parts: list[str] = []
+    if base_hint.strip():
+        parts.append(base_hint.strip())
+    blob = " ".join(prior_texts).lower()
+    if step_index == 1:
+        parts.append(
+            "Do NOT assume you already know APIs or that deps are installed. "
+            "Name ONE concrete next tool+target to verify."
+        )
+    else:
+        parts.append(
+            "FORBIDDEN: paraphrase prior thoughts. Add ONE new fact OR change next_action. "
+            "If you catch yourself rewriting 'write_file was blocked', STOP — pick the next protocol tool."
+        )
+    if any(k in blob for k in ("blocked", "not installed", "missing", "declare_apis", "bind_task")):
+        parts.append(
+            "Blocker already known. Do NOT restate it. next_action MUST advance: "
+            "install_packages / ask_epistemic / web_research / fetch_url / write_file."
+        )
+    if force_next_tools:
+        parts.append(
+            "REQUIRED next_action tool (pick one): " + ", ".join(force_next_tools[:4]) + "."
+        )
+    if prior_actions:
+        parts.append("Do NOT repeat next_action=" + prior_actions[-1] + ".")
+    return " ".join(parts)
 
 
 def _chain_step_text(payload: dict[str, Any], raw: str) -> str:

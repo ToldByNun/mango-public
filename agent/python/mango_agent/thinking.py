@@ -26,9 +26,10 @@ class ThinkingPreset:
 
 _PRESETS: dict[str, ThinkingPreset] = {
     "off": ThinkingPreset("off", 0, 0, 0, 128, 128, 192, 2, 280, 280),
+    # Cap chain length: SLMs echo blockers across long chains.
     "think": ThinkingPreset("think", 2, 3, 1, 256, 192, 256, 6, 800, 280),
-    "deep": ThinkingPreset("deep", 4, 6, 2, 384, 256, 384, 10, 1400, 420),
-    "max": ThinkingPreset("max", 6, 10, 3, 512, 384, 512, 10, 1400, 560),
+    "deep": ThinkingPreset("deep", 3, 5, 2, 384, 256, 384, 10, 1400, 420),
+    "max": ThinkingPreset("max", 3, 6, 3, 512, 384, 512, 10, 1400, 560),
 }
 
 
@@ -46,16 +47,23 @@ def thinking_preset(raw: str | None) -> ThinkingPreset:
 def verify_hint_for(strength: int) -> str:
     if strength <= 0:
         return ""
+    base_anti = (
+        "Do not assume APIs or installs from memory — re-verify with tools. "
+        "Never paraphrase 'write_file was blocked'; advance to the next protocol tool."
+    )
     if strength == 1:
         return (
-            "Soft verify-first: inspect before edit; run/observe after changes when possible."
+            "Soft verify-first: inspect before edit; run/observe after changes when possible. "
+            + base_anti
         )
     if strength == 2:
         return (
             "Strong verify-first: inspect → implement → run → observe → verify before finishing. "
-            "Writing code is not completion."
+            "Writing code is not completion. "
+            + base_anti
         )
     return (
         "Strict verify-first: Understand → Inspect → Implement → Run → Observe → Verify → Fix → "
-        "Verify again. Never finish on generation alone; re-verify after every fix."
+        "Verify again. Never finish on generation alone; re-verify after every fix. "
+        + base_anti
     )

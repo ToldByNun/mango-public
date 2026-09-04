@@ -8,9 +8,11 @@ import time
 import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from mango_studio_host.models import format_model_label, list_gguf_models
 from mango_studio_host.paths import find_repo_root, runtime_config_path, studio_workspace
 from mango_studio_host.rojo import find_rojo_project, rojo_tree_root
 from mango_studio_host.sidecar_client import SidecarClient
@@ -175,7 +177,41 @@ def make_handler(state: HostState):
                             settings.update(remote)
                         except Exception as exc:  # noqa: BLE001
                             settings["sidecar_error"] = str(exc)
+                    elif not settings.get("model_path"):
+                        # Sidecar not up yet — still expose config path label
+                        try:
+                            from mango_runtime.config import load_config_file
+
+                            cfg = load_config_file(state.config_path, require_model=False)
+                            settings["model_path"] = cfg.model.path
+                            settings["model_name"] = (
+                                format_model_label(Path(cfg.model.path).stem)
+                                if cfg.model.path
+                                else "No model"
+                            )
+                        except Exception:
+                            pass
                     _json_response(self, 200, settings)
+                    return
+                if path == "/v1/models":
+                    models = list_gguf_models(state.repo_root)
+                    current = ""
+                    try:
+                        from mango_runtime.config import load_config_file
+
+                        cfg = load_config_file(state.config_path, require_model=False)
+                        current = cfg.model.path or ""
+                    except Exception:
+                        current = str(state.settings.get("model_path") or "")
+                    if current and not any(m["path"] == current for m in models):
+                        models.insert(
+                            0,
+                            {
+                                "path": current,
+                                "label": format_model_label(Path(current).stem),
+                            },
+                        )
+                    _json_response(self, 200, {"models": models, "current": current})
                     return
                 if path == "/v1/events":
                     since = int((qs.get("since") or ["0"])[0] or 0)
@@ -232,12 +268,25 @@ def make_handler(state: HostState):
                         if key in body:
                             state.settings[key] = body[key]
                     if "model_path" in body and str(body["model_path"]).strip():
-                        state.ensure_sidecar().request(
+                        path_str = str(body["model_path"]).strip()
+                        sidecar = state.ensure_sidecar()
+                        result = sidecar.request(
                             "set_model_path",
-                            {"path": str(body["model_path"])},
+                            {"path": path_str},
                             timeout_s=30.0,
                         )
-                        state.settings["model_path"] = str(body["model_path"])
+                        state.settings["model_path"] = path_str
+                        state.settings["model_name"] = format_model_label(Path(path_str).stem)
+                        _json_response(
+                            self,
+                            200,
+                            {
+                                **state.settings,
+                                **(result if isinstance(result, dict) else {}),
+                                "ok": True,
+                            },
+                        )
+                        return
                     _json_response(self, 200, state.settings)
                     return
 

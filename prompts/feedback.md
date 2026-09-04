@@ -8,7 +8,7 @@ Placeholders look like `{{name}}`.
 This is a follow-up. Read the current implementation AND existing tests first. ask_epistemic must look up concrete symbols (package + symbol), not a whole module. Then edit. Re-read the result and ask whether the change still preserves invariants (especially lock granularity). Then run_tests. You are not done until tests pass AND the design still makes sense.
 
 # run.declare_first
-If you will use a third-party library (pandas, numpy, requests, …), first call declare_apis listing those names, then ask_epistemic. Stdlib (argparse, pathlib, json, csv, …) does not need ask_epistemic — write_file is allowed immediately.
+Third-party libs: declare_apis (sole) → ask_epistemic (sole) → install_packages if missing (sole, confirm popup) → write_file. Stdlib skips the gate.
 
 # run.tests_deadline
 Tests never passed within iteration limit.
@@ -114,22 +114,34 @@ You have only inspected the repo. Apply a minimal edit_file fix now. Use a short
 You have only inspected the repo. Apply a minimal edit_file fix now. Use a short unique old_string and new_string; do not rewrite whole files.
 
 # _note_plan_progress.declare
-Third-party libraries recorded: {{libs}}. NEXT TOOL MUST be ask_epistemic (implementation APIs, not unittest/pytest, not stdlib). Then write_file.
+Third-party libraries recorded: {{libs}}. NEXT TOOL MUST be ask_epistemic (sole tool this turn). Then install_packages if imports are missing.
+
+# _note_plan_progress.task_prompt_bound
+Continuation system prompt bound. Preview: {{preview}}. NEXT: ask_epistemic for usage; if packages missing → install_packages (confirm popup).
 
 # _note_plan_progress.stdlib_ok
 Stdlib only ({{libs}}). Skip ask_epistemic. NEXT you may write_file. Then wait for the syntax compile check.
 
 # _note_plan_progress.epistemic_ok
-API research done. Use the usage brief (imports and real calls). NEXT you may write_file. Then wait for the syntax compile check. Compile does not run the script.
+API research done AND packages are importable. NEXT tool MUST be write_file (complete file). Do not call edit_file/read_file first.
 
 # _note_plan_progress.epistemic_retry
 ask_epistemic must return a usage brief for {{needed}}. unittest/pytest do not count. Then write_file — do not ask again.
 
 # _note_plan_progress.epistemic_give_up
-ask_epistemic failed twice for {{needed}}. Gate cleared. NEXT tool MUST be write_file using known APIs (stdlib urllib if requests missing). Do not call ask_epistemic again.
+ask_epistemic failed twice for {{needed}}. Gate cleared. NEXT: install_packages if still missing (confirm popup), else write_file using known APIs. Do not call ask_epistemic again.
 
 # _note_plan_progress.install_failed
-Could not install {{pkgs}}. Command: {{command}}. Fix the package name or install manually, then ask_epistemic again.
+Could not install {{pkgs}}. Command: {{command}}. NEXT: install_packages with corrected names (confirm popup), or write_file with available APIs.
+
+# _note_plan_progress.needs_install_packages
+Packages missing locally: {{pkgs}}. NEXT TOOL MUST be install_packages (user confirm popup) — this is the ONLY allowed tool. On Deny → write continues unlocked. NEVER skip this step. NEVER write_file yet.
+
+# _note_plan_progress.install_denied
+User denied install for {{pkgs}}. Write unlocked. NEXT: write_file (use stdlib urllib if needed). Do NOT retry the same install.
+
+# _note_plan_progress.missing_dependency_installed
+Installed {{pkgs}} ({{command}}). NEXT tool MUST be write_file (complete implementation). Do not thrash with read/edit.
 
 # _feedback_failed_tools.retry
 Retry with ALL required keys. edit_file needs path, old_string, new_string. Copy old_string exactly from an implementation file, including whitespace. Do not edit testing/ or test_*.py unless the bug is in the test.
@@ -138,10 +150,16 @@ Retry with ALL required keys. edit_file needs path, old_string, new_string. Copy
 edit_file failed repeatedly or the tool JSON was invalid. NEXT tool MUST be write_file with the FULL current file plus your change. Do not call edit_file again until write_file succeeds.
 
 # _execute_tool_calls.blocked_declare
-BLOCKED by the runner. Call declare_apis first for third-party libraries (pandas, numpy, …). Stdlib-only files may write_file without this. Then ask_epistemic. write_file is rejected until both succeed for those libraries.
+BLOCKED by the runner. The ONLY allowed tool is declare_apis (max 5 libs you will import). write_file/edit_file are not available yet.
+
+# _execute_tool_calls.blocked_bind_task_prompt
+BLOCKED by the runner. Call bind_task_prompt now for {{libs}}. Write a short continuation system prompt that MUST include install_packages + user confirm/permission. write_file is rejected until that bind succeeds.
 
 # _execute_tool_calls.blocked_epistemic
-BLOCKED by the runner. Call ask_epistemic now for the third-party APIs: {{libs}}. Stdlib and unittest/pytest do not count. write_file is rejected until that call returns a usage brief.
+BLOCKED by the runner. The ONLY allowed tool is ask_epistemic for: {{libs}}. write_file/edit_file are not available yet.
+
+# _execute_tool_calls.blocked_install
+BLOCKED by the runner. The ONLY allowed tool is install_packages for: {{libs}} (user confirm popup). write_file is locked until install succeeds or the user denies.
 
 # _execute_tool_calls.blocked_edit_read
 BLOCKED by the runner. Do not edit yet. Call read_file on the implementation file, copy old_string verbatim, then edit_file.
@@ -192,7 +210,7 @@ Tests {{hint}} (attempt {{attempt}}/{{attempts}}, {{remaining}} left). Fix the f
 Tests {{hint}} (attempt {{attempt}}/{{attempts}}, {{remaining}} left). Do NOT restate the bug in thought. NEXT tool MUST be read_file path="{{path}}" (copy exact source), then edit_file with a short old_string from that file (e.g. call register in __init__). Then run_tests.{{extra}}{{detail}}
 
 # missing_dependency
-Tests failed because a package is missing: {{pkgs}}. Do NOT rewrite unrelated files. Command: {{command}}. NEXT: after install, run_tests again. Prefer mocking discord in unit tests or lazy-importing it inside the bot entrypoint.
+Tests failed because a package is missing: {{pkgs}}. Do NOT rewrite unrelated files. NEXT TOOL MUST be install_packages (confirm popup). Command hint: {{command}}. On Deny → mock/lazy-import. Then run_tests.
 
 # missing_dependency_installed
 Installed {{pkgs}} ({{command}}). Do NOT thrash other files. NEXT tool MUST be run_tests.

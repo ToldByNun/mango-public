@@ -398,7 +398,21 @@ function ThinkingPicker({
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
   const active = value !== "off";
+  const index = Math.max(0, THINKING_OPTIONS.findIndex((o) => o.id === value));
+  const current = THINKING_OPTIONS[index] ?? THINKING_OPTIONS[0];
+  const knobPct = (index / Math.max(1, THINKING_OPTIONS.length - 1)) * 100;
+
+  const levelFromClientX = useCallback((clientX: number): ThinkingLevel => {
+    const el = trackRef.current;
+    if (!el) return value;
+    const rect = el.getBoundingClientRect();
+    const t = rect.width <= 0 ? 0 : Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    const i = Math.round(t * (THINKING_OPTIONS.length - 1));
+    return THINKING_OPTIONS[i]?.id ?? "off";
+  }, [value]);
 
   useEffect(() => {
     if (disabled) setOpen(false);
@@ -412,33 +426,71 @@ function ThinkingPicker({
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  useEffect(() => {
+    if (!open) return;
+    const onMove = (e: PointerEvent) => {
+      if (!dragging.current) return;
+      onChange(levelFromClientX(e.clientX));
+    };
+    const onUp = () => {
+      dragging.current = false;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [open, levelFromClientX, onChange]);
+
   return (
     <div className={styles.modePicker} ref={rootRef}>
       <button
         className={`${styles.iconBtn} ${active ? styles.iconBtnAccent : ""}`}
         type="button"
-        title={value === "off" ? "Thinking" : `Thinking · ${value}`}
+        title={value === "off" ? "Thinking" : `Thinking · ${current.label}`}
         disabled={disabled}
         onClick={() => setOpen((v) => !v)}
       >
         <IconThink size={15} />
       </button>
       {open && !disabled ? (
-        <div className={styles.modeMenu}>
-          {THINKING_OPTIONS.map((m) => (
-            <button
-              key={m.id}
-              className={`${styles.modeOption} ${value === m.id ? styles.modeOptionActive : ""}`}
-              type="button"
-              onClick={() => {
-                onChange(m.id);
-                setOpen(false);
-              }}
-            >
-              <span className={styles.modeLabel}>{m.label}</span>
-              <span className={styles.modeDesc}>{m.desc}</span>
-            </button>
-          ))}
+        <div className={styles.modeMenu} role="dialog" aria-label="Thinking strength">
+          <div className={styles.sliderHeader}>
+            <span className={styles.sliderTitle}>Thinking · {current.label}</span>
+            <span className={styles.sliderSubtitle}>{current.desc}</span>
+          </div>
+          <div
+            className={styles.sliderTrackWrap}
+            ref={trackRef}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              dragging.current = true;
+              (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+              onChange(levelFromClientX(e.clientX));
+            }}
+          >
+            <div className={styles.sliderTrack}>
+              <div className={styles.sliderDash} aria-hidden />
+            </div>
+            <div
+              className={`${styles.sliderKnob} ${active ? styles.sliderKnobFilled : ""}`}
+              style={{ left: `${knobPct}%` }}
+              aria-hidden
+            />
+          </div>
+          <div className={styles.sliderLabels}>
+            {THINKING_OPTIONS.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={`${styles.sliderLabelBtn} ${value === m.id ? styles.sliderLabelActive : ""}`}
+                onClick={() => onChange(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
         </div>
       ) : null}
     </div>

@@ -183,7 +183,10 @@ def register_builtin_tools(registry: ToolRegistry, *, enable_delete: bool | None
     registry.register(
         "run_terminal_command",
         run_terminal_command,
-        description="Execute a shell command and return captured output.",
+        description=(
+            "Execute a shell command after the user confirms a popup. "
+            "Prefer install_packages for pip installs."
+        ),
         parameters={
             "command": {"type": "string", "description": "Shell command to run"},
             "cwd": {"type": "string", "description": "Optional working directory"},
@@ -191,6 +194,13 @@ def register_builtin_tools(registry: ToolRegistry, *, enable_delete: bool | None
         },
         required=["command"],
     )
+    from mango_tools.implementations.bind_task_prompt import register_bind_task_prompt
+    from mango_tools.implementations.install_packages import register_install_packages
+    from mango_tools.implementations.web_tools import register_web_tools
+
+    register_bind_task_prompt(registry)
+    register_install_packages(registry)
+    register_web_tools(registry)
 
 
 def create_default_registry(*, enable_delete: bool | None = None) -> ToolRegistry:

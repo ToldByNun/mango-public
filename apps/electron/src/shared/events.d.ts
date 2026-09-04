@@ -11,6 +11,7 @@ export declare const AGENT_EVENTS: readonly [
   "agent.final",
   "agent.stopped",
   "agent.error",
+  "agent.confirm",
   "model.loaded",
   "model.unloaded",
 ];

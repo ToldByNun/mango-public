@@ -8,6 +8,10 @@ A 12B local model cannot afford Aider-style repo maps or long framework essays. 
 
 **Roblox Studio:** see [`apps/roblox-studio/README.md`](apps/roblox-studio/README.md) — local plugin + `mango-studio-host` on localhost (DataModel tools, `mode=roblox`).
 
+**Playbooks** (when X → do Y, e.g. browser login): [`playbooks/`](playbooks/) + tool `lookup_playbook`. Put personal ones in `~/.mango/playbooks/`.
+
+**Knowledge tiers:** [`knowledge/`](knowledge/) — `project_brief` (fast) → `rag_search` (FTS RAG) → `vault_open` (markdown + `[[links]]`).
+
 Visual Docker/WASM sandboxing in the GUI is not built yet.
 
 ## Architecture
