@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
+import re
 import subprocess
 import sys
-from typing import Any
+import time
+from typing import Any, Callable
 
 # Import-root → PyPI distribution name (when they differ).
 _PIP_ALIASES: dict[str, str] = {
@@ -88,15 +91,26 @@ def ensure_packages(
     *,
     timeout: int = 180,
     python: str | None = None,
+    on_line: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Install missing third-party packages via ``python -m pip install``.
 
-    Returns a structured result suitable for tool UI / epistemic cards.
+    Streams combined stdout/stderr line-by-line through ``on_line`` until the
+    process exits. Never leaves stdin attached (avoids silent pip hangs).
     """
+    # Flatten accidental "flask pytest" / "a,b" entries into separate names.
+    flat: list[str] = []
+    for raw in import_names:
+        for part in re.split(r"[\s,;]+", str(raw or "")):
+            part = part.strip()
+            if part:
+                flat.append(part)
+
     wanted: list[str] = []
     skipped: list[str] = []
     already: list[str] = []
-    for raw in import_names:
+    for raw in flat:
         root = str(raw or "").split(".", 1)[0].strip()
         if not root:
             continue
@@ -123,29 +137,35 @@ def ensure_packages(
         }
 
     exe = python or sys.executable
-    command = f'"{exe}" -m pip install {" ".join(wanted)}'
-    argv = [exe, "-m", "pip", "install", *wanted]
-    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            creationflags=flags,
-        )
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        code = int(proc.returncode)
-    except subprocess.TimeoutExpired as exc:
-        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr = f"pip install timed out after {timeout}s"
-        code = -1
-    except OSError as exc:
-        stdout = ""
-        stderr = str(exc)
-        code = -1
+    argv = [
+        exe,
+        "-u",
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        *wanted,
+    ]
+    command = " ".join(argv)
+    print(f"[mango] pip install starting: {' '.join(wanted)}", file=sys.stderr, flush=True)
+    if on_line is not None:
+        on_line(f"$ {' '.join(argv)}\n")
+
+    code, combined = _run_pip_streaming(
+        argv,
+        timeout=timeout,
+        on_line=on_line,
+        cancelled=cancelled,
+    )
+
+    print(
+        f"[mango] pip install finished exit={code} wanted={wanted}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if on_line is not None:
+        on_line(f"\n[pip exit {code}]\n")
 
     importlib.invalidate_caches()
     # Drop cached failed imports so can_import/find_spec sees the new install.
@@ -169,10 +189,109 @@ def ensure_packages(
         "already": already,
         "skipped": skipped,
         "command": command,
-        "stdout": stdout[-4_000:],
-        "stderr": stderr[-4_000:],
+        "stdout": combined[-4_000:],
+        "stderr": "",
         "exit_code": code,
     }
+
+
+def _run_pip_streaming(
+    argv: list[str],
+    *,
+    timeout: int,
+    on_line: Callable[[str], None] | None,
+    cancelled: Callable[[], bool] | None,
+) -> tuple[int, str]:
+    """Run pip with live line streaming; wait until the process fully exits."""
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    env = {
+        **os.environ,
+        "PIP_NO_INPUT": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_PROGRESS_BAR": "off",
+        "PYTHONUNBUFFERED": "1",
+    }
+    env.pop("PYTHONHOME", None)
+    chunks: list[str] = []
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=flags,
+            env=env,
+        )
+    except OSError as exc:
+        msg = str(exc)
+        if on_line is not None:
+            on_line(msg + "\n")
+        return -1, msg
+
+    assert proc.stdout is not None
+    try:
+        while True:
+            if cancelled is not None and cancelled():
+                _kill_proc(proc)
+                msg = "pip install cancelled"
+                if on_line is not None:
+                    on_line(msg + "\n")
+                chunks.append(msg + "\n")
+                return -1, "".join(chunks)
+            if time.monotonic() - started > timeout:
+                _kill_proc(proc)
+                msg = f"pip install timed out after {timeout}s"
+                if on_line is not None:
+                    on_line(msg + "\n")
+                chunks.append(msg + "\n")
+                return -1, "".join(chunks)
+
+            line = proc.stdout.readline()
+            if line:
+                chunks.append(line)
+                print(line, end="", file=sys.stderr, flush=True)
+                if on_line is not None:
+                    on_line(line)
+                continue
+
+            # EOF on stdout — wait for process to fully exit.
+            rc = proc.poll()
+            if rc is not None:
+                # Drain any remaining buffered output.
+                rest = proc.stdout.read() or ""
+                if rest:
+                    chunks.append(rest)
+                    print(rest, end="", file=sys.stderr, flush=True)
+                    if on_line is not None:
+                        on_line(rest)
+                return int(rc), "".join(chunks)
+            time.sleep(0.05)
+    finally:
+        try:
+            if proc.poll() is None:
+                _kill_proc(proc)
+        except Exception:
+            pass
+
+
+def _kill_proc(proc: subprocess.Popen[Any]) -> None:
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=0.5)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 def _import_root_for_pip(pip_name: str) -> str:

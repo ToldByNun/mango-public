@@ -2160,6 +2160,19 @@ class Agent:
                             "streaming": True,
                         },
                     )
+                elif tool_name == "install_packages":
+                    pkgs = str(args.get("packages") or "").strip() or "packages"
+                    self._emit(
+                        agent_events.TOOL,
+                        {
+                            "id": f"tool-install-packages-{self._run_id}-{iteration}",
+                            "name": tool_name,
+                            "title": f"Installing {pkgs}…",
+                            "body": "",
+                            "streaming": True,
+                            "console": True,
+                        },
+                    )
                 elif tool_name in {
                     "search_code",
                     "read_file",
@@ -4902,6 +4915,28 @@ class Agent:
             return blocked_only
         phase = self._plan_gate_phase()
         tool_ctx = {**self._tool_context(), "_cancelled": self._cancelled}
+        # Live console stream for install_packages (and similar long shell tools).
+        console_buf: list[str] = []
+        install_stream_id = f"tool-install-packages-{self._run_id}-{self._current_iteration}"
+
+        def _on_console_line(chunk: str) -> None:
+            if not chunk:
+                return
+            console_buf.append(chunk)
+            body = "".join(console_buf)[-8_000:]
+            self._emit(
+                agent_events.TOOL,
+                {
+                    "id": install_stream_id,
+                    "name": "install_packages",
+                    "title": "Installing packages…",
+                    "body": body,
+                    "streaming": True,
+                    "console": True,
+                },
+            )
+
+        tool_ctx["_on_console_line"] = _on_console_line
         if phase is not None:
             allowed_names = set(_PLAN_ALLOWED)
             allowed = [call for call in tool_calls if call.name in allowed_names]
@@ -7457,6 +7492,23 @@ class Agent:
                         )
                 elif name == "declare_apis":
                     tool_id = f"tool-declare-apis-{self._run_id}-{self._current_iteration}"
+                elif name == "install_packages":
+                    tool_id = f"tool-install-packages-{self._run_id}-{self._current_iteration}"
+                    if isinstance(output, dict):
+                        ok = bool(output.get("ok"))
+                        pkgs = ", ".join(str(x) for x in (output.get("installed") or output.get("failed") or []))
+                        title = (
+                            f"Installed {pkgs}" if ok and pkgs else ("Install failed" if not ok else "Packages ready")
+                        )
+                        body = "\n".join(
+                            part
+                            for part in (
+                                str(output.get("command") or ""),
+                                str(output.get("stdout") or ""),
+                                str(output.get("stderr") or ""),
+                            )
+                            if part
+                        )[-4_000:]
                 elif name in {
                     "search_code",
                     "read_file",
@@ -7469,7 +7521,8 @@ class Agent:
                     "name": name,
                     "title": title,
                     "body": body or None,
-                    "console": name in {"run_tests", "run_terminal_command", "measure"},
+                    "console": name
+                    in {"run_tests", "run_terminal_command", "measure", "install_packages"},
                     "ok": ok if ok is not None else bool(result.success),
                     "streaming": False,
                 }

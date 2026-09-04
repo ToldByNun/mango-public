@@ -25,6 +25,14 @@ def test_builtin_registry_has_install_and_web() -> None:
     assert reg.has("web_research")
 
 
+def test_install_packages_splits_whitespace() -> None:
+    from mango_tools.implementations.install_packages import _parse_package_names
+
+    assert _parse_package_names("flask pytest") == ["flask", "pytest"]
+    assert _parse_package_names("flask, pytest; httpx") == ["flask", "pytest", "httpx"]
+    assert _parse_package_names("flask  flask") == ["flask"]
+
+
 def test_confirm_gate_auto_env(monkeypatch) -> None:
     set_confirm_emitter(None)
     monkeypatch.setenv("MANGO_AUTO_CONFIRM", "1")
