@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypedDict
 
 from mango_context.memory import DeterministicMemory
 
@@ -11,6 +11,31 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, (len(text) + 3) // 4)
+
+
+class ContextBudgetDict(TypedDict, total=False):
+    """Stable budget fields at the context engine edge."""
+
+    max_chars: int
+    max_tokens: int | None
+    max_stored_result_chars: int
+    max_actions: int
+    max_relevant_files: int
+    keep_recent_results: int
+    body_lines: int
+    memory_max_chars: int
+
+
+class ContextStateSnapshot(TypedDict, total=False):
+    """Lightweight snapshot of ContextState for boundary serialization."""
+
+    goal: str
+    constraints: list[str]
+    relevant_files: list[str]
+    reasoning_summary: str
+    work_plan: str
+    impl_status: str
+    budget: ContextBudgetDict
 
 
 @dataclass
@@ -29,6 +54,18 @@ class ContextBudget:
         if self.max_tokens is None:
             return self.max_chars
         return min(self.max_chars, self.max_tokens * 4)
+
+    def to_dict(self) -> ContextBudgetDict:
+        return {
+            "max_chars": self.max_chars,
+            "max_tokens": self.max_tokens,
+            "max_stored_result_chars": self.max_stored_result_chars,
+            "max_actions": self.max_actions,
+            "max_relevant_files": self.max_relevant_files,
+            "keep_recent_results": self.keep_recent_results,
+            "body_lines": self.body_lines,
+            "memory_max_chars": self.memory_max_chars,
+        }
 
 
 @dataclass
@@ -133,3 +170,15 @@ class ContextState:
                 error=error,
             )
         )
+
+    def to_snapshot(self) -> ContextStateSnapshot:
+        """Public edge snapshot — stable fields only, no memory internals."""
+        return {
+            "goal": self.goal,
+            "constraints": list(self.constraints),
+            "relevant_files": list(self.relevant_files),
+            "reasoning_summary": self.reasoning_summary,
+            "work_plan": self.work_plan,
+            "impl_status": self.impl_status,
+            "budget": self.budget.to_dict(),
+        }

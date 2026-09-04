@@ -2,6 +2,16 @@
 
 > **Aktueller Stand:** [README.md](README.md) beschreibt das laufende System (Loop, Runner-Gates, Entscheidungen). Diese Datei ist der ursprüngliche Modul-Entwurf.
 
+## Persistenz & Task-Queues (FileQueue-Patterns)
+
+Durable Main/Sidecar-State folgt einem gemeinsamen Vertrag:
+
+- **PersistentStore** — In-Memory-State, `loadFromStorage` / `persistNow` / `debouncePersist` (1s), `destroy()` flushed Timer + Disk.
+- **TaskQueue** — `add` / `addBatch`, `markAs…`, `get…` / `getRetryable()` mit Backoff `min(1000×2^retries, 60000)` ms; Crash-Recovery setzt `running`/`uploading` → `pending`.
+- **Status:** `pending` | `running` | `success` | `failed`. **Priorität:** `high` | `normal` | `low`.
+- **Naming:** PascalCase Klassen; camelCase / snake_case Methoden mit Präfixen `add`/`markAs`/`get`/`persist`/`load`.
+- Electron: Sessions/Workspace/Auth + `destroy()` in `before-quit`. Agent: Confirm/Undo in `~/.mango/queues/agent-tasks.json`. Studio-Host: `~/.mango/studio-host/settings.json`.
+
 ## Leitprinzip
 
 > **Ein lokales Modell, viele spezialisierte Agenten-Kontexte.**

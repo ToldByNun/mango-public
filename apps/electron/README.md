@@ -15,6 +15,10 @@ The main process starts `agent/python/.venv/Scripts/python.exe -m mango_agent.se
 - 48px activity rail, 260px session list, transcript, floating composer, 22px status bar
 - Tokens: `src/renderer/src/styles/tokens.css`
 
+## Persistence
+
+Main-process durable state uses `PersistentStore` / `TaskQueue` under `src/main/lib/` (debounced writes, crash-recovery, `destroy()` on quit). Sessions, workspace, and GitHub auth go through that layer — see root `ARCHITECTURE.md`.
+
 ## Sidecar protocol
 
 stdin/stdout JSON lines:

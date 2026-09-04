@@ -13,6 +13,15 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from mango_agent.agent_context import AgentLimits
+from mango_agent.rpc_schemas import (
+    ConfirmParams,
+    GenerateTitleParams,
+    RpcValidationError,
+    RunParams,
+    SetModelPathParams,
+    UpdateSettingsParams,
+    parse_rpc_message,
+)
 from mango_agent.thinking import thinking_preset
 from mango_agent.orchestrator import Orchestrator
 from mango_runtime.config import load_config, load_config_file, resolve_config_path, save_config
@@ -77,10 +86,13 @@ class AgentServer:
         self._current_agent: Any | None = None
         self._run_thread: threading.Thread | None = None
         self._session_id = ""
-        # Per-session undo state survives the run so the UI can still revert the
-        # last mutation after agent.stopped.
-        self._undo_history: dict[str, set[str]] = {}
-        self._undo_workspace: dict[str, str] = {}
+        # Undo consumed checkpoints + workspace live in AgentTaskQueue (durable).
+        try:
+            from mango_agent.agent_task_queue import get_agent_task_queue
+
+            get_agent_task_queue()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[mango] agent task queue unavailable: {exc}", file=sys.stderr, flush=True)
         try:
             from mango_tools.confirm_gate import set_confirm_emitter
 
@@ -102,8 +114,10 @@ class AgentServer:
         return {"ok": ok, "request_id": request_id, "allowed": allowed}
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any]:
-        method = str(message.get("method") or "")
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        try:
+            method, params = parse_rpc_message(message)
+        except RpcValidationError as exc:
+            raise ServeError(str(exc)) from None
         if method == "health":
             return {
                 "status": "ok",
@@ -116,13 +130,17 @@ class AgentServer:
         if method == "get_settings":
             return self._get_settings()
         if method == "set_model_path":
-            return self._set_model_path(str(params.get("path") or ""))
+            assert isinstance(params, SetModelPathParams)
+            return self._set_model_path(params.path)
         if method == "update_settings":
-            return self._update_settings(params)
+            assert isinstance(params, UpdateSettingsParams)
+            return self._update_settings(params.model_dump(exclude_unset=True))
         if method == "run":
-            return self._start_run(params)
+            assert isinstance(params, RunParams)
+            return self._start_run(params.model_dump())
         if method == "generate_title":
-            return self._generate_title_request(params)
+            assert isinstance(params, GenerateTitleParams)
+            return self._generate_title_request({"goal": params.goal})
         if method == "cancel":
             return self._cancel()
         if method == "continue_stall":
@@ -130,7 +148,8 @@ class AgentServer:
         if method == "undo_last_mutation":
             return self._undo_last_mutation()
         if method == "confirm":
-            return self._confirm(params)
+            assert isinstance(params, ConfirmParams)
+            return self._confirm(params.model_dump())
         if method == "shutdown":
             return self._begin_shutdown()
         raise ServeError(f"unknown method {method}")
@@ -577,16 +596,17 @@ class AgentServer:
             # works after the run thread finished and _current_agent is None.
             session = self._session_id or "default"
             agent = self._current_agent
-            consumed = self._undo_history.setdefault(session, set())
             if agent is not None and getattr(agent, "_last_checkpoint_id", ""):
-                self._undo_workspace[session] = str(getattr(agent, "_checkpoint_workspace", ""))
-                # Mark everything except the newest checkpoint as consumed so the
-                # first post-run undo reverts exactly that newest mutation.
+                from mango_agent.agent_task_queue import record_undo_consumed, set_undo_workspace
                 from mango_agent.checkpoints import _checkpoint_entries
 
+                workspace = str(getattr(agent, "_checkpoint_workspace", ""))
+                set_undo_workspace(session, workspace)
+                # Mark everything except the newest checkpoint as consumed so the
+                # first post-run undo reverts exactly that newest mutation.
                 for path, _key in _checkpoint_entries(getattr(agent, "_run_id", "") or "default"):
                     if path.name != agent._last_checkpoint_id:
-                        consumed.add(path.name)
+                        record_undo_consumed(session, path.name, workspace)
             self._current_agent = None
             self._run_thread = None
             # Free VRAM after every prompt (finish or cancel). Keeping a large GGUF
@@ -686,21 +706,28 @@ class AgentServer:
                 return result
         # Run already finished: fall back to the persisted per-session history.
         from mango_agent import checkpoints as ck
+        from mango_agent.agent_task_queue import get_undo_consumed, get_undo_workspace
 
-        consumed = self._undo_history.setdefault(session, set())
-        workspace = self._undo_workspace.get(session) or None
+        consumed = get_undo_consumed(session)
+        workspace = get_undo_workspace(session)
         result = ck.undo_last_mutation(
             session_id=self._last_checkpoint_session(), workspace=workspace, consumed=consumed
         )
+        if result.get("ok"):
+            self._mark_undone(session, str(result.get("checkpoint_id") or ""), workspace or "")
         return result
 
-    def _mark_undone(self, session: str, checkpoint_id: str) -> None:
+    def _mark_undone(self, session: str, checkpoint_id: str, workspace: str = "") -> None:
         if checkpoint_id:
-            self._undo_history.setdefault(session, set()).add(checkpoint_id)
+            from mango_agent.agent_task_queue import record_undo_consumed
+
+            record_undo_consumed(session, checkpoint_id, workspace)
 
     @staticmethod
     def _last_checkpoint_session() -> str:
         """The run id doubles as the checkpoints subfolder; use the newest one."""
+        from mango_agent import checkpoints as ck
+
         try:
             root = ck.checkpoints_root()
             candidates = [p for p in root.iterdir() if p.is_dir() and any(p.iterdir())]
@@ -713,6 +740,12 @@ class AgentServer:
 
     def _begin_shutdown(self) -> dict[str, Any]:
         self._cancel()
+        try:
+            from mango_agent.agent_task_queue import destroy_agent_task_queue
+
+            destroy_agent_task_queue()
+        except Exception:
+            pass
         return {"status": "bye"}
 
     def _join_run(self, timeout_s: float = 2.0) -> None:

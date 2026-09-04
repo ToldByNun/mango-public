@@ -1,44 +1,42 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { AgentEvent, Session } from "../shared/events";
+import type { AgentEvent } from "../shared/events";
+import type { MangoBridge } from "../shared/ipc-schema";
 
-contextBridge.exposeInMainWorld("mango", {
+const mango: MangoBridge = {
   sessions: {
-    list: (): Promise<Session[]> => ipcRenderer.invoke("sessions:list"),
-    save: (sessions: Session[]): Promise<Session[]> => ipcRenderer.invoke("sessions:save", sessions),
+    list: () => ipcRenderer.invoke("sessions:list"),
+    save: (sessions) => ipcRenderer.invoke("sessions:save", sessions),
   },
   workspace: {
-    get: (): Promise<string> => ipcRenderer.invoke("workspace:get"),
-    pick: (): Promise<string> => ipcRenderer.invoke("workspace:pick"),
-    set: (path: string): Promise<string> => ipcRenderer.invoke("workspace:set", path),
-    branch: (): Promise<string> => ipcRenderer.invoke("workspace:branch"),
+    get: () => ipcRenderer.invoke("workspace:get"),
+    pick: () => ipcRenderer.invoke("workspace:pick"),
+    set: (path) => ipcRenderer.invoke("workspace:set", path),
+    branch: () => ipcRenderer.invoke("workspace:branch"),
   },
   files: {
-    pick: (): Promise<string[]> => ipcRenderer.invoke("files:pick"),
+    pick: () => ipcRenderer.invoke("files:pick"),
   },
   sidecar: {
-    status: (): Promise<{ ready: boolean; modelLoaded: boolean }> => ipcRenderer.invoke("sidecar:status"),
-    load: (): Promise<Record<string, unknown>> => ipcRenderer.invoke("sidecar:load"),
-    settings: (): Promise<Record<string, unknown>> => ipcRenderer.invoke("sidecar:settings"),
-    setModelPath: (path: string): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("sidecar:set-model-path", path),
-    updateSettings: (settings: Record<string, unknown>): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("sidecar:update-settings", settings),
-    selectModel: (path: string): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("sidecar:select-model", path),
+    status: () => ipcRenderer.invoke("sidecar:status"),
+    load: () => ipcRenderer.invoke("sidecar:load"),
+    settings: () => ipcRenderer.invoke("sidecar:settings"),
+    setModelPath: (path) => ipcRenderer.invoke("sidecar:set-model-path", path),
+    updateSettings: (settings) => ipcRenderer.invoke("sidecar:update-settings", settings),
+    selectModel: (path) => ipcRenderer.invoke("sidecar:select-model", path),
   },
   models: {
-    list: (): Promise<Array<{ path: string; label: string }>> => ipcRenderer.invoke("models:list"),
+    list: () => ipcRenderer.invoke("models:list"),
   },
   agent: {
     run: (
-      sessionId: string,
-      goal: string,
-      workspace?: string,
-      generateTitle?: boolean,
-      thinkingLevel?: string,
-      thoughtMaxTokens?: number | null,
-      mode?: string,
-    ): Promise<Record<string, unknown>> =>
+      sessionId,
+      goal,
+      workspace,
+      generateTitle,
+      thinkingLevel,
+      thoughtMaxTokens,
+      mode,
+    ) =>
       ipcRenderer.invoke("agent:run", {
         sessionId,
         goal,
@@ -48,60 +46,66 @@ contextBridge.exposeInMainWorld("mango", {
         thoughtMaxTokens,
         mode,
       }),
-    cancel: (sessionId: string): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("agent:cancel", sessionId),
-    continueStall: (sessionId: string): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("agent:continueStall", sessionId),
-    undoLastMutation: (sessionId: string): Promise<Record<string, unknown>> =>
-      ipcRenderer.invoke("agent:undoLastMutation", sessionId),
-    onEvent: (handler: (event: AgentEvent) => void): (() => void) => {
+    cancel: (sessionId) => ipcRenderer.invoke("agent:cancel", sessionId),
+    continueStall: (sessionId) => ipcRenderer.invoke("agent:continueStall", sessionId),
+    undoLastMutation: (sessionId) => ipcRenderer.invoke("agent:undoLastMutation", sessionId),
+    onEvent: (handler) => {
       const listener = (_event: unknown, payload: AgentEvent): void => handler(payload);
       ipcRenderer.on("agent:event", listener);
       return () => ipcRenderer.removeListener("agent:event", listener);
     },
-    onSidecarError: (handler: (message: string) => void): (() => void) => {
+    onSidecarError: (handler) => {
       const listener = (_event: unknown, message: string): void => handler(message);
       ipcRenderer.on("sidecar:error", listener);
       return () => ipcRenderer.removeListener("sidecar:error", listener);
     },
   },
   app: {
-    openPath: (target: string): Promise<void> => ipcRenderer.invoke("app:open-path", target),
-    configPath: (): Promise<string> => ipcRenderer.invoke("app:config-path"),
-    version: (): Promise<string> => ipcRenderer.invoke("app:version"),
-    checkUpdates: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke("app:check-updates"),
+    openPath: (target) => ipcRenderer.invoke("app:open-path", target),
+    configPath: () => ipcRenderer.invoke("app:config-path"),
+    version: () => ipcRenderer.invoke("app:version"),
+    checkUpdates: () => ipcRenderer.invoke("app:check-updates"),
   },
   win: {
-    minimize: (): void => { ipcRenderer.send("win:minimize"); },
-    maximize: (): void => { ipcRenderer.send("win:maximize"); },
-    close: (): void => { ipcRenderer.send("win:close"); },
+    minimize: () => {
+      ipcRenderer.send("win:minimize");
+    },
+    maximize: () => {
+      ipcRenderer.send("win:maximize");
+    },
+    close: () => {
+      ipcRenderer.send("win:close");
+    },
   },
-  getPathForFile: (file: File): string => webUtils.getPathForFile(file),
+  getPathForFile: (file) => webUtils.getPathForFile(file),
   github: {
-    status: (): Promise<{ loggedIn: boolean; user?: { login: string; avatar_url: string; name: string | null } }> =>
-      ipcRenderer.invoke("github:status"),
-    login: (): Promise<{ loggedIn: boolean; user?: { login: string; avatar_url: string; name: string | null } }> =>
-      ipcRenderer.invoke("github:login"),
-    logout: (): Promise<{ loggedIn: boolean }> => ipcRenderer.invoke("github:logout"),
-    onDeviceCode: (handler: (data: { userCode: string; verificationUri: string }) => void): (() => void) => {
-      const listener = (_event: unknown, payload: { userCode: string; verificationUri: string }): void => handler(payload);
+    status: () => ipcRenderer.invoke("github:status"),
+    login: () => ipcRenderer.invoke("github:login"),
+    logout: () => ipcRenderer.invoke("github:logout"),
+    onDeviceCode: (handler) => {
+      const listener = (
+        _event: unknown,
+        payload: { userCode: string; verificationUri: string },
+      ): void => handler(payload);
       ipcRenderer.on("github:device-code", listener);
       return () => ipcRenderer.removeListener("github:device-code", listener);
     },
   },
   speech: {
-    start: (locale?: string): Promise<{ ok: boolean; listening: boolean }> =>
-      ipcRenderer.invoke("speech:start", locale),
-    stop: (): Promise<{ ok: boolean }> => ipcRenderer.invoke("speech:stop"),
-    onResult: (handler: (text: string) => void): (() => void) => {
+    start: (locale) => ipcRenderer.invoke("speech:start", locale),
+    stop: () => ipcRenderer.invoke("speech:stop"),
+    onResult: (handler) => {
       const listener = (_event: unknown, payload: { text: string }): void => handler(payload.text);
       ipcRenderer.on("speech:result", listener);
       return () => ipcRenderer.removeListener("speech:result", listener);
     },
-    onError: (handler: (message: string) => void): (() => void) => {
-      const listener = (_event: unknown, payload: { message: string }): void => handler(payload.message);
+    onError: (handler) => {
+      const listener = (_event: unknown, payload: { message: string }): void =>
+        handler(payload.message);
       ipcRenderer.on("speech:error", listener);
       return () => ipcRenderer.removeListener("speech:error", listener);
     },
   },
-});
+};
+
+contextBridge.exposeInMainWorld("mango", mango);

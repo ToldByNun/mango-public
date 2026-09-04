@@ -30,6 +30,36 @@ class InferenceConfig:
     repeat_last_n: int = 256
 
 
+class ConfigValidationError(ValueError):
+    """Invalid runtime config at the load edge."""
+
+
+def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigValidationError(f"{label} must be a mapping, got {type(value).__name__}")
+    return value
+
+
+def _as_int(value: Any, label: str, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigValidationError(f"{label} must be an integer") from exc
+
+
+def _as_float(value: Any, label: str, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigValidationError(f"{label} must be a number") from exc
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     model: ModelConfig
@@ -38,27 +68,40 @@ class RuntimeConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RuntimeConfig:
-        model = data.get("model", {})
-        hardware = data.get("hardware", {})
-        inference = data.get("inference", {})
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ConfigValidationError(f"config root must be a mapping, got {type(data).__name__}")
+        model = _require_mapping(data.get("model", {}), "model")
+        hardware = _require_mapping(data.get("hardware", {}), "hardware")
+        inference = _require_mapping(data.get("inference", {}), "inference")
+        stop_raw = inference.get("stop", [])
+        if stop_raw is None:
+            stop_raw = []
+        if not isinstance(stop_raw, list):
+            raise ConfigValidationError("inference.stop must be a list")
         return cls(
             model=ModelConfig(
                 path=str(model.get("path", "")),
-                n_ctx=int(model.get("n_ctx", 4096)),
-                n_batch=int(model.get("n_batch", 512)),
-                n_ubatch=int(model.get("n_ubatch", 0)),
+                n_ctx=_as_int(model.get("n_ctx", 4096), "model.n_ctx", 4096),
+                n_batch=_as_int(model.get("n_batch", 512), "model.n_batch", 512),
+                n_ubatch=_as_int(model.get("n_ubatch", 0), "model.n_ubatch", 0),
             ),
             hardware=HardwareConfig(
-                n_gpu_layers=int(hardware.get("n_gpu_layers", 0)),
-                n_threads=int(hardware.get("n_threads", 0)),
+                n_gpu_layers=_as_int(hardware.get("n_gpu_layers", 0), "hardware.n_gpu_layers", 0),
+                n_threads=_as_int(hardware.get("n_threads", 0), "hardware.n_threads", 0),
             ),
             inference=InferenceConfig(
-                max_tokens=int(inference.get("max_tokens", 256)),
-                temperature=float(inference.get("temperature", 0.1)),
-                top_p=float(inference.get("top_p", 0.95)),
-                stop=list(inference.get("stop", [])),
-                repeat_penalty=float(inference.get("repeat_penalty", 1.12)),
-                repeat_last_n=int(inference.get("repeat_last_n", 256)),
+                max_tokens=_as_int(inference.get("max_tokens", 256), "inference.max_tokens", 256),
+                temperature=_as_float(inference.get("temperature", 0.1), "inference.temperature", 0.1),
+                top_p=_as_float(inference.get("top_p", 0.95), "inference.top_p", 0.95),
+                stop=[str(item) for item in stop_raw],
+                repeat_penalty=_as_float(
+                    inference.get("repeat_penalty", 1.12), "inference.repeat_penalty", 1.12
+                ),
+                repeat_last_n=_as_int(
+                    inference.get("repeat_last_n", 256), "inference.repeat_last_n", 256
+                ),
             ),
         )
 

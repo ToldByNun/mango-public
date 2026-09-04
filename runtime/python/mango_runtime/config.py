@@ -104,7 +104,14 @@ def load_config_file(path: str | Path, *, require_model: bool = True) -> Runtime
     with config_path.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
 
-    config = RuntimeConfig.from_dict(data)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid config {config_path}: root must be a YAML mapping")
+
+    try:
+        config = RuntimeConfig.from_dict(data)
+    except Exception as exc:
+        # ConfigValidationError and TypeError from bad field shapes
+        raise ValueError(f"Invalid config {config_path}: {exc}") from exc
 
     env_model_path = os.environ.get("MANGO_GGUF_MODEL_PATH")
     if env_model_path:

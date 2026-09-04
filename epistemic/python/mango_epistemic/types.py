@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 
 @dataclass
@@ -11,6 +11,38 @@ class Evidence:
 
     def to_dict(self) -> dict[str, str]:
         return {"source": self.source, "snippet": self.snippet}
+
+
+class EvidenceDict(TypedDict):
+    source: str
+    snippet: str
+
+
+class EpistemicResultDict(TypedDict, total=False):
+    """Public compact payload returned to the main agent."""
+
+    exists: bool | None
+    signature: str | None
+    details: str | None
+    version: str | None
+    evidence: list[EvidenceDict]
+    conflicts: list[str] | None
+    looked_up: list[str] | None
+    question: str
+
+
+class InstallHintDict(TypedDict, total=False):
+    """Edge contract for pip install / install_deps results."""
+
+    ok: bool
+    installed: list[str]
+    failed: list[str]
+    already: list[str]
+    skipped: list[str]
+    command: str | None
+    stdout: str
+    stderr: str
+    exit_code: int
 
 
 @dataclass

@@ -1,43 +1,70 @@
 import { net, shell } from "electron";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { app } from "electron";
+import { PersistentStore } from "./lib/persistent-store";
 
 const CLIENT_ID = "Ov23liYourClientId"; // Replace with your GitHub OAuth App client ID
 const SCOPES = "repo,read:user";
 
 type GithubUser = { login: string; avatar_url: string; name: string | null };
-type StoredAuth = { token: string; user: GithubUser };
+export type StoredAuth = { token: string; user: GithubUser };
 
-function authPath(): string {
-  const dir = join(app.getPath("userData"), "auth");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return join(dir, "github.json");
+let authStore: PersistentStore<StoredAuth | null> | null = null;
+let authLoaded = false;
+
+function getAuthStore(): PersistentStore<StoredAuth | null> {
+  if (!authStore) {
+    authStore = new PersistentStore<StoredAuth | null>({
+      filePath: join(app.getPath("userData"), "auth", "github.json"),
+      scope: "github-auth",
+      debounceMs: 0,
+      emptyState: () => null,
+      serialize: (state) => state ?? {},
+      deserialize: (raw) => {
+        if (!raw || typeof raw !== "object") return null;
+        const obj = raw as { token?: unknown; user?: unknown };
+        if (typeof obj.token !== "string" || !obj.user || typeof obj.user !== "object") return null;
+        return { token: obj.token, user: obj.user as GithubUser };
+      },
+    });
+  }
+  return authStore;
+}
+
+function ensureAuthLoaded(): PersistentStore<StoredAuth | null> {
+  const store = getAuthStore();
+  if (!authLoaded) {
+    store.loadFromStorage();
+    authLoaded = true;
+  }
+  return store;
 }
 
 export function getStoredAuth(): StoredAuth | null {
-  const p = authPath();
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, "utf-8"));
-  } catch {
-    return null;
-  }
+  return ensureAuthLoaded().getState();
 }
 
 function storeAuth(auth: StoredAuth): void {
-  writeFileSync(authPath(), JSON.stringify(auth));
+  const store = ensureAuthLoaded();
+  store.replaceState(auth);
+  store.persistNow();
 }
 
 export function clearAuth(): void {
-  const p = authPath();
-  if (existsSync(p)) writeFileSync(p, "");
+  const store = ensureAuthLoaded();
+  store.replaceState(null);
+  store.persistNow();
+}
+
+export function destroyAuthStore(): void {
+  if (!authStore) return;
+  ensureAuthLoaded().destroy();
 }
 
 async function fetchJson<T>(url: string, opts: RequestInit = {}): Promise<T> {
   const resp = await net.fetch(url, {
     ...opts,
-    headers: { Accept: "application/json", ...((opts.headers as Record<string, string>) ?? {}) },
+    headers: { Accept: "application/json", ...((opts.headers as RequestInit["headers"]) ?? {}) },
   });
   return resp.json() as Promise<T>;
 }
@@ -56,7 +83,11 @@ type TokenResponse = {
   error?: string;
 };
 
-export async function startDeviceFlow(): Promise<{ userCode: string; verificationUri: string; poll: () => Promise<StoredAuth | null> } | null> {
+export async function startDeviceFlow(): Promise<{
+  userCode: string;
+  verificationUri: string;
+  poll: () => Promise<StoredAuth | null>;
+} | null> {
   let dcr: DeviceCodeResponse;
   try {
     dcr = await fetchJson<DeviceCodeResponse>("https://github.com/login/device/code", {

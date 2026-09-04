@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any
 
+from mango_cot.types import CotStepPayload, as_cot_step_payload
+
 _FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
@@ -18,6 +20,11 @@ def parse_reasoning_payload(text: str) -> dict[str, Any]:
         if parsed is not None:
             return parsed
     return {}
+
+
+def parse_cot_step(text: str) -> CotStepPayload:
+    """Typed CoT step at the engine edge (normalized GBNF/JSON fields)."""
+    return as_cot_step_payload(parse_reasoning_payload(text))
 
 
 def _candidate_json_blobs(text: str) -> list[str]:

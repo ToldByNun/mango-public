@@ -7,7 +7,9 @@ name = "mango-studio-host"
 version = "0.1.0"
 description = "HTTP bridge between Roblox Studio plugin and mango_agent.serve"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "pydantic>=2.0",
+]
 
 [project.scripts]
 mango-studio-host = "mango_studio_host.__main__:main"

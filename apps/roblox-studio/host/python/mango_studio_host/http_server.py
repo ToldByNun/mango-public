@@ -12,14 +12,31 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from pydantic import ValidationError
+
 from mango_studio_host.models import format_model_label, list_gguf_models
 from mango_studio_host.paths import find_repo_root, runtime_config_path, studio_workspace
+from mango_studio_host.persistent_store import PersistentStore
 from mango_studio_host.rojo import find_rojo_project, rojo_tree_root
+from mango_studio_host.schemas import (
+    CancelBody,
+    LoadModelBody,
+    RunBody,
+    SettingsUpdateBody,
+    StudioCallBody,
+    StudioResultBody,
+    UndoBody,
+    validation_error_body,
+)
 from mango_studio_host.sidecar_client import SidecarClient
 from mango_studio_host.studio_bridge import StudioBridge
 
 DEFAULT_PORT = 17880
 DEFAULT_HOST = "127.0.0.1"
+
+
+def _settings_path() -> Path:
+    return Path.home() / ".mango" / "studio-host" / "settings.json"
 
 
 class EventBus:
@@ -63,13 +80,31 @@ class HostState:
         self.busy = False
         self.session_id = ""
         self.last_error = ""
-        self.settings: dict[str, Any] = {
+        defaults: dict[str, Any] = {
             "port": port,
             "confirm_prop_threshold": 1,
             "model_path": "",
             "thinking_level": "off",
         }
+        self._settings_store = PersistentStore[dict[str, Any]](
+            file_path=_settings_path(),
+            debounce_s=1.0,
+            scope="studio-settings",
+            empty_state=lambda: dict(defaults),
+            serialize=lambda state: state,
+            deserialize=lambda raw: dict(raw) if isinstance(raw, dict) else None,
+        )
+        loaded = self._settings_store.load_from_storage()
+        self.settings = {**defaults, **loaded, "port": port}
+        self._settings_store.replace_state(dict(self.settings))
         self._lock = threading.Lock()
+
+    def persist_settings(self) -> None:
+        self._settings_store.replace_state(dict(self.settings))
+
+    def destroy(self) -> None:
+        self.persist_settings()
+        self._settings_store.destroy()
 
     def ensure_sidecar(self) -> SidecarClient:
         with self._lock:
@@ -241,34 +276,45 @@ def make_handler(state: HostState):
             body = _read_json(self)
             try:
                 if path == "/internal/studio/call":
-                    # Called by rbx_* tools inside the sidecar process.
-                    tool = str(body.get("tool") or "")
-                    args = body.get("args") if isinstance(body.get("args"), dict) else {}
-                    requires_confirm = bool(body.get("requires_confirm"))
-                    confirm_summary = str(body.get("confirm_summary") or "")
-                    timeout_s = body.get("timeout_s")
+                    try:
+                        req = StudioCallBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
                     result = state.bridge.call(
-                        tool,
-                        args,
-                        requires_confirm=requires_confirm,
-                        confirm_summary=confirm_summary,
-                        timeout_s=float(timeout_s) if timeout_s is not None else None,
+                        req.tool,
+                        req.args,
+                        requires_confirm=req.requires_confirm,
+                        confirm_summary=req.confirm_summary,
+                        timeout_s=req.timeout_s,
                     )
                     _json_response(self, 200, result)
                     return
 
                 if path == "/v1/studio/result":
-                    request_id = str(body.get("request_id") or "")
-                    ok = state.bridge.complete(request_id, body)
+                    try:
+                        req = StudioResultBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
+                    payload = req.model_dump()
+                    ok = state.bridge.complete(req.request_id, payload)
                     _json_response(self, 200 if ok else 404, {"ok": ok})
                     return
 
                 if path == "/v1/settings":
+                    try:
+                        req = SettingsUpdateBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
+                    dumped = req.model_dump(exclude_unset=True)
                     for key in ("confirm_prop_threshold", "thinking_level"):
-                        if key in body:
-                            state.settings[key] = body[key]
-                    if "model_path" in body and str(body["model_path"]).strip():
-                        path_str = str(body["model_path"]).strip()
+                        if key in dumped:
+                            state.settings[key] = dumped[key]
+                    state.persist_settings()
+                    if "model_path" in dumped and str(dumped["model_path"] or "").strip():
+                        path_str = str(dumped["model_path"]).strip()
                         sidecar = state.ensure_sidecar()
                         result = sidecar.request(
                             "set_model_path",
@@ -277,6 +323,7 @@ def make_handler(state: HostState):
                         )
                         state.settings["model_path"] = path_str
                         state.settings["model_name"] = format_model_label(Path(path_str).stem)
+                        state.persist_settings()
                         _json_response(
                             self,
                             200,
@@ -291,16 +338,21 @@ def make_handler(state: HostState):
                     return
 
                 if path == "/v1/run":
-                    session_id = str(body.get("session_id") or "studio")
-                    goal = str(body.get("goal") or "")
-                    mode = str(body.get("mode") or "roblox")
+                    try:
+                        req = RunBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
+                    session_id = str(req.session_id or "studio")
+                    goal = str(req.goal or "")
+                    mode = str(req.mode or "roblox")
                     thinking_level = str(
-                        body.get("thinking_level") or state.settings.get("thinking_level") or "off"
+                        req.thinking_level or state.settings.get("thinking_level") or "off"
                     )
-                    selection = body.get("selection")
+                    selection = req.selection
                     if selection:
                         goal = f"{goal}\n\n[Studio selection]\n{selection}".strip()
-                    workspace = str(body.get("workspace") or "")
+                    workspace = str(req.workspace or "")
                     if not workspace:
                         rojo = find_rojo_project(state.repo_root)
                         if rojo:
@@ -329,6 +381,11 @@ def make_handler(state: HostState):
                     return
 
                 if path == "/v1/cancel":
+                    try:
+                        CancelBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
                     if state.sidecar and state.sidecar.running:
                         result = state.sidecar.request("cancel", {}, timeout_s=10.0)
                         _json_response(self, 200, result)
@@ -338,6 +395,11 @@ def make_handler(state: HostState):
                     return
 
                 if path == "/v1/undo":
+                    try:
+                        UndoBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
                     if state.sidecar and state.sidecar.running:
                         result = state.sidecar.request("undo_last_mutation", {}, timeout_s=30.0)
                         _json_response(self, 200, result)
@@ -346,6 +408,11 @@ def make_handler(state: HostState):
                     return
 
                 if path == "/v1/load_model":
+                    try:
+                        LoadModelBody.model_validate(body)
+                    except ValidationError as exc:
+                        _json_response(self, 400, validation_error_body(exc))
+                        return
                     result = state.ensure_sidecar().request("load_model", {}, timeout_s=600.0)
                     _json_response(self, 200, result)
                     return
@@ -376,6 +443,10 @@ def serve_forever(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None
     except KeyboardInterrupt:
         print("[mango-studio-host] shutting down", flush=True)
     finally:
+        try:
+            state.destroy()
+        except Exception:
+            pass
         if state.sidecar:
             try:
                 state.sidecar.stop()
